@@ -1,0 +1,52 @@
+# Build artifacts
+*.o
+*.so
+*.a
+
+# Backup files
+*.bak
+*.backup
+*~
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-*
+
+# Test artifacts
+test-results/
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+
+# PostgreSQL data directories (don't commit actual data!)
+data/
+pgdata/
+*.pgdata
+
+# Cluster reports
+cluster-report-*/
+crm-report-*/
+
+# Configuration backups
+*.conf.bak
+*.conf.backup
+
+# Credentials
+.pgpass
+*.pgpass
+credentials.txt
+secrets.txt
+
+# Documentation builds
+_build/
+site/
