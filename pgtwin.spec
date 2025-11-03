@@ -88,7 +88,7 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
-* Mon Nov 03 2025 Your Name <your.email@example.com> - 1.6.0-1
+* Mon Nov 03 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.6.0-1
 - Release v1.6.0: Automatic Replication Recovery
 - Add automatic replication health monitoring on standby nodes
 - Add incremental failure counter with configurable threshold
@@ -97,7 +97,7 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 - Add new parameters: vip, replication_failure_threshold
 - Known issues: failure counter may not increment correctly, missing passfile in primary_conninfo
 
-* Sat Nov 02 2025 Your Name <your.email@example.com> - 1.5.0-1
+* Sat Nov 02 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.5.0-1
 - Release v1.5.0: Enhanced Configuration Validation
 - Add 6 new PostgreSQL configuration checks on startup
 - Add CRITICAL check for restart_after_crash (prevents split-brain)
@@ -106,27 +106,27 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 - Add runtime archive failure monitoring on primary
 - Add comprehensive README.postgres.md configuration guide
 
-* Fri Nov 01 2025 Your Name <your.email@example.com> - 1.4.0-1
+* Fri Nov 01 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.4.0-1
 - Release v1.4.0: Critical Bug Fixes
 - Fix promotion failure with standby.signal removal
 - Add dual location constraints for proper failover migration
 - Add automatic application_name management
 - Add STONITH/SBD configuration for fencing
 
-* Thu Oct 31 2025 Your Name <your.email@example.com> - 1.3.0-1
+* Thu Oct 31 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.3.0-1
 - Release v1.3.0: Configuration Validation Framework
 - Add 8 comprehensive checks on PostgreSQL start
 - Validate PostgreSQL version, replication settings, archive mode
 - Validate replication user, slots, VIP, sync mode
 - Early blocking for critical misconfigurations
 
-* Wed Oct 30 2025 Your Name <your.email@example.com> - 1.2.0-1
+* Wed Oct 30 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.2.0-1
 - Release v1.2.0: Disk Space Calculation Refactoring
 - Switch from logical database size to actual filesystem usage
 - Use du -sb for accurate total space requirements
 - Improve disk space safety margin calculations
 
-* Tue Oct 29 2025 Your Name <your.email@example.com> - 1.1.0-1
+* Tue Oct 29 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.1.0-1
 - Release v1.1.0: Feature Enhancements
 - Add application name validation and sanitization
 - Add disk space pre-check before pg_basebackup
@@ -134,7 +134,7 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 - Add asynchronous pg_basebackup support
 - Add enhanced .pgpass credential support
 
-* Mon Oct 28 2025 Your Name <your.email@example.com> - 1.0.0-1
+* Mon Oct 28 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.0.0-1
 - Initial release of pgtwin
 - PostgreSQL 17 High Availability support
 - Physical streaming replication with replication slots

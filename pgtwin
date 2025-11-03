@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # pgtwin - PostgreSQL Twin/HA OCF Resource Agent
-# Version: 1.6.1
+# Version: 1.6.2
 # Release Date: 2025-11-03
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with

@@ -291,8 +291,8 @@ sudo crm configure colocation vip-with-postgres inf: vip postgres-clone:Promoted
 sudo crm configure order postgres-before-vip Mandatory: postgres-clone:promote vip:start
 
 # Prefer node 1 as primary
-sudo crm configure location postgres-on-psql1 postgres-clone 100: psql1
-sudo crm configure location postgres-on-psql2 postgres-clone 50: psql2
+sudo crm configure location postgres-on-psql1 postgres-clone role=Promoted 100: psql1
+sudo crm configure location postgres-on-psql2 postgres-clone role=Promoted 50: psql2
 ```
 
 ### 2.10 Verify Configuration
@@ -474,11 +474,49 @@ sudo journalctl -u pacemaker | grep -E "CRITICAL ERROR|WARNING"
 
 ---
 
+## Production Checklist
+
+Before deploying to production, verify:
+
+- ☑ **PostgreSQL Configuration**
+  - `restart_after_crash = off` (CRITICAL - prevents split-brain)
+  - `wal_level = replica`
+  - `max_wal_senders >= 2`
+  - `wal_sender_timeout >= 15000` (15 seconds minimum)
+  - `max_standby_streaming_delay != -1` (set to 30000-60000)
+
+- ☑ **Replication**
+  - `.pgpass` file configured with proper permissions (0600)
+  - Replication user created with correct grants
+  - `pg_hba.conf` allows replication from standby node
+  - Replication slot created and active
+
+- ☑ **Cluster Configuration**
+  - STONITH enabled (`stonith-enabled=true`)
+  - Fencing device configured and tested
+  - VIP configured and reachable
+  - Both nodes have identical pgtwin agent version
+  - Location constraints configured for both nodes
+
+- ☑ **Testing**
+  - Manual failover tested successfully
+  - Automatic failover tested (node power-off)
+  - Replication lag monitored (<1 second normal)
+  - VIP migration verified
+  - Client reconnection tested
+
+- ☑ **Monitoring**
+  - Cluster status monitoring configured
+  - PostgreSQL log monitoring
+  - Disk space alerts (especially for WAL)
+  - Replication lag alerts
+
+---
+
 ## Next Steps
 
-1. **Production Checklist**: See PRODUCTION_CHECKLIST.md in parent directory
-2. **Administration Commands**: See CHEATSHEET.md for complete command reference
-3. **Architecture Details**: See README.md for design decisions and features
+1. **Administration Commands**: See CHEATSHEET.md for complete command reference
+2. **Architecture Details**: See README.md for design decisions and features
 
 ---
 

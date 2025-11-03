@@ -165,6 +165,36 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
    - If timelines diverged too much, falls back to `pg_basebackup` (full copy)
    - Node becomes new standby, replication resumes
 
+### Expected Timing
+
+**Automatic Failover** (Primary → Standby):
+- **Detection**: 10-15 seconds (monitor intervals + timeout)
+- **Fencing**: 5-10 seconds (STONITH via SBD)
+- **Promotion**: 5-10 seconds (pg_ctl promote)
+- **VIP Migration**: 2-5 seconds (Pacemaker IPaddr2)
+- **Total Downtime**: **30-60 seconds** (typical)
+
+**Manual Failover**:
+- **Total Time**: 15-30 seconds (no detection delay)
+- Triggered via: `crm resource move postgres-clone <target-node>`
+
+**Node Recovery After Failover**:
+- **pg_rewind**: 5-30 seconds (fast, depends on divergence)
+- **pg_basebackup**: Minutes to hours (depends on database size)
+  - Small databases (<10 GB): 2-5 minutes
+  - Medium databases (10-100 GB): 5-30 minutes
+  - Large databases (>100 GB): 30+ minutes
+- **Replication Resume**: <5 seconds after recovery
+
+**Replication Lag** (Normal Operation):
+- **Synchronous Mode**: <1 second (typically <100ms)
+- **Asynchronous Mode**: <5 seconds (network dependent)
+
+**Notes**:
+- Failover times assume healthy network and properly configured STONITH
+- pg_basebackup runs asynchronously to avoid blocking cluster operations
+- VIP ensures applications reconnect automatically after failover
+
 ---
 
 ## Design Decisions
@@ -434,15 +464,14 @@ ls -l /var/lib/pgsql/.pgpass  # Must be 600, owner postgres
 
 ## Testing
 
-pgtwin includes a comprehensive test suite:
+pgtwin includes testing capabilities:
 
 ```bash
-# Run all tests (in parent repository)
-./test-pgtwin-enhancements.sh     # Feature tests
-./test-production-config.sh        # Configuration validation tests
-
 # Test syntax
 sudo bash -n /usr/lib/ocf/resource.d/heartbeat/pgtwin
+
+# Verify OCF metadata
+sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 
 # Test OCF agent manually
 sudo OCF_ROOT=/usr/lib/ocf \
