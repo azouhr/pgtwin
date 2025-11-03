@@ -1,29 +1,12 @@
 #!/bin/bash
 #
-# pgtwin - PostgreSQL OCF RA for 2-node HA clusters
-# Version: 1.5.0
-# Release Date: 2025-01-02
+# pgtwin - PostgreSQL Twin/HA OCF Resource Agent
+# Version: 1.6.0
+# Release Date: 2025-11-03
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
-#               physical replication, slot management, and pg_rewind support
-#
-# Copyright (c) 2024-2025 pgtwin contributors
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 2 of the License, or
-# (at your option) any later version.
-#
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License along
-# with this program; if not, write to the Free Software Foundation, Inc.,
-# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
-#
-# SPDX-License-Identifier: GPL-2.0-or-later
+#               physical replication, slot management, pg_rewind support,
+#               automatic replication recovery, and dynamic promoted node discovery
 #
 # OCF instance parameters:
 #   OCF_RESKEY_pgdata           - PostgreSQL data directory
@@ -40,6 +23,9 @@
 #   OCF_RESKEY_backup_before_basebackup - Backup data before basebackup (true/false)
 #   OCF_RESKEY_basebackup_timeout - Timeout for pg_basebackup operation (seconds)
 #   OCF_RESKEY_pgpassfile       - Path to .pgpass file for replication credentials
+#   OCF_RESKEY_replication_failure_threshold - Number of consecutive monitor cycles with
+#                                               failed replication before triggering recovery (default: 5)
+#   OCF_RESKEY_vip              - Virtual IP address (used to discover promoted node)
 #
 
 #######################################################################
@@ -69,6 +55,8 @@ OCF_RESKEY_node_list_default=""
 OCF_RESKEY_backup_before_basebackup_default="true"
 OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
+OCF_RESKEY_replication_failure_threshold_default="5"
+OCF_RESKEY_vip_default=""
 
 : ${OCF_RESKEY_pgdata=${OCF_RESKEY_pgdata_default}}
 : ${OCF_RESKEY_pghost=${OCF_RESKEY_pghost_default}}
@@ -84,6 +72,8 @@ OCF_RESKEY_pgpassfile_default=""
 : ${OCF_RESKEY_backup_before_basebackup=${OCF_RESKEY_backup_before_basebackup_default}}
 : ${OCF_RESKEY_basebackup_timeout=${OCF_RESKEY_basebackup_timeout_default}}
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
+: ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
+: ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
 
 PGDATA="${OCF_RESKEY_pgdata}"
 PGCTL="/usr/bin/pg_ctl"
@@ -97,14 +87,19 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.5">
-<version>1.5</version>
+<resource-agent name="pgtwin" version="1.6">
+<version>1.6</version>
 
 <longdesc lang="en">
+pgtwin - PostgreSQL Twin/HA Resource Agent
+
 Resource agent for PostgreSQL with advanced replication slot management,
-pg_rewind support, and automatic failover handling.
+pg_rewind support, automatic failover handling, and automatic replication recovery.
+Includes enhanced monitoring for replication health and dynamic promoted node discovery.
+
+Designed for active-passive PostgreSQL HA clusters with automatic timeline recovery.
 </longdesc>
-<shortdesc lang="en">PostgreSQL HA with slot management</shortdesc>
+<shortdesc lang="en">PostgreSQL Twin HA with automatic replication recovery</shortdesc>
 
 <parameters>
 <parameter name="pgdata" unique="0" required="1">
@@ -242,6 +237,31 @@ If empty, defaults to ~postgres/.pgpass
 <content type="string" default="${OCF_RESKEY_pgpassfile_default}" />
 </parameter>
 
+<parameter name="replication_failure_threshold" unique="0">
+<longdesc lang="en">
+Number of consecutive monitor cycles with failed/missing replication before
+automatically triggering recovery (pg_rewind or pg_basebackup).
+
+This prevents temporary network issues from triggering unnecessary recovery,
+while ensuring persistent replication failures (like timeline divergence) are
+automatically resolved.
+
+Default: 5 (approximately 40 seconds with default 8s monitor interval for standby)
+</longdesc>
+<shortdesc lang="en">Replication failure threshold</shortdesc>
+<content type="integer" default="${OCF_RESKEY_replication_failure_threshold_default}" />
+</parameter>
+
+<parameter name="vip" unique="0">
+<longdesc lang="en">
+Virtual IP address of the cluster (optional).
+If specified, used to dynamically discover the current promoted node during demote operations.
+If not specified, falls back to using node_list for promoted node discovery.
+</longdesc>
+<shortdesc lang="en">Virtual IP address</shortdesc>
+<content type="string" default="${OCF_RESKEY_vip_default}" />
+</parameter>
+
 </parameters>
 
 <actions>
@@ -305,7 +325,7 @@ update_application_name_in_config() {
     # Check if postgresql.auto.conf exists
     if [ ! -f "$auto_conf" ]; then
         ocf_log info "Creating postgresql.auto.conf with application_name='$app_name'"
-        echo "# Managed by Pacemaker pgtwin resource agent" > "$auto_conf"
+        echo "# Managed by Pacemaker pgsql-ha resource agent" > "$auto_conf"
         echo "application_name = '$app_name'" >> "$auto_conf"
         chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "$auto_conf"
         chmod 600 "$auto_conf"
@@ -494,8 +514,8 @@ check_postgresql_config() {
 
     # 1. Check wal_level
     local wal_level=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW wal_level\"" 2>/dev/null)
-    if [ "$wal_level" != "replica" ]; then
-        ocf_log err "CONFIGURATION ERROR: wal_level='${wal_level}' - MUST be 'replica' for physical replication!"
+    if [ "$wal_level" != "replica" ] && [ "$wal_level" != "logical" ]; then
+        ocf_log err "CONFIGURATION ERROR: wal_level='${wal_level}' - MUST be 'replica' or 'logical' for replication!"
         ocf_log err "FIX: Set 'wal_level = replica' in postgresql.conf"
         config_ok=1
     else
@@ -732,6 +752,92 @@ pgsql_is_promoted() {
     return 1  # Is standby
 }
 
+discover_promoted_node() {
+    # Discover which node is currently promoted (primary)
+    # Try multiple methods in order of reliability
+
+    local promoted_node=""
+
+    # Method 1: Use VIP if configured
+    if [ -n "${OCF_RESKEY_vip}" ]; then
+        ocf_log debug "Attempting to discover promoted node via VIP ${OCF_RESKEY_vip}"
+
+        # Try to connect to VIP and check if it's promoted
+        local is_primary=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+
+        if [ "$is_primary" = "t" ]; then
+            # VIP responds and is primary, now get its hostname
+            promoted_node=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT split_part(inet_server_addr()::text, '.', 4)\"" 2>/dev/null)
+
+            if [ -z "$promoted_node" ]; then
+                # Fallback: just use VIP directly
+                promoted_node="${OCF_RESKEY_vip}"
+            fi
+
+            ocf_log info "Discovered promoted node via VIP: ${promoted_node}"
+            echo "$promoted_node"
+            return 0
+        fi
+    fi
+
+    # Method 2: Query each node in node_list
+    if [ -n "${OCF_RESKEY_node_list}" ]; then
+        ocf_log debug "Attempting to discover promoted node via node_list"
+
+        for node in ${OCF_RESKEY_node_list}; do
+            local is_primary=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+
+            if [ "$is_primary" = "t" ]; then
+                promoted_node="$node"
+                ocf_log info "Discovered promoted node via node_list: ${promoted_node}"
+                echo "$promoted_node"
+                return 0
+            fi
+        done
+    fi
+
+    # Method 3: Query Pacemaker CIB (as fallback)
+    if command -v crm_mon >/dev/null 2>&1; then
+        ocf_log debug "Attempting to discover promoted node via Pacemaker CIB"
+
+        # Try to find promoted instance from crm_mon
+        promoted_node=$(crm_mon -1 2>/dev/null | grep -A 1 "Promoted:" | tail -1 | tr -d '[]' | awk '{print $1}')
+
+        if [ -n "$promoted_node" ]; then
+            ocf_log info "Discovered promoted node via Pacemaker CIB: ${promoted_node}"
+            echo "$promoted_node"
+            return 0
+        fi
+    fi
+
+    ocf_log warn "Could not discover promoted node via any method"
+    return 1
+}
+
+check_replication_health() {
+    # Check if standby is properly replicating from primary
+    # Returns 0 if healthy, 1 if unhealthy
+
+    if pgsql_is_promoted; then
+        # Primary doesn't need replication health check
+        return 0
+    fi
+
+    # Check if standby is receiving WAL
+    local wal_receiver_status=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT status FROM pg_stat_wal_receiver\"" 2>/dev/null)
+
+    if [ "$wal_receiver_status" = "streaming" ]; then
+        ocf_log debug "Replication healthy: WAL receiver status = streaming"
+        return 0
+    elif [ -z "$wal_receiver_status" ]; then
+        ocf_log warn "Replication unhealthy: No WAL receiver process running"
+        return 1
+    else
+        ocf_log warn "Replication unhealthy: WAL receiver status = ${wal_receiver_status}"
+        return 1
+    fi
+}
+
 pgsql_monitor() {
     local rc
 
@@ -782,7 +888,56 @@ pgsql_monitor() {
 
         return $OCF_RUNNING_PROMOTED
     else
-        return $OCF_SUCCESS
+        # Enhanced replication health monitoring for standby (v1.6)
+        check_replication_health
+        local repl_health=$?
+
+        if [ $repl_health -eq 0 ]; then
+            # Replication is healthy, reset failure counter
+            ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+            return $OCF_SUCCESS
+        else
+            # Replication is unhealthy, increment failure counter
+            local failure_count=$(ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null)
+            failure_count=$((failure_count + 1))
+            ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v $failure_count -l reboot 2>/dev/null
+
+            ocf_log warn "Replication failure detected (count: ${failure_count}/${OCF_RESKEY_replication_failure_threshold})"
+
+            # Check if threshold exceeded
+            if [ $failure_count -ge ${OCF_RESKEY_replication_failure_threshold} ]; then
+                ocf_log err "Replication failure threshold (${OCF_RESKEY_replication_failure_threshold}) exceeded"
+                ocf_log err "Triggering automatic recovery (pg_rewind/pg_basebackup)"
+
+                # Discover promoted node for recovery
+                local primary_host=$(discover_promoted_node)
+
+                if [ -n "$primary_host" ]; then
+                    ocf_log info "Initiating recovery from primary: ${primary_host}"
+
+                    # Reset failure counter before recovery attempt
+                    ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+
+                    # Trigger recovery (this will stop PostgreSQL, run pg_rewind/basebackup, and restart)
+                    recover_standby "$primary_host"
+                    local recovery_rc=$?
+
+                    if [ $recovery_rc -eq 0 ]; then
+                        ocf_log info "Automatic replication recovery completed successfully"
+                        return $OCF_SUCCESS
+                    else
+                        ocf_log err "Automatic replication recovery failed (rc=$recovery_rc)"
+                        return $OCF_ERR_GENERIC
+                    fi
+                else
+                    ocf_log err "Cannot trigger recovery: unable to discover promoted node"
+                    return $OCF_ERR_GENERIC
+                fi
+            fi
+
+            # Haven't reached threshold yet, still return success but log warning
+            return $OCF_SUCCESS
+        fi
     fi
 }
 
@@ -973,21 +1128,30 @@ pgsql_demote() {
 
     ocf_log info "Demoting PostgreSQL to standby"
 
-    # Get primary host from .pgpass or node list
-    primary_host=$(get_replication_host)
+    # Enhanced promoted node discovery (v1.6)
+    # Try dynamic discovery first, then fall back to traditional methods
+    ocf_log info "Discovering current promoted node for replication setup"
+    primary_host=$(discover_promoted_node)
 
     if [ -z "$primary_host" ]; then
-        # Fallback to node list
-        for node in ${OCF_RESKEY_node_list}; do
-            if [ "$node" != "$(hostname -s)" ]; then
-                primary_host="$node"
-                break
-            fi
-        done
+        # Fallback to .pgpass or node list
+        ocf_log info "Dynamic discovery failed, trying traditional methods"
+        primary_host=$(get_replication_host)
+
+        if [ -z "$primary_host" ]; then
+            # Fallback to node list (first non-self node)
+            for node in ${OCF_RESKEY_node_list}; do
+                if [ "$node" != "$(hostname -s)" ]; then
+                    primary_host="$node"
+                    break
+                fi
+            done
+        fi
     fi
 
     if [ -z "$primary_host" ]; then
         ocf_log err "Cannot determine primary host for replication"
+        ocf_log err "Tried: discover_promoted_node, .pgpass, and node_list"
         return $OCF_ERR_GENERIC
     fi
 

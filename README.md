@@ -78,6 +78,24 @@ pgtwin automatically validates your PostgreSQL configuration on startup to preve
 
 **CRITICAL** errors block PostgreSQL startup - you must fix them before the cluster will start.
 
+### Automatic Replication Recovery (v1.6)
+
+pgtwin v1.6 introduces intelligent replication failure detection and automatic recovery:
+
+| Feature | Description |
+|---------|-------------|
+| **Replication Health Monitoring** | Monitor function actively tracks WAL receiver status on standby nodes |
+| **Failure Counter** | Incremental counter tracks consecutive replication failures (configurable threshold) |
+| **Automatic Recovery** | When threshold exceeded, automatically triggers `pg_rewind` or `pg_basebackup` |
+| **Dynamic Node Discovery** | Discovers current primary via VIP query, node scanning, or CIB parsing |
+| **Zero-Touch Recovery** | Timeline divergence and replication breaks resolve automatically without manual intervention |
+
+**New Parameters**:
+- `vip`: Virtual IP address for fast promoted node discovery (optional but recommended)
+- `replication_failure_threshold`: Number of monitor cycles before recovery (default: 5, ~40 seconds with 8s intervals)
+
+**Status**: Experimental - automatic recovery logic is implemented but has known issues (see CHANGELOG.md).
+
 ### Advanced Features
 
 - **Disk Space Pre-Check**: Validates sufficient space before `pg_basebackup`
