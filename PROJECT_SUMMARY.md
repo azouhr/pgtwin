@@ -10,7 +10,7 @@ This document summarizes the transformation from the original `pgsql-ha` OCF age
 **Purpose**: OCF resource agent for 2-node PostgreSQL HA clusters
 **Target Repository**: https://github.com/azouhr/pgtwin
 **License**: GPL-2.0-or-later (ClusterLabs compatible)
-**Version**: 1.5.0
+**Version**: 1.6.1
 
 ---
 
@@ -42,8 +42,6 @@ This document summarizes the transformation from the original `pgsql-ha` OCF age
 ### 3. Added Patroni Comparison
 
 **Rationale**: Help users understand when to choose pgtwin vs Patroni
-
-**Location**: arc42/architecture.md (Section 2.1, Constraint TC-7)
 
 **Key Points**:
 | Feature | pgtwin (2-node) | Patroni (3+ nodes) |
@@ -319,13 +317,7 @@ pgtwin/
 
 ## Parent Repository Updates
 
-### arc42/architecture.md
-- ✅ Added Section 2.1 TC-7: Two-Node Cluster constraint
-- ✅ Added Patroni comparison table
-- ✅ Removed logical replication reference in glossary
-- ✅ Updated to reflect pgtwin as 2-node focused solution
-
-**Note**: Parent repository still contains original pgsql-ha and comprehensive development history. The pgtwin directory is a clean, production-ready extraction.
+The pgtwin directory is a clean, production-ready extraction from the parent repository which contains original pgsql-ha and comprehensive development history.
 
 ---
 
