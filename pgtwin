@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# pgtwin - PostgreSQL Twin/HA OCF Resource Agent
+# PostgreSQL OCF RA with advanced replication slot management
 # Version: 1.6.3
 # Release Date: 2025-11-05
 #
@@ -91,15 +91,11 @@ meta_data() {
 <version>1.6</version>
 
 <longdesc lang="en">
-pgtwin - PostgreSQL Twin/HA Resource Agent
-
 Resource agent for PostgreSQL with advanced replication slot management,
 pg_rewind support, automatic failover handling, and automatic replication recovery.
 Includes enhanced monitoring for replication health and dynamic promoted node discovery.
-
-Designed for active-passive PostgreSQL HA clusters with automatic timeline recovery.
 </longdesc>
-<shortdesc lang="en">PostgreSQL Twin HA with automatic replication recovery</shortdesc>
+<shortdesc lang="en">PostgreSQL HA with automatic replication recovery</shortdesc>
 
 <parameters>
 <parameter name="pgdata" unique="0" required="1">
@@ -325,7 +321,7 @@ update_application_name_in_config() {
     # Check if postgresql.auto.conf exists
     if [ ! -f "$auto_conf" ]; then
         ocf_log info "Creating postgresql.auto.conf with application_name='$app_name'"
-        echo "# Managed by Pacemaker pgsql-ha resource agent" > "$auto_conf"
+        echo "# Managed by Pacemaker pgtwin resource agent" > "$auto_conf"
         echo "application_name = '$app_name'" >> "$auto_conf"
         chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "$auto_conf"
         chmod 600 "$auto_conf"
@@ -344,6 +340,14 @@ update_application_name_in_config() {
     fi
 
     return 0
+}
+
+# Get the Pacemaker cluster node name for this node
+# Returns the cluster node name (not hostname) which is required for crm_attribute and node list operations
+get_cluster_node_name() {
+    # Use crm_node to get the cluster node name (not hostname)
+    # This is critical when cluster node names differ from system hostnames
+    crm_node -n 2>/dev/null || hostname -s
 }
 
 # Parse .pgpass file to get replication credentials
@@ -401,7 +405,7 @@ get_replication_host() {
     if [ -z "$rep_host" ] || [ "$rep_host" = "*" ]; then
         # Fallback to finding another node from node_list
         for node in ${OCF_RESKEY_node_list}; do
-            if [ "$node" != "$(hostname -s)" ]; then
+            if [ "$node" != "$(get_cluster_node_name)" ]; then
                 echo "$node"
                 return 0
             fi
@@ -801,10 +805,9 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via Pacemaker CIB"
 
         # Try to find promoted instance from crm_mon
-        # Parse format: "* Promoted: [ psql1 ]" or "Promoted: [ psql1 ]"
-        promoted_node=$(crm_mon -1 2>/dev/null | grep "Promoted:" | tr -d '[]' | awk '{print $NF}')
+        promoted_node=$(crm_mon -1 2>/dev/null | grep -A 1 "Promoted:" | tail -1 | tr -d '[]' | awk '{print $1}')
 
-        if [ -n "$promoted_node" ] && [ "$promoted_node" != "*" ]; then
+        if [ -n "$promoted_node" ]; then
             ocf_log info "Discovered promoted node via Pacemaker CIB: ${promoted_node}"
             echo "$promoted_node"
             return 0
@@ -895,20 +898,13 @@ pgsql_monitor() {
 
         if [ $repl_health -eq 0 ]; then
             # Replication is healthy, reset failure counter
-            ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+            ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
             return $OCF_SUCCESS
         else
             # Replication is unhealthy, increment failure counter
-            # Note: Don't use ocf_run for GET operations as it interferes with output capture
-            local failure_count=$(crm_attribute -N $(hostname -s) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null)
-
-            # Ensure failure_count is a number (default to 0 if empty or non-numeric)
-            if ! [[ "$failure_count" =~ ^[0-9]+$ ]]; then
-                failure_count=0
-            fi
-
+            local failure_count=$(ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null)
             failure_count=$((failure_count + 1))
-            ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v $failure_count -l reboot 2>/dev/null
+            ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v $failure_count -l reboot 2>/dev/null
 
             ocf_log warn "Replication failure detected (count: ${failure_count}/${OCF_RESKEY_replication_failure_threshold})"
 
@@ -924,7 +920,7 @@ pgsql_monitor() {
                     ocf_log info "Initiating recovery from primary: ${primary_host}"
 
                     # Reset failure counter before recovery attempt
-                    ocf_run crm_attribute -N $(hostname -s) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+                    ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
 
                     # Trigger recovery (this will stop PostgreSQL, run pg_rewind/basebackup, and restart)
                     recover_standby "$primary_host"
@@ -1149,7 +1145,7 @@ pgsql_demote() {
         if [ -z "$primary_host" ]; then
             # Fallback to node list (first non-self node)
             for node in ${OCF_RESKEY_node_list}; do
-                if [ "$node" != "$(hostname -s)" ]; then
+                if [ "$node" != "$(get_cluster_node_name)" ]; then
                     primary_host="$node"
                     break
                 fi
@@ -1176,14 +1172,8 @@ pgsql_demote() {
     touch "${PGDATA}/standby.signal"
 
     # Update postgresql.auto.conf for replication with validated application name
-    # Include passfile parameter if pgpassfile is configured
-    local conninfo_params="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}"
-    if [ -n "${OCF_RESKEY_pgpassfile}" ]; then
-        conninfo_params="${conninfo_params} passfile=${OCF_RESKEY_pgpassfile}"
-    fi
-
     cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = '${conninfo_params}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
@@ -1240,13 +1230,7 @@ recover_standby() {
     if [ -x "${PG_REWIND}" ]; then
         ocf_log info "Attempting pg_rewind"
 
-        # Set PGPASSFILE environment variable if configured
-        local passfile_env=""
-        if [ -n "${OCF_RESKEY_pgpassfile}" ]; then
-            passfile_env="PGPASSFILE=${OCF_RESKEY_pgpassfile}"
-        fi
-
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${passfile_env} ${PG_REWIND} --target-pgdata=${PGDATA} --source-server='host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user}' --progress" >/dev/null 2>&1
+        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PG_REWIND} --target-pgdata=${PGDATA} --source-server='host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user}' --progress" >/dev/null 2>&1
         rc=$?
 
         if [ $rc -eq 0 ]; then
@@ -1255,14 +1239,9 @@ recover_standby() {
             # Create standby.signal
             touch "${PGDATA}/standby.signal"
 
-            # Update connection info with validated application name and passfile
-            local conninfo_params="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}"
-            if [ -n "${OCF_RESKEY_pgpassfile}" ]; then
-                conninfo_params="${conninfo_params} passfile=${OCF_RESKEY_pgpassfile}"
-            fi
-
+            # Update connection info with validated application name
             cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = '${conninfo_params}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
@@ -1348,17 +1327,8 @@ timeout=${OCF_RESKEY_basebackup_timeout}
 EOF
 
     # Start pg_basebackup in background
-    # Set PGPASSFILE environment variable if configured
-    local passfile_env=""
-    if [ -n "${OCF_RESKEY_pgpassfile}" ]; then
-        passfile_env="PGPASSFILE=${OCF_RESKEY_pgpassfile}"
-    fi
-
     (
-        # Note: Don't use -S (replication slot) during basebackup if there's timeline divergence
-        # The slot will be out of sync and cause failures. Let basebackup stream without a slot,
-        # and the slot will be recreated when replication starts up.
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${passfile_env} ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R --progress" > "${log_file}" 2>&1
+        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress" > "${log_file}" 2>&1
         echo $? > "${PGDATA}/.basebackup_rc"
     ) &
 
@@ -1428,8 +1398,7 @@ check_basebackup_progress() {
     # Process completed, check result
     if [ -f "${rc_file}" ]; then
         local bb_rc=$(cat "${rc_file}")
-        # Clean up all marker files (pid, rc, and log)
-        rm -f "${pid_file}" "${rc_file}" "${log_file}"
+        rm -f "${pid_file}" "${rc_file}"
 
         if [ "$bb_rc" -eq 0 ]; then
             ocf_log info "Asynchronous pg_basebackup completed successfully after ${elapsed}s"
@@ -1444,18 +1413,13 @@ check_basebackup_progress() {
                 fi
             fi
 
-            # Update connection info with passfile support
+            # Update connection info
             local app_name=$(get_application_name)
             local primary_host=$(grep "^primary=" "${pid_file}" | cut -d= -f2)
             local rep_user=$(grep "^user=" "${pid_file}" | cut -d= -f2)
 
-            local conninfo_params="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}"
-            if [ -n "${OCF_RESKEY_pgpassfile}" ]; then
-                conninfo_params="${conninfo_params} passfile=${OCF_RESKEY_pgpassfile}"
-            fi
-
             cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = '${conninfo_params}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
