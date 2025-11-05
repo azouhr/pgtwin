@@ -10,7 +10,7 @@
 
 ## Why pgtwin?
 
-**Problem**: You need PostgreSQL high availability but don't want the complexity and cost of 3+ node clusters.
+**Problem**: You need PostgreSQL high availability and recovery from cluster failures but don't want the complexity and cost of 3+ node clusters.
 
 **Solution**: pgtwin provides enterprise-grade PostgreSQL HA with just 2 nodes, using battle-tested Pacemaker/Corosync for cluster management.
 
@@ -42,7 +42,11 @@ sudo crm configure primitive postgres-db pgtwin \
 sudo crm configure clone postgres-clone postgres-db \
   meta promotable=true notify=true
 
-# 6. Done! Check status
+# 6. Create location constraints
+sudo crm configure location prefer-psql1 postgres-clone role=Promoted 100: psql1
+sudo crm configure location prefer-psql2 postgres-clone role=Promoted 50: psql2
+
+# 7. Done! Check status
 sudo crm status
 ```
 
@@ -111,38 +115,38 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                    Application Layer                        │
+│                    Application Layer                       │
 │               (Connects to VIP: 192.168.122.20)            │
 └────────────────────┬───────────────────────────────────────┘
                      │
             PostgreSQL Protocol (TCP 5432)
                      │
 ┌────────────────────┴───────────────────────────────────────┐
-│            PostgreSQL HA Cluster (pgtwin)                   │
-│                                                              │
-│  ┌──────────────────┐              ┌──────────────────┐   │
-│  │  Node 1 (psql1)  │◄────────────►│  Node 2 (psql2)  │   │
-│  │  192.168.122.60  │ Replication  │  192.168.122.120 │   │
-│  │                  │              │                  │   │
-│  │  PostgreSQL 17   │              │  PostgreSQL 17   │   │
-│  │  ┌────────────┐  │              │  ┌────────────┐  │   │
-│  │  │  Primary   │  │─────────────>│  │  Standby   │  │   │
-│  │  │  (Active)  │  │ WAL Stream   │  │ (Passive)  │  │   │
-│  │  └────────────┘  │              │  └────────────┘  │   │
-│  │                  │              │                  │   │
-│  │  Pacemaker       │◄────────────►│  Pacemaker       │   │
-│  │  Corosync        │ Heartbeat    │  Corosync        │   │
-│  │  pgtwin OCF      │ (UDP 5405)   │  pgtwin OCF      │   │
-│  └──────────────────┘              └──────────────────┘   │
-│           │                                   │             │
-│           │         SBD STONITH Fencing       │             │
-│           └───────────────┬───────────────────┘             │
-│                           │                                 │
+│            PostgreSQL HA Cluster (pgtwin)                  │
+│                                                            │
+│  ┌──────────────────┐              ┌──────────────────┐    │
+│  │  Node 1 (psql1)  │◄────────────►│  Node 2 (psql2)  │    │
+│  │  192.168.122.60  │ Replication  │  192.168.122.120 │    │
+│  │                  │              │                  │    │
+│  │  PostgreSQL 17   │              │  PostgreSQL 17   │    │
+│  │  ┌────────────┐  │              │  ┌────────────┐  │    │
+│  │  │  Primary   │  │─────────────>│  │  Standby   │  │    │
+│  │  │  (Active)  │  │ WAL Stream   │  │ (Passive)  │  │    │
+│  │  └────────────┘  │              │  └────────────┘  │    │
+│  │                  │              │                  │    │
+│  │  Pacemaker       │◄────────────►│  Pacemaker       │    │
+│  │  Corosync        │ Heartbeat    │  Corosync        │    │
+│  │  pgtwin OCF      │ (UDP 5405)   │  pgtwin OCF      │    │
+│  └──────────────────┘              └──────────────────┘    │
+│           │                                   │            │
+│           │         SBD STONITH Fencing       │            │
+│           └───────────────┬───────────────────┘            │
+│                           │                                │
 │                  ┌────────┴────────┐                       │
-│                  │  Shared Storage  │                       │
-│                  │   /dev/vdb       │                       │
-│                  └──────────────────┘                       │
-└─────────────────────────────────────────────────────────────┘
+│                  │  Shared Storage  │                      │
+│                  │   /dev/vdb       │                      │
+│                  └──────────────────┘                      │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ### How It Works
@@ -204,7 +208,7 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 **Decision**: pgtwin is explicitly designed for 2-node clusters, not 3+.
 
 **Rationale**:
-- Many organizations need basic HA but can't afford 3+ nodes
+- Many organizations need basic HA but can't afford 3+ Datacenters
 - Patroni requires 3+ nodes (1 DCS cluster + N PostgreSQL nodes minimum)
 - Pacemaker's 2-node quorum is well-established and reliable
 - Simpler architecture = easier to understand and operate
@@ -305,7 +309,7 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 | **Infrastructure Cost** | Lower (2 VMs) | Higher (3+ VMs + DCS) |
 | **Setup Complexity** | Lower | Higher |
 | **External Dependencies** | None (Pacemaker built-in) | Requires etcd/Consul/ZooKeeper |
-| **Maturity** | Very mature (Pacemaker 20+ years) | Mature (Patroni 8+ years) |
+| **Maturity** | Mature (Pacemaker 20+ years) | Mature (Patroni 8+ years) |
 | **Cloud-Native** | On-premise focused | Cloud-optimized |
 | **Geographic Distribution** | Limited (2 nodes, low latency) | Excellent (multi-site support) |
 | **Use Case** | Budget-constrained, simple HA | Multi-node, cloud, complex topologies |
@@ -319,7 +323,7 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 ## Requirements
 
 - **PostgreSQL**: 17.x (earlier versions may work but untested)
-- **OS**: Linux (SUSE/openSUSE, RHEL/CentOS, Ubuntu tested)
+- **OS**: Linux (openSUSE Tumbleweed tested)
 - **Pacemaker**: 3.0.1 or higher
 - **Corosync**: 3.x
 - **Python**: Not required (pure bash OCF agent)
@@ -471,7 +475,9 @@ pgtwin includes testing capabilities:
 sudo bash -n /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify OCF metadata
-sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
+sudo OCF_ROOT=/usr/lib/ocf \
+  OCF_RESKEY_pgdata=/var/lib/pgsql/data \
+  /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 
 # Test OCF agent manually
 sudo OCF_ROOT=/usr/lib/ocf \

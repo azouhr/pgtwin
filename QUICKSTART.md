@@ -101,16 +101,42 @@ host    replication     replicator      192.168.122.0/24        scram-sha-256
 host    all             all             192.168.122.0/24        scram-sha-256
 ```
 
-### 1.5 Create Replication User
+### 1.5 Start PostgreSQL on Primary (Temporarily)
+
+**NOTE**: PostgreSQL must be running to create the replication user and slot.
 
 ```bash
-# On primary node
+# On node 1 only - start PostgreSQL temporarily
+sudo -u postgres pg_ctl -D /var/lib/pgsql/data start
+
+# Test connection
+sudo -u postgres psql -c "SELECT version();"
+sudo -u postgres psql -c "SHOW wal_level;"
+sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
+```
+
+### 1.6 Create Replication User
+
+```bash
+# On primary node (while PostgreSQL is running)
 sudo -u postgres psql << EOF
 CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
 EOF
 ```
 
-### 1.6 Create .pgpass File (Both Nodes)
+### 1.7 Create Replication Slot
+
+```bash
+# On primary node - create the replication slot for standby
+sudo -u postgres psql << EOF
+SELECT pg_create_physical_replication_slot('ha_slot');
+EOF
+
+# Verify slot creation
+sudo -u postgres psql -c "SELECT * FROM pg_replication_slots;"
+```
+
+### 1.8 Create .pgpass File (Both Nodes)
 
 ```bash
 # On both nodes
@@ -122,27 +148,24 @@ sudo chmod 600 /var/lib/pgsql/.pgpass
 sudo chown postgres:postgres /var/lib/pgsql/.pgpass
 ```
 
-### 1.7 Start PostgreSQL on Primary (Temporarily)
+### 1.9 Stop PostgreSQL on Primary
 
 ```bash
-# On node 1 only - just to verify configuration
-sudo -u postgres pg_ctl -D /var/lib/pgsql/data start
-
-# Test connection
-sudo -u postgres psql -c "SELECT version();"
-sudo -u postgres psql -c "SHOW wal_level;"
-sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
-
-# Stop it - Pacemaker will manage it
+# On node 1 - stop PostgreSQL, Pacemaker will manage it
 sudo -u postgres pg_ctl -D /var/lib/pgsql/data stop
 ```
 
-### 1.8 Copy Data Directory to Standby (Initial Setup)
+### 1.10 Copy Data Directory to Standby (Initial Setup)
 
 ```bash
-# On node 2 - copy from node 1
+# On node 2 - copy from node 1 (use the replication slot created earlier)
 sudo -u postgres pg_basebackup -h psql1 -U replicator -D /var/lib/pgsql/data -P -R -S ha_slot
+
+# Verify standby.signal was created
+ls -l /var/lib/pgsql/data/standby.signal
 ```
+
+**NOTE**: The `-S ha_slot` parameter uses the replication slot created in step 1.7. This ensures the primary retains all necessary WAL files during the initial copy.
 
 ---
 
@@ -166,8 +189,13 @@ sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
 sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify installation
-sudo ocf-tester -n pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin
+ls -l /usr/lib/ocf/resource.d/heartbeat/pgtwin
+
+# Optional: Test agent metadata
+sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 ```
+
+**NOTE**: Testing with `ocf-tester` requires setting environment variables and can be complex. It's recommended to test the agent once the cluster is configured, where Pacemaker will set all required variables automatically.
 
 ### 2.3 Configure Corosync (Node 1)
 
