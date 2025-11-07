@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.3
-# Release Date: 2025-11-05
+# Version: 1.6.4
+# Release Date: 2025-11-07
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -310,33 +310,54 @@ get_application_name() {
 # Update application_name in postgresql.auto.conf
 # This ensures the correct application_name is set when starting or promoting
 update_application_name_in_config() {
+    # v1.7.0: Refactored to use ALTER SYSTEM instead of manual file editing
+    # This function now handles both application_name and synchronous_standby_names
     local app_name=$(get_application_name)
-    local auto_conf="${PGDATA}/postgresql.auto.conf"
 
     if [ -z "$app_name" ]; then
         ocf_log warn "No application_name to set in configuration"
         return 0
     fi
 
-    # Check if postgresql.auto.conf exists
-    if [ ! -f "$auto_conf" ]; then
-        ocf_log info "Creating postgresql.auto.conf with application_name='$app_name'"
-        echo "# Managed by Pacemaker pgtwin resource agent" > "$auto_conf"
-        echo "application_name = '$app_name'" >> "$auto_conf"
-        chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "$auto_conf"
-        chmod 600 "$auto_conf"
+    # Check if PostgreSQL is running (required for ALTER SYSTEM)
+    if ! pgsql_is_running; then
+        ocf_log debug "PostgreSQL not running, cannot use ALTER SYSTEM. Will configure on next start."
         return 0
     fi
 
-    # Update or add application_name in existing file
-    if grep -q "^application_name" "$auto_conf"; then
-        # Update existing application_name (using sed for in-place edit)
-        sed -i "s/^application_name.*$/application_name = '$app_name'/" "$auto_conf"
-        ocf_log info "Updated application_name to '$app_name' in postgresql.auto.conf"
+    # Set application_name using ALTER SYSTEM
+    ocf_log info "Configuring application_name='${app_name}' using ALTER SYSTEM"
+    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET application_name = '${app_name}'\"" >/dev/null 2>&1
+
+    if [ $? -ne 0 ]; then
+        ocf_log warn "Failed to set application_name using ALTER SYSTEM"
+        return 1
+    fi
+
+    # If this is a promoted instance with rep_mode=sync, also configure synchronous_standby_names
+    if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+        local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
+
+        # Only set if empty or different from expected
+        if [ -z "$current_sync" ] || [ "$current_sync" != "$app_name" ]; then
+            ocf_log info "Configuring synchronous_standby_names='${app_name}' for rep_mode=sync"
+            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${app_name}'\"" >/dev/null 2>&1
+
+            if [ $? -eq 0 ]; then
+                ocf_log info "Synchronous replication enabled: synchronous_standby_names='${app_name}'"
+            else
+                ocf_log warn "Failed to set synchronous_standby_names"
+            fi
+        fi
+    fi
+
+    # Reload configuration to apply changes
+    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
+
+    if [ $? -eq 0 ]; then
+        ocf_log debug "PostgreSQL configuration reloaded successfully"
     else
-        # Append if not found
-        echo "application_name = '$app_name'" >> "$auto_conf"
-        ocf_log info "Added application_name='$app_name' to postgresql.auto.conf"
+        ocf_log warn "Failed to reload PostgreSQL configuration"
     fi
 
     return 0
@@ -356,6 +377,8 @@ parse_pgpass() {
     local pgpass_file="${OCF_RESKEY_pgpassfile}"
     local rep_user=""
     local rep_host=""
+    local local_node=$(get_cluster_node_name)
+    local local_hostname=$(hostname)
 
     # Default to postgres user's .pgpass if not specified
     if [ -z "$pgpass_file" ]; then
@@ -368,12 +391,32 @@ parse_pgpass() {
         return 1
     fi
 
-    # Look for replication database entries
+    # Look for replication database entries, but exclude local node entries
     # Format: host:port:replication:username:password
-    local entry=$(grep ":replication:" "$pgpass_file" | head -1)
+    # v1.7.0: Filter out entries matching local node/hostname to prevent self-replication
+    local entry=""
+    while IFS= read -r line; do
+        local entry_host=$(echo "$line" | cut -d: -f1)
+
+        # Skip if entry matches local cluster node name or local hostname
+        if [ "$entry_host" = "$local_node" ] || [ "$entry_host" = "$local_hostname" ]; then
+            ocf_log debug "Skipping .pgpass entry for local node: $entry_host"
+            continue
+        fi
+
+        # Skip if entry matches localhost or 127.0.0.1
+        if [ "$entry_host" = "localhost" ] || [ "$entry_host" = "127.0.0.1" ]; then
+            ocf_log debug "Skipping .pgpass entry for localhost: $entry_host"
+            continue
+        fi
+
+        # Found a valid remote host entry
+        entry="$line"
+        break
+    done < <(grep ":replication:" "$pgpass_file")
 
     if [ -z "$entry" ]; then
-        ocf_log warn "No replication entry found in $pgpass_file, using default 'replicator' user"
+        ocf_log warn "No remote replication entry found in $pgpass_file (filtered local node: $local_node/$local_hostname)"
         echo "replicator:"
         return 1
     fi
@@ -499,6 +542,143 @@ check_disk_space_for_basebackup() {
     fi
 
     ocf_log info "Disk space check PASSED: ${available_space_mb}MB available, ${required_space_mb}MB required"
+    return 0
+}
+
+# Ensure .pgpass file exists in standard location
+ensure_pgpass() {
+    local standard_pgpass="/var/lib/pgsql/.pgpass"
+
+    # If no pgpassfile parameter set, check if standard location exists
+    if [ -z "${OCF_RESKEY_pgpassfile}" ]; then
+        if [ -f "$standard_pgpass" ]; then
+            ocf_log debug ".pgpass exists in standard location: $standard_pgpass"
+            echo "$standard_pgpass"
+            return 0
+        else
+            ocf_log warn "No pgpassfile configured and $standard_pgpass does not exist"
+            return 1
+        fi
+    fi
+
+    # If pgpassfile parameter points to standard location, we're good
+    if [ "${OCF_RESKEY_pgpassfile}" = "$standard_pgpass" ]; then
+        if [ -f "$standard_pgpass" ]; then
+            ocf_log debug ".pgpass exists in standard location: $standard_pgpass"
+            echo "$standard_pgpass"
+            return 0
+        else
+            ocf_log err "Configured pgpassfile $standard_pgpass does not exist"
+            return 1
+        fi
+    fi
+
+    # pgpassfile points to non-standard location - copy to standard location
+    if [ -f "${OCF_RESKEY_pgpassfile}" ]; then
+        ocf_log info "Copying .pgpass from ${OCF_RESKEY_pgpassfile} to $standard_pgpass"
+        cp "${OCF_RESKEY_pgpassfile}" "$standard_pgpass"
+        chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "$standard_pgpass"
+        chmod 600 "$standard_pgpass"
+
+        if [ $? -eq 0 ]; then
+            ocf_log info ".pgpass successfully copied to standard location"
+            echo "$standard_pgpass"
+            return 0
+        else
+            ocf_log err "Failed to copy .pgpass to standard location"
+            return 1
+        fi
+    else
+        ocf_log err "Configured pgpassfile ${OCF_RESKEY_pgpassfile} does not exist"
+        return 1
+    fi
+}
+
+# Validate pg_hba.conf for replication and pg_rewind access
+validate_pghba_config() {
+    ocf_log info "Validating pg_hba.conf for replication access..."
+
+    # Only check on promoted (primary) node
+    if ! pgsql_is_promoted; then
+        ocf_log debug "Not promoted, skipping pg_hba.conf validation"
+        return 0
+    fi
+
+    local rep_user=$(get_replication_user)
+    local has_errors=0
+    local has_warnings=0
+
+    # Determine expected network from node_list or make a suggestion
+    local suggested_network=""
+    if [ -n "${OCF_RESKEY_node_list}" ]; then
+        # Try to extract network from first IP in node_list
+        local first_node=$(echo "${OCF_RESKEY_node_list}" | awk '{print $1}')
+        if [[ $first_node =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            # It's an IP address - derive /24 network
+            suggested_network=$(echo "$first_node" | sed 's/\.[0-9]*$/\.0\/24/')
+        else
+            suggested_network="<your_cluster_network>/24"
+        fi
+    else
+        suggested_network="<your_cluster_network>/24"
+    fi
+
+    # Check for postgres database access (required for pg_rewind)
+    local postgres_access=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT COUNT(*) FROM pg_hba_file_rules
+        WHERE database @> '{postgres}'
+        AND user_name @> '{${rep_user}}'
+        AND type IN ('host', 'hostssl')
+    \"" 2>/dev/null)
+
+    if [ "$postgres_access" = "0" ] || [ -z "$postgres_access" ]; then
+        ocf_log warn "pg_hba.conf WARNING: Missing entry for pg_rewind access"
+        ocf_log warn "pg_rewind requires SQL access to 'postgres' database"
+        ocf_log warn "Without this, recovery will always use slower pg_basebackup"
+        ocf_log warn ""
+        ocf_log warn "SUGGESTED FIX: Add to pg_hba.conf on PRIMARY (before restrictive rules):"
+        ocf_log warn "  host    postgres        ${rep_user}      ${suggested_network}        scram-sha-256"
+        ocf_log warn ""
+        ocf_log warn "After adding, reload: sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
+        has_warnings=1
+    else
+        ocf_log info "✓ pg_hba.conf allows pg_rewind access (postgres database)"
+    fi
+
+    # Check for replication database access (required for streaming replication and pg_basebackup)
+    local replication_access=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT COUNT(*) FROM pg_hba_file_rules
+        WHERE database @> '{replication}'
+        AND user_name @> '{${rep_user}}'
+        AND type IN ('host', 'hostssl')
+    \"" 2>/dev/null)
+
+    if [ "$replication_access" = "0" ] || [ -z "$replication_access" ]; then
+        ocf_log err "pg_hba.conf ERROR: Missing entry for replication access"
+        ocf_log err "Streaming replication and pg_basebackup REQUIRE 'replication' database access"
+        ocf_log err ""
+        ocf_log err "REQUIRED FIX: Add to pg_hba.conf on PRIMARY (before restrictive rules):"
+        ocf_log err "  host    replication     ${rep_user}      ${suggested_network}        scram-sha-256"
+        ocf_log err ""
+        ocf_log err "After adding, reload: sudo -u postgres psql -c \"SELECT pg_reload_conf();\""
+        has_errors=1
+    else
+        ocf_log info "✓ pg_hba.conf allows replication access"
+    fi
+
+    # Additional helpful suggestions
+    if [ $has_errors -ne 0 ] || [ $has_warnings -ne 0 ]; then
+        ocf_log info ""
+        ocf_log info "Complete pg_hba.conf example (add near top of file):"
+        ocf_log info "  # Replication access for HA cluster"
+        ocf_log info "  host    postgres        ${rep_user}      ${suggested_network}        scram-sha-256"
+        ocf_log info "  host    replication     ${rep_user}      ${suggested_network}        scram-sha-256"
+    fi
+
+    if [ $has_errors -ne 0 ]; then
+        return 1
+    fi
+
     return 0
 }
 
@@ -717,6 +897,15 @@ check_postgresql_config() {
         ocf_log info "Instance is STANDBY - configuration check complete"
     fi
 
+    # Validate pg_hba.conf entries (on PRIMARY only)
+    if pgsql_is_promoted; then
+        validate_pghba_config
+        local pghba_rc=$?
+        if [ $pghba_rc -ne 0 ]; then
+            config_ok=1
+        fi
+    fi
+
     # Summary
     if [ $config_ok -ne 0 ]; then
         ocf_log err "PostgreSQL configuration has ERRORS - replication may not work!"
@@ -754,6 +943,47 @@ pgsql_is_promoted() {
         return 0  # Is promoted (primary)
     fi
     return 1  # Is standby
+}
+
+resolve_cluster_node_to_hostname() {
+    # Resolve Pacemaker cluster node name to actual hostname/IP
+    # This is needed when cluster node names differ from system hostnames
+    local cluster_node="$1"
+
+    # Try to get the node's hostname from Pacemaker
+    if command -v crm_node >/dev/null 2>&1; then
+        # Query Pacemaker for node attributes
+        local node_hostname=$(crm_node -l 2>/dev/null | grep "^[0-9]* ${cluster_node} " | awk '{print $2}')
+
+        if [ -n "$node_hostname" ] && [ "$node_hostname" != "$cluster_node" ]; then
+            ocf_log debug "Resolved cluster node '${cluster_node}' to hostname '${node_hostname}'"
+            echo "$node_hostname"
+            return 0
+        fi
+    fi
+
+    # Check if node_list has a mapping for this cluster node
+    # node_list should contain resolvable hostnames or IPs
+    if [ -n "${OCF_RESKEY_node_list}" ]; then
+        # If cluster node is in node_list, return it (should be resolvable)
+        for node in ${OCF_RESKEY_node_list}; do
+            if [ "$node" = "$cluster_node" ]; then
+                echo "$node"
+                return 0
+            fi
+        done
+
+        # If not found in node_list, assume first node in list matches
+        # This is a weak fallback but better than nothing
+        ocf_log warn "Cluster node '${cluster_node}' not in node_list, using first entry"
+        echo "${OCF_RESKEY_node_list}" | awk '{print $1}'
+        return 0
+    fi
+
+    # Last resort: return the cluster node name as-is (may not be resolvable)
+    ocf_log warn "Cannot resolve cluster node '${cluster_node}' to hostname, using as-is"
+    echo "$cluster_node"
+    return 1
 }
 
 discover_promoted_node() {
@@ -805,12 +1035,22 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via Pacemaker CIB"
 
         # Try to find promoted instance from crm_mon
-        promoted_node=$(crm_mon -1 2>/dev/null | grep -A 1 "Promoted:" | tail -1 | tr -d '[]' | awk '{print $1}')
+        # Use $NF to get last field (the node name) from the Promoted line
+        local cluster_node=$(crm_mon -1 2>/dev/null | grep "Promoted:" | tr -d '[]' | awk '{print $NF}')
 
-        if [ -n "$promoted_node" ]; then
-            ocf_log info "Discovered promoted node via Pacemaker CIB: ${promoted_node}"
-            echo "$promoted_node"
-            return 0
+        if [ -n "$cluster_node" ]; then
+            ocf_log info "Discovered promoted cluster node via Pacemaker CIB: ${cluster_node}"
+
+            # Resolve cluster node name to actual hostname/IP
+            promoted_node=$(resolve_cluster_node_to_hostname "$cluster_node")
+
+            if [ $? -eq 0 ]; then
+                ocf_log info "Resolved to connectable hostname: ${promoted_node}"
+                echo "$promoted_node"
+                return 0
+            else
+                ocf_log warn "Could not resolve cluster node '${cluster_node}' to hostname"
+            fi
         fi
     fi
 
@@ -993,9 +1233,6 @@ pgsql_start() {
         ocf_log info "Starting PostgreSQL as primary"
     fi
 
-    # Update application_name in configuration before starting
-    update_application_name_in_config
-
     # Start PostgreSQL
     runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} -w -t 60 start" >/dev/null 2>&1
     rc=$?
@@ -1010,6 +1247,9 @@ pgsql_start() {
     while [ $count -lt 60 ]; do
         if runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT 1' >/dev/null 2>&1"; then
             ocf_log info "PostgreSQL started successfully"
+
+            # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
+            update_application_name_in_config
 
             # Perform configuration check after successful start
             check_postgresql_config
@@ -1080,9 +1320,6 @@ pgsql_promote() {
 
     ocf_log info "Promoting PostgreSQL to primary"
 
-    # Update application_name before promotion
-    update_application_name_in_config
-
     # Promote using pg_ctl (it will remove standby.signal automatically)
     # Note: Do NOT manually remove standby.signal - pg_ctl promote handles it
     runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} promote" >/dev/null 2>&1
@@ -1104,6 +1341,9 @@ pgsql_promote() {
         if pgsql_is_promoted; then
             ocf_log info "PostgreSQL promoted successfully"
 
+            # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
+            update_application_name_in_config
+
             # Create replication slot if needed
             if [ -n "${OCF_RESKEY_slot_name}" ]; then
                 create_replication_slot
@@ -1117,6 +1357,65 @@ pgsql_promote() {
 
     ocf_log err "PostgreSQL promotion timed out"
     return $OCF_ERR_GENERIC
+}
+
+check_timeline_divergence() {
+    # Check if local PGDATA has diverged from the primary
+    # Returns 0 if diverged (needs recovery), 1 if not diverged
+    local primary_host="$1"
+    local rep_user=$(get_replication_user)
+
+    if [ ! -d "${PGDATA}" ]; then
+        ocf_log debug "PGDATA does not exist, no divergence possible"
+        return 1
+    fi
+
+    # Get local checkpoint LSN and timeline from pg_controldata
+    local local_checkpoint_lsn=""
+    local local_timeline=""
+
+    if command -v pg_controldata >/dev/null 2>&1; then
+        local_checkpoint_lsn=$(runuser -u ${OCF_RESKEY_pguser} -- pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint location:" | awk '{print $NF}')
+        local_timeline=$(runuser -u ${OCF_RESKEY_pguser} -- pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint's TimeLineID:" | awk '{print $NF}')
+    fi
+
+    if [ -z "$local_checkpoint_lsn" ] || [ -z "$local_timeline" ]; then
+        ocf_log debug "Could not read local pg_controldata, assuming no divergence"
+        return 1
+    fi
+
+    ocf_log info "Local PGDATA state: timeline=${local_timeline}, checkpoint_lsn=${local_checkpoint_lsn}"
+
+    # Try to get primary's current WAL position
+    local primary_current_lsn=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_current_wal_lsn()\"" 2>/dev/null)
+    local primary_timeline=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT timeline_id FROM pg_control_checkpoint()\"" 2>/dev/null)
+
+    if [ -z "$primary_current_lsn" ] || [ -z "$primary_timeline" ]; then
+        ocf_log warn "Could not query primary for timeline/LSN, will attempt demotion and let PostgreSQL detect issues"
+        return 1
+    fi
+
+    ocf_log info "Primary state: timeline=${primary_timeline}, current_lsn=${primary_current_lsn}"
+
+    # Check if timelines match
+    if [ "$local_timeline" != "$primary_timeline" ]; then
+        ocf_log warn "Timeline divergence detected: local=${local_timeline}, primary=${primary_timeline}"
+        ocf_log info "Timeline divergence requires pg_rewind recovery"
+        return 0
+    fi
+
+    # Check if local checkpoint is ahead of primary's current position
+    # This indicates the local node has WAL that the primary doesn't have
+    local lsn_compare=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_wal_lsn_diff('${local_checkpoint_lsn}', '${primary_current_lsn}')\"" 2>/dev/null)
+
+    if [ -n "$lsn_compare" ] && [ "$lsn_compare" -gt 0 ]; then
+        ocf_log warn "WAL divergence detected: local checkpoint ${local_checkpoint_lsn} is ahead of primary ${primary_current_lsn} by $lsn_compare bytes"
+        ocf_log info "WAL divergence requires pg_rewind recovery"
+        return 0
+    fi
+
+    ocf_log debug "No timeline divergence detected"
+    return 1
 }
 
 pgsql_demote() {
@@ -1168,12 +1467,33 @@ pgsql_demote() {
         return $rc
     fi
 
+    # v1.7.0: Check for timeline divergence before attempting to start as standby
+    ocf_log info "Checking for timeline divergence before demotion"
+    if check_timeline_divergence "${primary_host}"; then
+        ocf_log info "Timeline divergence detected, triggering pg_rewind recovery"
+
+        # Call recover_standby which will handle pg_rewind, create standby.signal, and start
+        recover_standby "${primary_host}"
+        rc=$?
+
+        if [ $rc -eq 0 ]; then
+            ocf_log info "PostgreSQL demoted successfully via pg_rewind recovery"
+            return $OCF_SUCCESS
+        else
+            ocf_log err "Failed to recover standby during demotion (rc=$rc)"
+            return $rc
+        fi
+    fi
+
+    # No divergence detected, proceed with normal demotion
+    ocf_log info "No timeline divergence detected, proceeding with normal demotion"
+
     # Create standby.signal
     touch "${PGDATA}/standby.signal"
 
     # Update postgresql.auto.conf for replication with validated application name
     cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
@@ -1230,24 +1550,48 @@ recover_standby() {
     if [ -x "${PG_REWIND}" ]; then
         ocf_log info "Attempting pg_rewind"
 
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PG_REWIND} --target-pgdata=${PGDATA} --source-server='host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user}' --progress" >/dev/null 2>&1
-        rc=$?
+        # Ensure .pgpass is in standard location
+        local pgpass_file=$(ensure_pgpass)
+        if [ $? -ne 0 ]; then
+            ocf_log warn "Cannot ensure .pgpass file, skipping pg_rewind"
+        else
+            ocf_log info "Using .pgpass file: ${pgpass_file}"
 
-        if [ $rc -eq 0 ]; then
-            ocf_log info "pg_rewind completed successfully"
+            # Test connectivity before attempting pg_rewind
+            ocf_log debug "Testing connectivity to ${primary_host} as ${rep_user}"
+            runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" psql -h "${primary_host}" -p "${OCF_RESKEY_pgport}" -U "${rep_user}" -d postgres -Atc "SELECT 1" >/dev/null 2>&1
+            if [ $? -ne 0 ]; then
+                ocf_log warn "Cannot connect to primary ${primary_host} as ${rep_user}, pg_rewind will likely fail"
+            fi
 
-            # Create standby.signal
-            touch "${PGDATA}/standby.signal"
+            # Run pg_rewind with proper environment variable passing
+            ocf_log info "Executing pg_rewind to sync from ${primary_host}"
+            runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" \
+                ${PG_REWIND} \
+                --target-pgdata="${PGDATA}" \
+                --source-server="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} dbname=postgres sslmode=prefer" \
+                --progress 2>&1 | tee /tmp/pg_rewind_$$.log
+            rc=${PIPESTATUS[0]}
 
-            # Update connection info with validated application name
-            cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
+            if [ $rc -eq 0 ]; then
+                ocf_log info "pg_rewind completed successfully"
+                rm -f /tmp/pg_rewind_$$.log
+
+                # Create standby.signal
+                touch "${PGDATA}/standby.signal"
+
+                # Update connection info with validated application name
+                cat > "${PGDATA}/postgresql.auto.conf" <<EOF
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
-            return 0
-        else
-            ocf_log warn "pg_rewind failed, falling back to full basebackup"
+                return 0
+            else
+                ocf_log warn "pg_rewind failed with exit code $rc, see log: /tmp/pg_rewind_$$.log"
+                ocf_log warn "pg_rewind output: $(cat /tmp/pg_rewind_$$.log | head -20)"
+                ocf_log warn "Falling back to full basebackup"
+            fi
         fi
     fi
 
@@ -1318,6 +1662,14 @@ start_async_basebackup() {
 
     ocf_log info "Starting asynchronous pg_basebackup from ${primary_host}"
 
+    # Ensure .pgpass is in standard location
+    local pgpass_file=$(ensure_pgpass)
+    if [ $? -ne 0 ]; then
+        ocf_log err "Cannot ensure .pgpass file for pg_basebackup"
+        return $OCF_ERR_CONFIGURED
+    fi
+    ocf_log info "Using .pgpass file for pg_basebackup: ${pgpass_file}"
+
     # Create progress marker
     cat > "${pid_file}" <<EOF
 started=$(date +%s)
@@ -1328,7 +1680,7 @@ EOF
 
     # Start pg_basebackup in background
     (
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress" > "${log_file}" 2>&1
+        runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress > "${log_file}" 2>&1
         echo $? > "${PGDATA}/.basebackup_rc"
     ) &
 
@@ -1419,7 +1771,7 @@ check_basebackup_progress() {
             local rep_user=$(grep "^user=" "${pid_file}" | cut -d= -f2)
 
             cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 

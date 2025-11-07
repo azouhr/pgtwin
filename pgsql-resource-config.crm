@@ -1,0 +1,97 @@
+# Pacemaker Resource Configuration for PostgreSQL HA
+# with custom pgtwin resource agent
+#
+# This configuration creates a promotable clone resource for PostgreSQL
+# with automatic failover and replication slot management
+
+###############################################################################
+# IMPORTANT: Required pg_hba.conf Configuration on PRIMARY Node
+###############################################################################
+#
+# The pgtwin agent requires BOTH of these entries in pg_hba.conf for proper
+# operation. Add these lines BEFORE any restrictive rules:
+#
+#   # Required for pg_rewind (SQL database access)
+#   host    postgres        replicator      192.168.122.0/24        scram-sha-256
+#
+#   # Required for streaming replication and pg_basebackup
+#   host    replication     replicator      192.168.122.0/24        scram-sha-256
+#
+# After adding, reload configuration on PRIMARY:
+#   sudo -u postgres psql -c "SELECT pg_reload_conf();"
+#
+# Validation:
+#   The pgtwin agent will automatically validate these entries during startup
+#   and provide clear error messages if missing.
+#
+###############################################################################
+
+# Configure cluster properties
+property cib-bootstrap-options: \
+    have-watchdog=true \
+    stonith-enabled=true \
+    no-quorum-policy=ignore \
+    cluster-recheck-interval=2min
+
+# Define the virtual IP for PostgreSQL clients
+primitive postgres-vip IPaddr2 \
+    params ip=192.168.122.100 cidr_netmask=24 \
+    op monitor interval=10s timeout=20s \
+    meta is-managed=true target-role=Started
+
+# Define the PostgreSQL resource using our custom agent
+primitive postgres-db pgtwin \
+    params \
+        pgdata="/var/lib/pgsql/data" \
+        pghost="0.0.0.0" \
+        pgport="5432" \
+        pguser="postgres" \
+        pgpassfile="/var/lib/pgsql/.pgpass" \
+        slot_name="ha_slot" \
+        max_slot_wal_keep_size="1024" \
+        monitor_timeout_promoted="60" \
+        monitor_timeout_unpromoted="30" \
+        rep_mode="sync" \
+        node_list="psql1 psql2" \
+        replication_failure_threshold="5" \
+        backup_before_basebackup="true" \
+        basebackup_timeout="3600" \
+    op start timeout="120s" interval="0" \
+    op stop timeout="120s" interval="0" \
+    op monitor interval="10s" timeout="60s" role="Unpromoted" \
+    op monitor interval="8s" timeout="60s" role="Unpromoted" \
+    op monitor interval="3s" timeout="60s" role="Promoted" \
+    op promote timeout="120s" interval="0" \
+    op demote timeout="120s" interval="0" \
+    op notify timeout="90s" interval="0" \
+    meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
+
+# Create a promotable clone (formerly known as master/slave)
+clone postgres-clone postgres-db \
+    meta \
+        promoted-max="1" \
+        promoted-node-max="1" \
+        clone-max="2" \
+        clone-node-max="1" \
+        notify="true" \
+        promotable="true" \
+        interleave="true" \
+        target-role="Started"
+
+# Colocation: VIP runs on the promoted (primary) node
+colocation vip-with-promoted inf: \
+    postgres-vip postgres-clone:Promoted
+
+# Order: Promote PostgreSQL before starting VIP
+order promote-before-vip Mandatory: \
+    postgres-clone:promote postgres-vip:start \
+    symmetrical=false
+
+# Order: Stop VIP before demoting PostgreSQL
+order vip-stop-before-demote Mandatory: \
+    postgres-vip:stop postgres-clone:demote \
+    symmetrical=false
+
+# Location constraints: Allow both nodes to be promoted, prefer psql1
+location prefer-psql1 postgres-clone role=Promoted 100: psql1
+location prefer-psql2 postgres-clone role=Promoted 50: psql2
