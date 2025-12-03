@@ -20,17 +20,24 @@
 
 ```bash
 # On both nodes (openSUSE/SUSE)
+sudo zypper ref
+sudo zypper up   # or 'zypper dup' on Tumbleweed
+
+# On both nodes (openSUSE/SUSE)
 sudo zypper install postgresql17 postgresql17-server postgresql17-contrib
 
 # On both nodes (RHEL/CentOS)
 sudo dnf install postgresql17 postgresql17-server postgresql17-contrib
+
+**NOTE**: There seems to be an issue installing postgresql17 at least in Tumbleweed, where it also installs postgres-18. This is not addressed here.
 ```
 
 ### 1.2 Initialize PostgreSQL (Primary Node Only)
 
 ```bash
 # On node 1 only
-sudo -u postgres initdb -D /var/lib/pgsql/data
+sudo systemctl start postgresql
+sudo systemctl stop postgresql
 ```
 
 ### 1.3 Configure PostgreSQL for Replication
@@ -103,17 +110,23 @@ host    all             all             192.168.122.0/24        scram-sha-256
 
 ### 1.5 Start PostgreSQL on Primary (Temporarily)
 
-**NOTE**: PostgreSQL must be running to create the replication user and slot.
+**IMPORTANT**: Before starting PostgreSQL, temporarily disable synchronous replication to avoid hanging when creating the replication user (since no standby is connected yet).
 
 ```bash
-# On node 1 only - start PostgreSQL temporarily
-sudo -u postgres pg_ctl -D /var/lib/pgsql/data start
+# On node 1 only - backup the config and temporarily disable synchronous_standby_names
+sudo cp -a /var/lib/pgsql/data/postgresql.custom.conf /var/lib/pgsql/data/postgresql.custom.conf.backup
+sudo sed -i "s/^synchronous_standby_names = .*/synchronous_standby_names = ''/" /var/lib/pgsql/data/postgresql.custom.conf
+
+# Start PostgreSQL temporarily
+sudo systemctl start postgresql
 
 # Test connection
 sudo -u postgres psql -c "SELECT version();"
 sudo -u postgres psql -c "SHOW wal_level;"
 sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
 ```
+
+**Why this is necessary**: With `synchronous_standby_names = '*'` configured, PostgreSQL will wait for a standby to confirm every write operation. Since the standby doesn't exist yet, commands like `CREATE ROLE` will hang indefinitely. We temporarily disable this setting and restore the original configuration after setup is complete.
 
 ### 1.6 Create Replication User
 
@@ -148,14 +161,7 @@ sudo chmod 600 /var/lib/pgsql/.pgpass
 sudo chown postgres:postgres /var/lib/pgsql/.pgpass
 ```
 
-### 1.9 Stop PostgreSQL on Primary
-
-```bash
-# On node 1 - stop PostgreSQL, Pacemaker will manage it
-sudo -u postgres pg_ctl -D /var/lib/pgsql/data stop
-```
-
-### 1.10 Copy Data Directory to Standby (Initial Setup)
+### 1.9 Copy Data Directory to Standby (Initial Setup)
 
 ```bash
 # On node 2 - copy from node 1 (use the replication slot created earlier)
@@ -167,6 +173,19 @@ ls -l /var/lib/pgsql/data/standby.signal
 
 **NOTE**: The `-S ha_slot` parameter uses the replication slot created in step 1.7. This ensures the primary retains all necessary WAL files during the initial copy.
 
+### 1.10 Restore Configuration and Stop PostgreSQL
+
+```bash
+# On node 1 - restore original configuration with synchronous replication enabled
+sudo mv /var/lib/pgsql/data/postgresql.custom.conf.backup /var/lib/pgsql/data/postgresql.custom.conf
+
+# Stop PostgreSQL - Pacemaker will manage it from now on
+sudo systemctl stop postgresql
+```
+
+**NOTE**: We restore the original configuration with `synchronous_standby_names = '*'` now that the standby is ready. When Pacemaker starts the cluster, both nodes will be available for synchronous replication.
+
+
 ---
 
 ## Part 2: Pacemaker Cluster Setup
@@ -175,7 +194,7 @@ ls -l /var/lib/pgsql/data/standby.signal
 
 ```bash
 # openSUSE/SUSE
-sudo zypper install pacemaker corosync crmsh
+sudo zypper install pacemaker corosync crmsh resource-agents fence-agents-common fence-agents-sbd
 
 # RHEL/CentOS
 sudo dnf install pacemaker corosync pcs
@@ -184,6 +203,11 @@ sudo dnf install pacemaker corosync pcs
 ### 2.2 Install pgtwin OCF Agent (Both Nodes)
 
 ```bash
+# openSUSE Tumbleweed
+sudo zypper ar https://download.opensuse.org/repositories/home:azouhr:d3v/openSUSE_Factory_standard azouhr-d3v
+sudo zypper in pgtwin
+
+# For others, there is no package available yet:
 # Copy pgtwin agent to OCF directory
 sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
 sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
@@ -197,64 +221,19 @@ sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 
 **NOTE**: Testing with `ocf-tester` requires setting environment variables and can be complex. It's recommended to test the agent once the cluster is configured, where Pacemaker will set all required variables automatically.
 
-### 2.3 Configure Corosync (Node 1)
-
-Create `/etc/corosync/corosync.conf`:
-
-```
-totem {
-    version: 2
-    cluster_name: postgres
-    transport: knet
-    crypto_cipher: aes256
-    crypto_hash: sha256
-}
-
-nodelist {
-    node {
-        ring0_addr: psql1
-        name: psql1
-        nodeid: 1
-    }
-    node {
-        ring0_addr: psql2
-        name: psql2
-        nodeid: 2
-    }
-}
-
-quorum {
-    provider: corosync_votequorum
-    two_node: 1
-}
-
-logging {
-    to_logfile: yes
-    logfile: /var/log/cluster/corosync.log
-    to_syslog: yes
-    timestamp: on
-}
-```
-
-Copy to node 2:
+### 2.3 Configure Cluster (Node 1)
 
 ```bash
-sudo scp /etc/corosync/corosync.conf psql2:/etc/corosync/
+sudo crm cluster init --name CLUSTERNAME
 ```
 
-### 2.4 Start Pacemaker (Both Nodes)
+Answer the questions you are asked. For SBD, you will need a shared block device. You should be aware of a persistent device name of that block device.
+
+### 2.4 Configure Cluster (Node 2)
 
 ```bash
-# On both nodes
-sudo systemctl enable pacemaker corosync
-sudo systemctl start corosync
-sudo systemctl start pacemaker
-
-# Check cluster status
-sudo crm status
+sudo crm cluster join
 ```
-
-You should see both nodes online.
 
 ### 2.5 Configure Cluster Properties
 
@@ -269,6 +248,8 @@ sudo crm configure property \
 **Note**: Set `stonith-enabled=true` in production with proper SBD configuration!
 
 ### 2.6 Create PostgreSQL Resource
+
+Make sure that your nodelist reflects your infrastructure.
 
 ```bash
 sudo crm configure primitive postgres-db pgtwin \
@@ -386,7 +367,7 @@ psql -h 192.168.122.20 -U postgres -c "SELECT inet_server_addr();"
 sudo crm resource move postgres-clone psql2
 
 # Watch status
-watch -n 2 'sudo crm status'
+sudo crm_mon
 
 # IMPORTANT: Clear the constraint after move!
 sudo crm resource clear postgres-clone
@@ -406,7 +387,7 @@ sudo crm_mon -1Afr
 ### Check PostgreSQL Logs
 
 ```bash
-# Pacemaker logs
+# Pacemaker logs. This is **strongly recommended**. pgtwin will print lots of warning if the configuration is not optimal.
 sudo journalctl -u pacemaker -f
 
 # PostgreSQL logs

@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.4
-# Release Date: 2025-11-07
+# Version: 1.6.5
+# Release Date: 2024-12-03
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -338,13 +338,13 @@ update_application_name_in_config() {
     if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
-        # Only set if empty or different from expected
-        if [ -z "$current_sync" ] || [ "$current_sync" != "$app_name" ]; then
-            ocf_log info "Configuring synchronous_standby_names='${app_name}' for rep_mode=sync"
-            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${app_name}'\"" >/dev/null 2>&1
+        # Only set if empty; use wildcard '*' to match any standby (fixed bug where it used local hostname)
+        if [ -z "$current_sync" ]; then
+            ocf_log info "Configuring synchronous_standby_names='*' for rep_mode=sync"
+            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
 
             if [ $? -eq 0 ]; then
-                ocf_log info "Synchronous replication enabled: synchronous_standby_names='${app_name}'"
+                ocf_log info "Synchronous replication enabled: synchronous_standby_names='*'"
             else
                 ocf_log warn "Failed to set synchronous_standby_names"
             fi
