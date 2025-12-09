@@ -1,6 +1,6 @@
 # Release Notes: pgtwin v1.6.5
 
-**Release Date**: 2024-12-03
+**Release Date**: 2025-12-03
 **Type**: Bug Fix Release
 **Status**: Stable - Production Ready
 **Severity**: High - Critical bug fix for synchronous replication
@@ -65,8 +65,8 @@ sudo -u postgres psql -x -c "SELECT sync_state FROM pg_stat_replication;"
    - After: `**Version:** 1.6.5`
 
 3. **Line 848**: Corrected release date
-   - Before: `**Last Updated:** 2025-11-19` (future date)
-   - After: `**Last Updated:** 2024-12-03`
+   - Before: `**Last Updated:** 2025-11-19`
+   - After: `**Last Updated:** 2025-12-03`
 
 ## Upgrade Instructions
 

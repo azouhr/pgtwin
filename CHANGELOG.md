@@ -5,6 +5,78 @@ All notable changes to pgtwin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.6] - 2025-12-09
+
+### Fixed
+- **CRITICAL**: Fixed pg_basebackup configuration finalization bug that created empty `primary_conninfo` values
+  - Bug caused 100% replication failure after pg_basebackup recovery (affects v1.6.0-v1.6.5)
+  - Root cause: Code attempted to read values from file after deleting it
+  - Fix: Read values before deletion in `check_basebackup_progress()`
+  - New unified `finalize_standby_config()` function ensures correct config (lines 1838-1912)
+  - Prefers direct file update when PostgreSQL stopped, falls back to ALTER SYSTEM
+  - Safety check in `pgsql_start()` detects and auto-fixes broken configurations
+  - Used in all recovery paths: pg_rewind, pg_basebackup (async), manual recovery
+
+### Added
+- **Automatic Standby Initialization**: Zero-touch deployment from empty PGDATA
+  - New `is_valid_pgdata()` function detects empty/missing/invalid PGDATA (lines 1483-1506)
+  - Auto-init logic in `pgsql_start()` triggers pg_basebackup automatically (lines 1530-1590)
+  - Updated `pgsql_validate()` to allow empty PGDATA (lines 2360-2375)
+  - Prerequisites: Only `.pgpass` file with replication credentials required
+  - Use cases: Fresh deployment, disk replacement, corrupted data recovery
+  - Disk replacement simplified: 10+ steps → 3 steps
+- **Pacemaker Notify Support**: Dynamic synchronous replication management
+  - New `pgsql_notify()` action handler (lines 2393-2429)
+  - `enable_sync_replication()` - enables sync when standby starts (lines 2383-2391)
+  - `disable_sync_replication()` - disables sync when standby stops (lines 2373-2381)
+  - Prevents write blocking when standby fails
+  - Automatically switches between sync and async based on cluster state
+  - Requires `notify="true"` in clone meta configuration
+  - Handles post-start, post-stop, post-promote, pre-demote events
+
+### Changed
+- Updated version to 1.6.6 and release date to 2025-12-09
+- Enhanced description includes automatic standby initialization and notify support
+- Configuration finalization now unified across all recovery methods
+- PGDATA validation more lenient to support auto-initialization
+
+### Documentation
+- **NEW**: `doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md` - Critical bug fix analysis
+- **NEW**: `doc/FEATURE_AUTO_INITIALIZATION.md` - Complete auto-init guide
+- **NEW**: `doc/FEATURE_NOTIFY_SUPPORT.md` - Complete notify support guide
+- **UPDATED**: `MAINTENANCE_GUIDE.md` - Simplified disk replacement procedure
+- **UPDATED**: `CHANGELOG.md` - This entry
+- **NEW**: `RELEASE_v1.6.6.md` - Complete release notes
+
+### Migration
+- **CRITICAL**: Immediate upgrade recommended to fix configuration bug
+- Fully backward compatible with v1.6.x
+- No cluster configuration changes required
+- Optional: Enable notify support by adding `notify="true"` to clone meta
+- See RELEASE_v1.6.6.md for complete upgrade instructions
+
+## [1.6.5] - 2025-11-10
+
+### Added
+- **Container Mode Support**: Seamless Podman/Docker container deployment (Phase 1)
+  - New container library: `pgtwin-container-lib.sh`
+  - Automatic container runtime detection (Podman primary, Docker fallback)
+  - Transparent PostgreSQL command wrappers (pg_ctl, psql, pg_basebackup, etc.)
+  - Container lifecycle management (start, stop, cleanup)
+  - New OCF parameters: `container_mode`, `container_name`, `container_image`, `pg_major_version`
+  - Container mode validation in `pgsql_validate()`
+  - No code changes needed in main agent for container vs bare-metal operation
+
+### Changed
+- Added container mode support throughout all PostgreSQL operations
+- Enhanced metadata with container-specific parameters
+- Installation now includes container library deployment
+
+### Documentation
+- **NEW**: `CONTAINER_MODE_IMPLEMENTATION.md` - Container mode technical guide
+- **NEW**: `RELEASE_v1.6.5_SUMMARY.md` - Container mode release summary
+- **UPDATED**: Installation instructions include container library
+
 ## [1.6.4] - 2025-11-07
 
 ### Changed

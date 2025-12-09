@@ -149,23 +149,137 @@ EOF
 sudo -u postgres psql -c "SELECT * FROM pg_replication_slots;"
 ```
 
-### 1.8 Create .pgpass File (Both Nodes)
+### 1.8 Configure /etc/hosts (Both Nodes)
+
+Ensure nodes can resolve each other's hostnames:
 
 ```bash
-# On both nodes
+# On both nodes - verify or add hostname resolution
+sudo cat >> /etc/hosts <<EOF
+192.168.122.60   psql1
+192.168.122.120  psql2
+EOF
+
+# Test resolution
+ping -c 1 psql1
+ping -c 1 psql2
+```
+
+**NOTE**: Adjust IP addresses to match your network configuration. Alternatively, you can use IP addresses directly in `.pgpass` (see below).
+
+### 1.9 Create .pgpass File (Both Nodes)
+
+The `.pgpass` file is used for two purposes:
+1. **Discovery queries**: Connect to `postgres` database to check which node is promoted
+2. **Replication**: Connect to `replication` database for pg_basebackup
+
+```bash
+# On both nodes - using hostnames (requires /etc/hosts or DNS)
 sudo -u postgres bash -c 'cat > /var/lib/pgsql/.pgpass << EOF
-*:5432:replication:replicator:strong_password_here
+pg1:5432:replication:replicator:strong_password_here
+pg2:5432:replication:replicator:strong_password_here
+pg1:5432:postgres:replicator:strong_password_here
+pg2:5432:postgres:replicator:strong_password_here
 EOF'
 
 sudo chmod 600 /var/lib/pgsql/.pgpass
 sudo chown postgres:postgres /var/lib/pgsql/.pgpass
+
+# Alternative: Use IP addresses if DNS/hostnames are unavailable
+# sudo -u postgres bash -c 'cat > /var/lib/pgsql/.pgpass << EOF
+# 192.168.122.60:5432:replication:replicator:strong_password_here
+# 192.168.122.120:5432:replication:replicator:strong_password_here
+# 192.168.122.60:5432:postgres:replicator:strong_password_here
+# 192.168.122.120:5432:postgres:replicator:strong_password_here
+# EOF'
 ```
 
-### 1.9 Copy Data Directory to Standby (Initial Setup)
+**IMPORTANT**:
+- Each node should have entries for **both** nodes (including itself)
+- Each node needs **both** `replication` and `postgres` database entries
+- pgtwin automatically filters out the local node entry
+- Use either hostnames (with proper resolution) OR IP addresses consistently
+
+### 1.10 Prepare Standby Node for Automatic Initialization
+
+**NEW in v1.6.6**: pgtwin now **automatically initializes** standby nodes with empty PGDATA directories. No manual pg_basebackup required!
+
+#### Recommended Approach: Controlled Startup Sequence
+
+For first-time cluster setup, use a controlled startup to avoid race conditions:
+
+```bash
+# On node 2 - create an empty PGDATA directory
+sudo mkdir -p /var/lib/pgsql/data
+sudo chown postgres:postgres /var/lib/pgsql/data
+sudo chmod 700 /var/lib/pgsql/data
+
+# Put node 2 in standby mode (we'll bring it online after node 1 is promoted)
+sudo crm node standby pg2
+```
+
+**What happens next:**
+1. You'll configure the cluster in Part 2 (only node 1 will start initially)
+2. Node 1 becomes promoted (primary)
+3. You bring node 2 online → **automatic initialization triggers**
+4. pgtwin will:
+   - Detect the empty PGDATA directory
+   - Discover the primary node (pg1)
+   - Run pg_basebackup in the background
+   - Configure replication settings
+   - Start PostgreSQL as standby
+
+**Why use controlled startup?**
+- ✅ Cleaner logs (no "could not discover" warnings)
+- ✅ No retry delays
+- ✅ Primary is guaranteed to be ready before standby initializes
+- ✅ Recommended for production deployments
+
+**Note**: This is only needed for **first-time setup**. For ongoing operations (disk replacement, recovery), automatic initialization works immediately without any special sequencing.
+
+#### Alternative: Simultaneous Startup
+
+If you prefer to start both nodes simultaneously:
+
+```bash
+# On node 2 - just create an empty PGDATA directory
+sudo mkdir -p /var/lib/pgsql/data
+sudo chown postgres:postgres /var/lib/pgsql/data
+sudo chmod 700 /var/lib/pgsql/data
+
+# Don't put node in standby - let both start together
+```
+
+**Expected behavior:**
+- You may see "WARNING: Could not discover promoted node" in logs
+- This is **normal** - it's a timing issue during first startup
+- pgtwin automatically retries every monitor interval
+- Once pg1 is promoted, pg2 discovers it and completes initialization
+- Total delay: ~30-60 seconds
+
+**Monitor automatic initialization**:
+```bash
+# Watch Pacemaker logs for progress
+sudo journalctl -u pacemaker -f
+
+# Expected log sequence:
+# 1. "WARNING: Could not discover promoted node" (initial retries, if simultaneous start)
+# 2. "Discovered promoted node: pg1" (once primary is ready)
+# 3. "Auto-initializing standby from primary: pg1"
+# 4. "Basebackup in progress..." (progress updates)
+# 5. "PostgreSQL started successfully" (complete)
+
+# Watch pg_basebackup progress
+sudo tail -f /var/lib/pgsql/.pgtwin_basebackup.log
+```
+
+#### Option B: Manual pg_basebackup (Alternative)
+
+If you prefer to initialize manually (e.g., for faster first startup or to avoid retry warnings):
 
 ```bash
 # On node 2 - copy from node 1 (use the replication slot created earlier)
-sudo -u postgres pg_basebackup -h psql1 -U replicator -D /var/lib/pgsql/data -P -R -S ha_slot
+sudo -u postgres pg_basebackup -h pg1 -U replicator -D /var/lib/pgsql/data -P -R -S ha_slot
 
 # Verify standby.signal was created
 ls -l /var/lib/pgsql/data/standby.signal
@@ -173,7 +287,7 @@ ls -l /var/lib/pgsql/data/standby.signal
 
 **NOTE**: The `-S ha_slot` parameter uses the replication slot created in step 1.7. This ensures the primary retains all necessary WAL files during the initial copy.
 
-### 1.10 Restore Configuration and Stop PostgreSQL
+### 1.11 Restore Configuration and Stop PostgreSQL
 
 ```bash
 # On node 1 - restore original configuration with synchronous replication enabled
@@ -185,6 +299,24 @@ sudo systemctl stop postgresql
 
 **NOTE**: We restore the original configuration with `synchronous_standby_names = '*'` now that the standby is ready. When Pacemaker starts the cluster, both nodes will be available for synchronous replication.
 
+
+### 1.12 Configure Firewall (Both Nodes)
+
+If you're using firewalld, you need to open PostgreSQL port for replication:
+
+```bash
+# On both nodes
+sudo firewall-cmd --permanent --add-service=postgresql
+sudo firewall-cmd --reload
+
+# Verify
+sudo firewall-cmd --list-services
+# Should show: dhcpv6-client high-availability postgresql ssh
+```
+
+**Why this is needed:**
+- Auto-initialization requires connecting to the primary for discovery and pg_basebackup
+- Without this, you'll see "No route to host" errors
 
 ---
 
@@ -279,8 +411,17 @@ sudo crm configure clone postgres-clone postgres-db \
     promotable="true" \
     notify="true" \
     clone-max="2" \
-    clone-node-max="1"
+    clone-node-max="1" \
+    failure-timeout="5m"
 ```
+
+**About failure-timeout:**
+- Automatically clears failures after 5 minutes
+- Essential for automatic standby initialization (eliminates need for manual cleanup)
+- When pg_basebackup is running, start returns "Not running" → Pacemaker marks as failed
+- After 5 minutes, Pacemaker automatically retries
+- For large databases (>100GB), multiple retries will occur until basebackup completes
+- This is **expected behavior** - no manual intervention needed!
 
 ### 2.8 Create Virtual IP Resource
 
@@ -317,23 +458,81 @@ sudo crm configure show
 sudo crm status
 ```
 
-Expected status:
+Expected status (if you used controlled startup with node 2 in standby):
 ```
 Cluster Summary:
   * Stack: corosync
-  * Current DC: psql1
+  * Current DC: pg1
   * 2 nodes configured
-  * 3 resource instances configured
+  * 4 resource instances configured
 
 Node List:
-  * Online: [ psql1 psql2 ]
+  * Node pg2: standby
+  * Online: [ pg1 ]
 
 Full List of Resources:
+  * stonith-sbd (stonith:fence_sbd): Started pg1
   * Clone Set: postgres-clone [postgres-db] (promotable):
-    * Promoted: [ psql1 ]
-    * Unpromoted: [ psql2 ]
-  * vip (ocf:heartbeat:IPaddr2): Started psql1
+    * Promoted: [ pg1 ]
+    * Stopped: [ pg2 ]
+  * vip (ocf:heartbeat:IPaddr2): Started pg1
 ```
+
+### 2.11 Bring Node 2 Online (If Using Controlled Startup)
+
+If you put node 2 in standby mode in section 1.10, now is the time to bring it online. This will trigger **automatic standby initialization**.
+
+```bash
+# Bring node 2 online
+sudo crm node online pg2
+
+# Watch automatic initialization progress
+sudo journalctl -u pacemaker -f
+
+# You should see:
+# "PGDATA is empty or invalid - triggering automatic standby initialization"
+# "Discovered promoted node: pg1"
+# "Auto-initializing standby from primary: pg1"
+# "Starting asynchronous pg_basebackup from pg1"
+# ... progress updates ...
+# "Asynchronous pg_basebackup completed successfully"
+# "PostgreSQL started successfully"
+```
+
+**Monitor progress:**
+```bash
+# In another terminal, watch pg_basebackup progress
+sudo tail -f /var/lib/pgsql/.pgtwin_basebackup.log
+
+# In another terminal, watch cluster status
+watch -n 2 'sudo crm status'
+```
+
+**How long does it take?**
+- Small database (<1GB): 1-2 minutes
+- Medium database (10GB): 5-10 minutes
+- Large database (100GB): 30-60 minutes
+
+**When complete, you should see:**
+```
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: pg1
+  * 2 nodes configured
+  * 4 resource instances configured
+
+Node List:
+  * Online: [ pg1 pg2 ]
+
+Full List of Resources:
+  * stonith-sbd (stonith:fence_sbd): Started pg1
+  * Clone Set: postgres-clone [postgres-db] (promotable):
+    * Promoted: [ pg1 ]
+    * Unpromoted: [ pg2 ]  ← Node 2 is now a standby!
+  * vip (ocf:heartbeat:IPaddr2): Started pg1
+```
+
+If you didn't use controlled startup (both nodes started simultaneously), automatic initialization already happened during cluster startup. You should already see both nodes running.
 
 ---
 
@@ -481,6 +680,67 @@ sudo journalctl -u pacemaker | grep -E "CRITICAL ERROR|WARNING"
 # - max_standby_streaming_delay=-1 → WARNING (set to 30-60 seconds)
 ```
 
+### "Could not discover promoted node" Warning
+
+**During initial cluster startup**, this warning is **expected and normal**:
+
+```
+WARNING: Could not discover promoted node via any method
+```
+
+**What's happening:**
+- The standby node (pg2) starts before the primary (pg1) is fully promoted
+- pgtwin retries automatically (Pacemaker handles this)
+- Once pg1 is promoted, pg2 discovers it and proceeds
+
+**This will resolve itself in 30-60 seconds.** If it persists for more than 2 minutes:
+
+```bash
+# Check if primary is promoted
+crm_mon -1
+# Should show: "Promoted: [ pg1 ]"
+
+# If primary is promoted but standby still can't discover it:
+# Check network connectivity
+ping pg1  # From pg2
+
+# Check PostgreSQL is listening
+sudo -u postgres psql -h pg1 -p 5432 -l
+
+# Check .pgpass configuration
+cat /var/lib/pgsql/.pgpass
+```
+
+### Automatic Initialization Issues
+
+If automatic standby initialization doesn't start after primary is promoted:
+
+```bash
+# 1. Verify .pgpass is configured correctly
+ls -l /var/lib/pgsql/.pgpass  # Should be 600, owned by postgres
+cat /var/lib/pgsql/.pgpass     # Should contain both replication and postgres entries
+
+# 2. Check that primary node is running AND promoted
+sudo crm status  # Look for "Promoted: [ pg1 ]"
+
+# 3. Verify PGDATA is empty
+ls -la /var/lib/pgsql/data/  # Should be empty
+
+# 4. Check for sufficient disk space
+df -h /var/lib/pgsql/data
+
+# 5. Check firewall
+sudo firewall-cmd --list-services  # Should include "postgresql"
+ping pg1  # Should work
+sudo -u postgres psql -h pg1 -p 5432 -U replicator -d postgres -c "SELECT 1"  # Should connect
+
+# 6. Monitor initialization progress
+sudo journalctl -u pacemaker -f | grep -i "auto-init\|basebackup\|discover"
+sudo tail -f /var/lib/pgsql/.pgtwin_basebackup.log  # Note: file is in /var/lib/pgsql/, not data/
+```
+
+See FEATURE_AUTO_INITIALIZATION.md for detailed troubleshooting.
+
 ---
 
 ## Production Checklist
@@ -524,8 +784,9 @@ Before deploying to production, verify:
 
 ## Next Steps
 
-1. **Administration Commands**: See CHEATSHEET.md for complete command reference
-2. **Architecture Details**: See README.md for design decisions and features
+1. **Automatic Standby Initialization**: See FEATURE_AUTO_INITIALIZATION.md for details on auto-init feature
+2. **Administration Commands**: See CHEATSHEET.md for complete command reference
+3. **Architecture Details**: See README.md for design decisions and features
 
 ---
 

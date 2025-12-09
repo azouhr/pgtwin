@@ -1,12 +1,14 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.5
-# Release Date: 2024-12-03
+# Version: 1.6.6
+# Release Date: 2025-12-09
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
-#               automatic replication recovery, and dynamic promoted node discovery
+#               automatic replication recovery, dynamic promoted node discovery,
+#               automatic standby initialization, Pacemaker notify support,
+#               and seamless container mode support (Podman/Docker)
 #
 # OCF instance parameters:
 #   OCF_RESKEY_pgdata           - PostgreSQL data directory
@@ -26,6 +28,9 @@
 #   OCF_RESKEY_replication_failure_threshold - Number of consecutive monitor cycles with
 #                                               failed replication before triggering recovery (default: 5)
 #   OCF_RESKEY_vip              - Virtual IP address (used to discover promoted node)
+#   OCF_RESKEY_container_mode   - Enable container mode (true/false)
+#   OCF_RESKEY_container_name   - Container name for PostgreSQL instance
+#   OCF_RESKEY_container_image  - Container image to use (default: registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postgres:17.6-158.5)
 #
 
 #######################################################################
@@ -33,6 +38,13 @@
 
 : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
 . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Load container library (provides seamless container/bare-metal support)
+if [ -f "${OCF_FUNCTIONS_DIR}/pgtwin-container-lib.sh" ]; then
+    . "${OCF_FUNCTIONS_DIR}/pgtwin-container-lib.sh"
+elif [ -f "/tmp/pgtwin-container-lib.sh" ]; then
+    . "/tmp/pgtwin-container-lib.sh"
+fi
 
 # OCF return codes for promoted/master state
 : ${OCF_RUNNING_PROMOTED:=8}
@@ -57,6 +69,10 @@ OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
 OCF_RESKEY_vip_default=""
+OCF_RESKEY_container_mode_default="false"
+OCF_RESKEY_pg_major_version_default=""
+OCF_RESKEY_container_name_default="postgres-ha"
+OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postgres:17.6-158.5"
 
 : ${OCF_RESKEY_pgdata=${OCF_RESKEY_pgdata_default}}
 : ${OCF_RESKEY_pghost=${OCF_RESKEY_pghost_default}}
@@ -74,6 +90,10 @@ OCF_RESKEY_vip_default=""
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
+: ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
+: ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
+: ${OCF_RESKEY_container_name=${OCF_RESKEY_container_name_default}}
+: ${OCF_RESKEY_container_image=${OCF_RESKEY_container_image_default}}
 
 PGDATA="${OCF_RESKEY_pgdata}"
 PGCTL="/usr/bin/pg_ctl"
@@ -87,15 +107,16 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.6">
-<version>1.6</version>
+<resource-agent name="pgtwin" version="1.6.6">
+<version>1.6.6</version>
 
 <longdesc lang="en">
 Resource agent for PostgreSQL with advanced replication slot management,
-pg_rewind support, automatic failover handling, and automatic replication recovery.
-Includes enhanced monitoring for replication health and dynamic promoted node discovery.
+pg_rewind support, automatic failover handling, automatic replication recovery,
+automatic standby initialization from empty PGDATA, and seamless container mode support (Podman/Docker).
+Includes enhanced monitoring for replication health, dynamic promoted node discovery, and zero-touch deployment.
 </longdesc>
-<shortdesc lang="en">PostgreSQL HA with automatic replication recovery</shortdesc>
+<shortdesc lang="en">PostgreSQL HA with auto-initialization and container support</shortdesc>
 
 <parameters>
 <parameter name="pgdata" unique="0" required="1">
@@ -258,6 +279,66 @@ If not specified, falls back to using node_list for promoted node discovery.
 <content type="string" default="${OCF_RESKEY_vip_default}" />
 </parameter>
 
+<parameter name="container_mode" unique="0">
+<longdesc lang="en">
+Enable container mode for PostgreSQL. When true, PostgreSQL runs in a Podman container
+instead of directly on the host. This enables:
+- Easy version management and upgrades
+- Resource isolation (CPU, memory, I/O)
+- Clean separation between multiple PostgreSQL versions
+- Migration path between bare-metal and containerized deployments
+
+Default: false (bare-metal PostgreSQL)
+</longdesc>
+<shortdesc lang="en">Enable container mode</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_container_mode_default}" />
+</parameter>
+
+<parameter name="pg_major_version" unique="0">
+<longdesc lang="en">
+PostgreSQL major version to use in container mode (e.g., "17", "16", "15").
+When specified, pgtwin automatically discovers and uses the latest available
+container image for that major version from the registry.
+
+This provides:
+- Automatic minor version updates (e.g., 17.6 → 17.7)
+- No need to track specific image tags
+- Always uses the latest stable release for the major version
+
+Set to "auto" or leave empty to use container_image parameter instead.
+
+Examples:
+  pg_major_version="17"  → Uses latest PG 17 (e.g., 17.6-158.5)
+  pg_major_version="16"  → Uses latest PG 16 (e.g., 16.10-300.5)
+
+Default: "" (uses container_image parameter)
+</longdesc>
+<shortdesc lang="en">PostgreSQL major version</shortdesc>
+<content type="string" default="${OCF_RESKEY_pg_major_version_default}" />
+</parameter>
+
+<parameter name="container_name" unique="0">
+<longdesc lang="en">
+Name for the PostgreSQL container. Used when container_mode=true.
+Each node should have a unique container name if running multiple instances.
+
+Default: postgres-ha
+</longdesc>
+<shortdesc lang="en">Container name</shortdesc>
+<content type="string" default="${OCF_RESKEY_container_name_default}" />
+</parameter>
+
+<parameter name="container_image" unique="0">
+<longdesc lang="en">
+Container image to use for PostgreSQL when container_mode=true.
+Uses openSUSE BCI (Base Container Images) by default.
+
+Default: registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postgres:17.6-158.5
+</longdesc>
+<shortdesc lang="en">Container image</shortdesc>
+<content type="string" default="${OCF_RESKEY_container_image_default}" />
+</parameter>
+
 </parameters>
 
 <actions>
@@ -338,13 +419,16 @@ update_application_name_in_config() {
     if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
-        # Only set if empty; use wildcard '*' to match any standby (fixed bug where it used local hostname)
-        if [ -z "$current_sync" ]; then
-            ocf_log info "Configuring synchronous_standby_names='*' for rep_mode=sync"
-            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
+        # Use '*' to match any standby (most robust for HA clusters)
+        local expected_sync="*"
+
+        # Only set if empty or different from expected
+        if [ -z "$current_sync" ] || [ "$current_sync" != "$expected_sync" ]; then
+            ocf_log info "Configuring synchronous_standby_names='${expected_sync}' for rep_mode=sync"
+            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${expected_sync}'\"" >/dev/null 2>&1
 
             if [ $? -eq 0 ]; then
-                ocf_log info "Synchronous replication enabled: synchronous_standby_names='*'"
+                ocf_log info "Synchronous replication enabled: synchronous_standby_names='${expected_sync}'"
             else
                 ocf_log warn "Failed to set synchronous_standby_names"
             fi
@@ -369,6 +453,173 @@ get_cluster_node_name() {
     # Use crm_node to get the cluster node name (not hostname)
     # This is critical when cluster node names differ from system hostnames
     crm_node -n 2>/dev/null || hostname -s
+}
+
+#######################################################################
+# Container Mode Functions
+#
+# These functions provide podman container support for PostgreSQL.
+# When container_mode=true, all PostgreSQL operations are executed
+# inside containers instead of directly on the host.
+#######################################################################
+
+# Check if container exists
+container_exists() {
+    podman container exists "${OCF_RESKEY_container_name}" 2>/dev/null
+    return $?
+}
+
+# Check if container is running
+container_is_running() {
+    local state=$(podman inspect --format '{{.State.Running}}' "${OCF_RESKEY_container_name}" 2>/dev/null)
+    [ "$state" = "true" ]
+    return $?
+}
+
+# Create PostgreSQL container (does not start it)
+container_create() {
+    if container_exists; then
+        ocf_log debug "Container ${OCF_RESKEY_container_name} already exists"
+        return 0
+    fi
+
+    ocf_log info "Creating PostgreSQL container: ${OCF_RESKEY_container_name}"
+
+    # Pull image if not present
+    if ! podman image exists "${OCF_RESKEY_container_image}"; then
+        ocf_log info "Pulling container image: ${OCF_RESKEY_container_image}"
+        podman pull "${OCF_RESKEY_container_image}" || {
+            ocf_log err "Failed to pull container image: ${OCF_RESKEY_container_image}"
+            return $OCF_ERR_GENERIC
+        }
+    fi
+
+    # Create container with persistent storage
+    # Key design: Use --network host for HA cluster networking
+    # Data directory is bind-mounted from host
+    podman create \
+        --name "${OCF_RESKEY_container_name}" \
+        --network host \
+        --privileged \
+        -v "${PGDATA}:/var/lib/pgsql/data:Z" \
+        -e PGDATA="/var/lib/pgsql/data" \
+        "${OCF_RESKEY_container_image}" \
+        tail -f /dev/null
+
+    if [ $? -eq 0 ]; then
+        ocf_log info "Container ${OCF_RESKEY_container_name} created successfully"
+        return 0
+    else
+        ocf_log err "Failed to create container ${OCF_RESKEY_container_name}"
+        return $OCF_ERR_GENERIC
+    fi
+}
+
+# Start container (must already exist)
+container_start() {
+    if container_is_running; then
+        ocf_log debug "Container ${OCF_RESKEY_container_name} is already running"
+        return 0
+    fi
+
+    ocf_log info "Starting container: ${OCF_RESKEY_container_name}"
+    podman start "${OCF_RESKEY_container_name}" || {
+        ocf_log err "Failed to start container ${OCF_RESKEY_container_name}"
+        return $OCF_ERR_GENERIC
+    }
+
+    return 0
+}
+
+# Stop container
+container_stop() {
+    if ! container_is_running; then
+        ocf_log debug "Container ${OCF_RESKEY_container_name} is not running"
+        return 0
+    fi
+
+    ocf_log info "Stopping container: ${OCF_RESKEY_container_name}"
+    podman stop -t 60 "${OCF_RESKEY_container_name}" || {
+        ocf_log warn "Failed to stop container gracefully, forcing..."
+        podman kill "${OCF_RESKEY_container_name}"
+    }
+
+    return 0
+}
+
+# Remove container
+container_remove() {
+    if ! container_exists; then
+        return 0
+    fi
+
+    ocf_log info "Removing container: ${OCF_RESKEY_container_name}"
+    podman rm -f "${OCF_RESKEY_container_name}" >/dev/null 2>&1
+    return 0
+}
+
+# Execute command in container
+# Usage: container_exec [command...]
+container_exec() {
+    if ! container_is_running; then
+        ocf_log err "Cannot execute command: container ${OCF_RESKEY_container_name} is not running"
+        return $OCF_ERR_GENERIC
+    fi
+
+    podman exec "${OCF_RESKEY_container_name}" "$@"
+    return $?
+}
+
+# Execute command as postgres user in container
+# Usage: container_exec_as_postgres [command...]
+container_exec_as_postgres() {
+    container_exec runuser -u postgres -- "$@"
+    return $?
+}
+
+#######################################################################
+# Wrapper Functions for PostgreSQL Operations
+# These detect container mode and route commands appropriately
+#######################################################################
+
+# Wrapper for pg_ctl
+pg_ctl_wrapper() {
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        container_exec_as_postgres /usr/bin/pg_ctl "$@"
+    else
+        runuser -u "${OCF_RESKEY_pguser}" -- "${PGCTL}" "$@"
+    fi
+    return $?
+}
+
+# Wrapper for psql
+psql_wrapper() {
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        container_exec_as_postgres /usr/bin/psql "$@"
+    else
+        runuser -u "${OCF_RESKEY_pguser}" -- "${PSQL}" "$@"
+    fi
+    return $?
+}
+
+# Wrapper for pg_rewind
+pg_rewind_wrapper() {
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        container_exec_as_postgres /usr/bin/pg_rewind "$@"
+    else
+        runuser -u "${OCF_RESKEY_pguser}" -- "${PG_REWIND}" "$@"
+    fi
+    return $?
+}
+
+# Wrapper for pg_basebackup
+pg_basebackup_wrapper() {
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        container_exec_as_postgres /usr/bin/pg_basebackup "$@"
+    else
+        runuser -u "${OCF_RESKEY_pguser}" -- "${PG_BASEBACKUP}" "$@"
+    fi
+    return $?
 }
 
 # Parse .pgpass file to get replication credentials
@@ -922,13 +1173,30 @@ check_postgresql_config() {
 }
 
 pgsql_is_running() {
-    if [ -f "${PGDATA}/postmaster.pid" ]; then
-        PID=$(head -n 1 "${PGDATA}/postmaster.pid")
-        if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
-            return 0
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        # Container mode: check if container is running AND PostgreSQL is running inside
+        if ! container_is_running; then
+            return 1
         fi
+
+        # Check if postmaster is running inside the container
+        if container_exec test -f /var/lib/pgsql/data/postmaster.pid 2>/dev/null; then
+            local PID=$(container_exec head -n 1 /var/lib/pgsql/data/postmaster.pid 2>/dev/null)
+            if [ -n "$PID" ] && container_exec kill -0 "$PID" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        return 1
+    else
+        # Bare-metal mode: traditional check
+        if [ -f "${PGDATA}/postmaster.pid" ]; then
+            PID=$(head -n 1 "${PGDATA}/postmaster.pid")
+            if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+                return 0
+            fi
+        fi
+        return 1
     fi
-    return 1
 }
 
 pgsql_is_promoted() {
@@ -1086,10 +1354,12 @@ pgsql_monitor() {
     local rc
 
     # Check if basebackup is in progress (for status reporting)
-    if [ -f "${PGDATA}/.basebackup_in_progress" ]; then
+    # BUG FIX v1.6.6: Check state directory, not PGDATA
+    local state_dir=$(dirname "${PGDATA}")
+    if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
         check_basebackup_progress
         # Still in progress, return not running so resource won't be started yet
-        if [ -f "${PGDATA}/.basebackup_in_progress" ]; then
+        if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
             ocf_log info "Basebackup still in progress, instance not ready"
             return $OCF_NOT_RUNNING
         fi
@@ -1112,6 +1382,31 @@ pgsql_monitor() {
     if pgsql_is_promoted; then
         # Check replication slots on primary
         check_replication_slots
+
+        # SELF-HEALING: Verify and fix synchronous_standby_names if rep_mode=sync
+        # Only enable sync mode if a standby is actually connected
+        if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+            local standby_count=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'\"" 2>/dev/null)
+            local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
+
+            if [ -n "$standby_count" ] && [ "$standby_count" -gt 0 ]; then
+                # Standby is connected, should be in sync mode
+                if [ "$current_sync" != "*" ]; then
+                    ocf_log info "Monitor: Standby connected but synchronous_standby_names='$current_sync' - fixing to '*'"
+                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
+                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+                    ocf_log info "Monitor: synchronous_standby_names corrected to '*'"
+                fi
+            else
+                # No standby connected, should NOT be in sync mode (would block writes)
+                if [ -n "$current_sync" ] && [ "$current_sync" != "" ]; then
+                    ocf_log info "Monitor: No standby connected but synchronous_standby_names='$current_sync' - clearing to avoid blocking writes"
+                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
+                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+                    ocf_log info "Monitor: synchronous_standby_names cleared (no standby connected)"
+                fi
+            fi
+        fi
 
         # Check for archive failures (can cause cluster to block)
         local archive_mode=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_mode\"" 2>/dev/null)
@@ -1216,6 +1511,31 @@ cleanup_old_replication_slot() {
     fi
 }
 
+is_valid_pgdata() {
+    # Check if PGDATA exists and contains a valid PostgreSQL cluster
+    # Returns 0 if valid, 1 if empty/missing/invalid
+
+    if [ ! -d "${PGDATA}" ]; then
+        ocf_log debug "PGDATA does not exist: ${PGDATA}"
+        return 1
+    fi
+
+    # Check if directory is empty
+    if [ -z "$(ls -A ${PGDATA} 2>/dev/null)" ]; then
+        ocf_log debug "PGDATA is empty: ${PGDATA}"
+        return 1
+    fi
+
+    # Check for PG_VERSION file (present in all valid PostgreSQL clusters)
+    if [ ! -f "${PGDATA}/PG_VERSION" ]; then
+        ocf_log warn "PGDATA missing PG_VERSION file (corrupted or incomplete): ${PGDATA}"
+        return 1
+    fi
+
+    ocf_log debug "PGDATA is valid: ${PGDATA}"
+    return 0
+}
+
 pgsql_start() {
     local rc
 
@@ -1226,9 +1546,130 @@ pgsql_start() {
         return $OCF_SUCCESS
     fi
 
+    # Check if basebackup is in progress from previous start attempt
+    # BUG FIX v1.6.6: Check state directory, not PGDATA
+    local state_dir=$(dirname "${PGDATA}")
+    if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
+        ocf_log info "Basebackup already in progress, checking status"
+        check_basebackup_progress
+        if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
+            ocf_log info "Basebackup still in progress, instance not ready"
+            return $OCF_NOT_RUNNING
+        fi
+        # Basebackup completed, continue to start PostgreSQL
+        ocf_log info "Basebackup completed, proceeding to start PostgreSQL"
+    fi
+
+    # Auto-initialization: Check if PGDATA is empty/missing/invalid
+    if ! is_valid_pgdata; then
+        ocf_log info "PGDATA is empty or invalid - triggering automatic standby initialization"
+
+        # Ensure .pgpass exists
+        local pgpass_file=$(ensure_pgpass)
+        if [ $? -ne 0 ]; then
+            ocf_log err "Cannot initialize standby: .pgpass file not configured or invalid"
+            ocf_log err "Please create ${OCF_RESKEY_pgpassfile} with replication credentials"
+            return $OCF_ERR_CONFIGURED
+        fi
+
+        # Discover primary node from Pacemaker cluster
+        local primary_host=$(discover_promoted_node)
+        if [ -z "$primary_host" ]; then
+            ocf_log err "Cannot initialize standby: unable to discover primary node from cluster"
+            ocf_log err "Ensure the primary node is running and promoted"
+            return $OCF_ERR_GENERIC
+        fi
+
+        # Get replication user from .pgpass
+        local rep_user=$(get_replication_user)
+        if [ -z "$rep_user" ]; then
+            ocf_log err "Cannot initialize standby: unable to determine replication user from .pgpass"
+            ocf_log err "Check ${pgpass_file} contains entry for ${primary_host}"
+            return $OCF_ERR_CONFIGURED
+        fi
+
+        # Check disk space before proceeding
+        if ! check_disk_space_for_basebackup "${primary_host}"; then
+            ocf_log err "Cannot initialize standby: insufficient disk space for pg_basebackup"
+            return $OCF_ERR_GENERIC
+        fi
+
+        ocf_log info "Auto-initializing standby from primary: ${primary_host} (user: ${rep_user})"
+
+        # Create empty PGDATA with correct ownership if needed
+        if [ ! -d "${PGDATA}" ]; then
+            mkdir -p "${PGDATA}" || {
+                ocf_log err "Failed to create PGDATA directory: ${PGDATA}"
+                return $OCF_ERR_GENERIC
+            }
+        fi
+
+        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}"
+        chmod 700 "${PGDATA}"
+
+        # Start asynchronous pg_basebackup (existing function)
+        # This creates .pgtwin_basebackup_in_progress marker in state directory
+        start_async_basebackup "${primary_host}" "${rep_user}"
+        local bb_rc=$?
+
+        if [ $bb_rc -eq 0 ]; then
+            ocf_log info "Automatic standby initialization started (pg_basebackup running in background)"
+            ocf_log info "Monitor function will track progress and start PostgreSQL when ready"
+            return $OCF_NOT_RUNNING
+        else
+            ocf_log err "Failed to start automatic standby initialization"
+            return $OCF_ERR_GENERIC
+        fi
+    fi
+
+    # Container mode: Ensure container is running before starting PostgreSQL
+    if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+        if type pgtwin_ensure_container_running >/dev/null 2>&1; then
+            ocf_log info "Container mode enabled, ensuring container is running"
+            pgtwin_ensure_container_running || {
+                ocf_log err "Failed to start container"
+                return $OCF_ERR_GENERIC
+            }
+        else
+            ocf_log err "Container mode enabled but pgtwin_ensure_container_running not available"
+            return $OCF_ERR_CONFIGURED
+        fi
+    fi
+
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
+
+        # Safety check: Verify standby configuration before starting
+        # This catches cases where manual pg_basebackup was done or config was corrupted
+        if [ -f "${PGDATA}/postgresql.auto.conf" ]; then
+            local primary_conninfo=$(grep "^primary_conninfo" "${PGDATA}/postgresql.auto.conf" | cut -d= -f2- | tr -d "' ")
+
+            # Check for common issues:
+            # 1. Empty host= or user= (bug #2063-2071 before fix)
+            # 2. Missing application_name
+            # 3. Wrong passfile location
+            if echo "$primary_conninfo" | grep -qE "host=\s|user=\s|host=$|user=$" || \
+               ! echo "$primary_conninfo" | grep -q "application_name="; then
+                ocf_log warn "Detected potentially incorrect standby configuration - attempting to fix"
+
+                # Try to discover primary node to fix configuration
+                local discovered_primary=$(discover_promoted_node)
+                local rep_user=$(get_replication_user)
+
+                if [ -n "$discovered_primary" ] && [ -n "$rep_user" ]; then
+                    ocf_log info "Auto-fixing standby config: primary=${discovered_primary}, user=${rep_user}"
+                    finalize_standby_config "${discovered_primary}" "${rep_user}"
+                    if [ $? -ne 0 ]; then
+                        ocf_log warn "Failed to auto-fix standby configuration - will attempt start anyway"
+                    fi
+                else
+                    ocf_log warn "Cannot auto-fix standby config: unable to discover primary node or replication user"
+                fi
+            fi
+        else
+            ocf_log warn "Standby node missing postgresql.auto.conf - this may indicate incomplete pg_basebackup"
+        fi
     else
         ocf_log info "Starting PostgreSQL as primary"
     fi
@@ -1285,6 +1726,15 @@ pgsql_stop() {
     while [ $count -lt 30 ]; do
         if ! pgsql_is_running; then
             ocf_log info "PostgreSQL stopped successfully"
+
+            # Container mode: Stop and cleanup container
+            if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+                if type pgtwin_container_stop >/dev/null 2>&1; then
+                    ocf_log info "Stopping container"
+                    pgtwin_container_stop
+                fi
+            fi
+
             return $OCF_SUCCESS
         fi
         sleep 1
@@ -1298,6 +1748,14 @@ pgsql_stop() {
     sleep 2
 
     if ! pgsql_is_running; then
+        # Container mode: Stop and cleanup container
+        if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
+            if type pgtwin_container_stop >/dev/null 2>&1; then
+                ocf_log info "Stopping container"
+                pgtwin_container_stop
+            fi
+        fi
+
         return $OCF_SUCCESS
     fi
 
@@ -1533,6 +1991,89 @@ create_replication_slot() {
     fi
 }
 
+# Finalize standby configuration after pg_rewind or pg_basebackup
+# This ensures postgresql.auto.conf has correct primary_conninfo with:
+# - Correct primary host
+# - Correct replication user
+# - Correct application_name (pgtwin-managed)
+# - Correct passfile location
+# This runs AFTER pg_basebackup -R to sanitize/override the generated config
+finalize_standby_config() {
+    local primary_host="$1"
+    local rep_user="$2"
+    local app_name=$(get_application_name)
+    local pgpass_file=$(ensure_pgpass)
+
+    if [ -z "$primary_host" ] || [ -z "$rep_user" ]; then
+        ocf_log err "finalize_standby_config: Missing required parameters (host='${primary_host}', user='${rep_user}')"
+        return 1
+    fi
+
+    if [ $? -ne 0 ]; then
+        ocf_log err "finalize_standby_config: Cannot ensure .pgpass file"
+        return 1
+    fi
+
+    ocf_log info "Finalizing standby configuration: primary=${primary_host}, user=${rep_user}, app_name=${app_name}"
+
+    # Check if PostgreSQL is running
+    if pgsql_is_running; then
+        ocf_log warn "PostgreSQL is running during finalization - using ALTER SYSTEM (prefer to avoid this)"
+
+        # Use ALTER SYSTEM if PostgreSQL is already running
+        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'\"" >/dev/null 2>&1
+
+        if [ $? -ne 0 ]; then
+            ocf_log err "Failed to set primary_conninfo via ALTER SYSTEM"
+            return 1
+        fi
+
+        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_slot_name = '${OCF_RESKEY_slot_name}'\"" >/dev/null 2>&1
+
+        if [ $? -ne 0 ]; then
+            ocf_log err "Failed to set primary_slot_name via ALTER SYSTEM"
+            return 1
+        fi
+
+        # Reload configuration
+        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+
+        ocf_log info "Standby configuration updated via ALTER SYSTEM (requires PostgreSQL restart to take effect)"
+    else
+        ocf_log info "PostgreSQL is stopped - directly updating postgresql.auto.conf (preferred method)"
+
+        # Preferred method: Direct file update when PostgreSQL is stopped
+        # This overwrites pg_basebackup -R generated config to ensure correctness
+        cat > "${PGDATA}/postgresql.auto.conf" <<EOF
+# Do not edit this file manually!
+# It will be overwritten by the ALTER SYSTEM command.
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'
+primary_slot_name = '${OCF_RESKEY_slot_name}'
+EOF
+
+        if [ $? -ne 0 ]; then
+            ocf_log err "Failed to write postgresql.auto.conf"
+            return 1
+        fi
+
+        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}/postgresql.auto.conf"
+        chmod 600 "${PGDATA}/postgresql.auto.conf"
+
+        ocf_log info "postgresql.auto.conf updated successfully"
+    fi
+
+    # Always ensure standby.signal exists
+    # pg_basebackup -R should create this, but be defensive
+    if [ ! -f "${PGDATA}/standby.signal" ]; then
+        ocf_log info "Creating missing standby.signal"
+        touch "${PGDATA}/standby.signal"
+        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}/standby.signal"
+    fi
+
+    ocf_log info "Standby configuration finalized successfully"
+    return 0
+}
+
 recover_standby() {
     local primary_host="$1"
     local rc
@@ -1577,14 +2118,12 @@ recover_standby() {
                 ocf_log info "pg_rewind completed successfully"
                 rm -f /tmp/pg_rewind_$$.log
 
-                # Create standby.signal
-                touch "${PGDATA}/standby.signal"
-
-                # Update connection info with validated application name
-                cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'
-primary_slot_name = '${OCF_RESKEY_slot_name}'
-EOF
+                # Finalize standby configuration (creates standby.signal and postgresql.auto.conf)
+                finalize_standby_config "${primary_host}" "${rep_user}"
+                if [ $? -ne 0 ]; then
+                    ocf_log err "Failed to finalize standby configuration after pg_rewind"
+                    return $OCF_ERR_GENERIC
+                fi
 
                 return 0
             else
@@ -1596,7 +2135,9 @@ EOF
     fi
 
     # Check if async basebackup is already in progress
-    if [ -f "${PGDATA}/.basebackup_in_progress" ]; then
+    # BUG FIX v1.6.6: Check state directory, not PGDATA
+    local state_dir=$(dirname "${PGDATA}")
+    if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
         check_basebackup_progress
         return $?
     fi
@@ -1657,8 +2198,14 @@ EOF
 start_async_basebackup() {
     local primary_host="$1"
     local rep_user="$2"
-    local log_file="${PGDATA}/.basebackup.log"
-    local pid_file="${PGDATA}/.basebackup_in_progress"
+
+    # BUG FIX v1.6.6: Store tracking files OUTSIDE of PGDATA
+    # pg_basebackup requires PGDATA to be empty, so we can't put files there
+    # Use parent directory (e.g., /var/lib/pgsql/) for state files
+    local state_dir=$(dirname "${PGDATA}")
+    local log_file="${state_dir}/.pgtwin_basebackup.log"
+    local pid_file="${state_dir}/.pgtwin_basebackup_in_progress"
+    local rc_file="${state_dir}/.pgtwin_basebackup_rc"
 
     ocf_log info "Starting asynchronous pg_basebackup from ${primary_host}"
 
@@ -1670,18 +2217,20 @@ start_async_basebackup() {
     fi
     ocf_log info "Using .pgpass file for pg_basebackup: ${pgpass_file}"
 
-    # Create progress marker
+    # Create progress marker with correct ownership
     cat > "${pid_file}" <<EOF
 started=$(date +%s)
 primary=${primary_host}
 user=${rep_user}
 timeout=${OCF_RESKEY_basebackup_timeout}
+pgdata=${PGDATA}
 EOF
+    chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "${pid_file}"
 
     # Start pg_basebackup in background
     (
         runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress > "${log_file}" 2>&1
-        echo $? > "${PGDATA}/.basebackup_rc"
+        echo $? > "${rc_file}"
     ) &
 
     local bg_pid=$!
@@ -1695,9 +2244,11 @@ EOF
 
 # Check progress of asynchronous basebackup
 check_basebackup_progress() {
-    local pid_file="${PGDATA}/.basebackup_in_progress"
-    local rc_file="${PGDATA}/.basebackup_rc"
-    local log_file="${PGDATA}/.basebackup.log"
+    # BUG FIX v1.6.6: Use same state directory as start_async_basebackup()
+    local state_dir=$(dirname "${PGDATA}")
+    local pid_file="${state_dir}/.pgtwin_basebackup_in_progress"
+    local rc_file="${state_dir}/.pgtwin_basebackup_rc"
+    local log_file="${state_dir}/.pgtwin_basebackup.log"
 
     if [ ! -f "${pid_file}" ]; then
         return 0  # No basebackup in progress
@@ -1750,11 +2301,29 @@ check_basebackup_progress() {
     # Process completed, check result
     if [ -f "${rc_file}" ]; then
         local bb_rc=$(cat "${rc_file}")
+
+        # CRITICAL: Read values from pid_file BEFORE deleting it
+        local primary_host=$(grep "^primary=" "${pid_file}" | cut -d= -f2)
+        local rep_user=$(grep "^user=" "${pid_file}" | cut -d= -f2)
+
+        # Now safe to delete
         rm -f "${pid_file}" "${rc_file}"
 
         if [ "$bb_rc" -eq 0 ]; then
             ocf_log info "Asynchronous pg_basebackup completed successfully after ${elapsed}s"
 
+            # BUG FIX v1.6.6: Only finalize if PGDATA is actually valid
+            # If PGDATA is empty/invalid, this means the tracking files are stale/orphaned
+            # (e.g., user deleted PGDATA after basebackup completed)
+            if ! is_valid_pgdata; then
+                ocf_log warn "Basebackup tracking files exist but PGDATA is invalid - orphaned tracking files detected"
+                ocf_log warn "This can happen if PGDATA was deleted after a successful basebackup"
+                ocf_log info "Ignoring stale basebackup completion, will trigger new auto-initialization"
+                # Don't finalize - let pgsql_start() detect empty PGDATA and run new basebackup
+                return 0
+            fi
+
+            # PGDATA is valid, proceed with finalization
             # Clean up backup directories if backup mode was enabled
             if [ "${OCF_RESKEY_backup_before_basebackup}" = "true" ]; then
                 # Optionally keep the most recent backup, remove older ones
@@ -1765,17 +2334,14 @@ check_basebackup_progress() {
                 fi
             fi
 
-            # Update connection info
-            local app_name=$(get_application_name)
-            local primary_host=$(grep "^primary=" "${pid_file}" | cut -d= -f2)
-            local rep_user=$(grep "^user=" "${pid_file}" | cut -d= -f2)
+            # Finalize standby configuration
+            # This sanitizes pg_basebackup -R generated config with correct application_name and passfile
+            finalize_standby_config "${primary_host}" "${rep_user}"
+            if [ $? -ne 0 ]; then
+                ocf_log err "Failed to finalize standby configuration after pg_basebackup"
+                return $OCF_ERR_GENERIC
+            fi
 
-            cat > "${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}'
-primary_slot_name = '${OCF_RESKEY_slot_name}'
-EOF
-
-            touch "${PGDATA}/standby.signal"
             return 0
         else
             ocf_log err "Asynchronous pg_basebackup failed with exit code ${bb_rc}"
@@ -1815,6 +2381,16 @@ disable_sync_replication() {
     ocf_log info "Synchronous replication disabled"
 }
 
+enable_sync_replication() {
+    ocf_log info "Enabling synchronous replication (standby connected)"
+
+    # Update postgresql.auto.conf to enable sync replication
+    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
+    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
+
+    ocf_log info "Synchronous replication enabled"
+}
+
 pgsql_notify() {
     local type_op="${OCF_RESKEY_CRM_meta_notify_type}-${OCF_RESKEY_CRM_meta_notify_operation}"
 
@@ -1826,6 +2402,17 @@ pgsql_notify() {
         pre-demote)
             # Before demotion, prepare for standby role
             ocf_log info "Pre-demote notification received"
+            ;;
+        post-start)
+            # After an unpromoted resource (standby) starts, enable sync replication
+            if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+                # Check if there are unpromoted resources running
+                local unpromoted="${OCF_RESKEY_CRM_meta_notify_unpromoted_resource}"
+                if [ -n "$unpromoted" ]; then
+                    ocf_log info "Post-start notification: Unpromoted resource started, enabling sync replication"
+                    enable_sync_replication
+                fi
+            fi
             ;;
         post-stop)
             # After a node stops, check if we need to disable sync replication
@@ -1847,10 +2434,22 @@ pgsql_validate() {
     check_binary "${PGCTL}"
     check_binary "${PSQL}"
 
-    # Check data directory
+    # Check data directory - be lenient, allow missing/empty for auto-initialization
     if [ ! -d "${PGDATA}" ]; then
-        ocf_log err "PostgreSQL data directory ${PGDATA} does not exist"
-        return $OCF_ERR_INSTALLED
+        ocf_log info "PostgreSQL data directory ${PGDATA} does not exist - will be auto-initialized on start"
+        # Try to create it to verify parent directory exists and is writable
+        mkdir -p "${PGDATA}" 2>/dev/null || {
+            ocf_log err "Cannot create PGDATA directory ${PGDATA} - check parent directory exists and permissions"
+            return $OCF_ERR_INSTALLED
+        }
+        # Set ownership
+        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}" 2>/dev/null || {
+            ocf_log warn "Cannot set ownership on ${PGDATA} - may need manual intervention"
+        }
+    elif [ -z "$(ls -A ${PGDATA} 2>/dev/null)" ]; then
+        ocf_log info "PostgreSQL data directory ${PGDATA} is empty - will be auto-initialized on start"
+    elif [ ! -f "${PGDATA}/PG_VERSION" ]; then
+        ocf_log warn "PostgreSQL data directory ${PGDATA} exists but missing PG_VERSION - may be corrupted, will attempt auto-initialization"
     fi
 
     # Validate application_name if provided
@@ -1873,6 +2472,45 @@ pgsql_validate() {
     # Check .pgpass file if specified
     if [ -n "${OCF_RESKEY_pgpassfile}" ] && [ ! -f "${OCF_RESKEY_pgpassfile}" ]; then
         ocf_log warn "Specified pgpassfile does not exist: ${OCF_RESKEY_pgpassfile}"
+    fi
+
+    # Validate container mode configuration (v1.6.5)
+    if [ "${OCF_RESKEY_container_mode}" = "true" ] || [ "${OCF_RESKEY_container_mode}" = "yes" ]; then
+        # Check if container runtime is available
+        if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+            ocf_log err "Container mode enabled but no container runtime found. Install podman or docker."
+            return $OCF_ERR_INSTALLED
+        fi
+
+        # Validate pg_major_version format if specified
+        if [ -n "${OCF_RESKEY_pg_major_version}" ] && [ "${OCF_RESKEY_pg_major_version}" != "auto" ]; then
+            if ! echo "${OCF_RESKEY_pg_major_version}" | grep -qE '^[0-9]+$'; then
+                ocf_log err "Invalid pg_major_version: ${OCF_RESKEY_pg_major_version}. Must be a number (e.g., 17, 16, 15)"
+                return $OCF_ERR_CONFIGURED
+            fi
+        fi
+
+        # Validate container_name is not empty
+        if [ -z "${OCF_RESKEY_container_name}" ]; then
+            ocf_log err "Container mode enabled but container_name is empty"
+            return $OCF_ERR_CONFIGURED
+        fi
+
+        # Validate container_image format if specified
+        if [ -n "${OCF_RESKEY_container_image}" ] && [ "${OCF_RESKEY_container_image}" != "auto" ]; then
+            # Basic validation: should contain at least a colon for tag
+            if ! echo "${OCF_RESKEY_container_image}" | grep -q ':'; then
+                ocf_log warn "Container image '${OCF_RESKEY_container_image}' does not specify a tag. Consider using versioned tags."
+            fi
+        fi
+
+        # If both pg_major_version and container_image are set, warn about priority
+        if [ -n "${OCF_RESKEY_pg_major_version}" ] && [ "${OCF_RESKEY_pg_major_version}" != "auto" ] && \
+           [ -n "${OCF_RESKEY_container_image}" ] && [ "${OCF_RESKEY_container_image}" != "auto" ]; then
+            ocf_log info "Both pg_major_version and container_image are set. Using container_image: ${OCF_RESKEY_container_image}"
+        fi
+
+        ocf_log info "Container mode validation passed. Runtime: $(command -v podman >/dev/null 2>&1 && echo podman || echo docker)"
     fi
 
     return $OCF_SUCCESS

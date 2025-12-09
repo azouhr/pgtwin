@@ -98,7 +98,67 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 - `vip`: Virtual IP address for fast promoted node discovery (optional but recommended)
 - `replication_failure_threshold`: Number of monitor cycles before recovery (default: 5, ~40 seconds with 8s intervals)
 
-**Status**: Experimental - automatic recovery logic is implemented but has known issues (see CHANGELOG.md).
+**Status**: Production Ready - v1.6.6 fixes all critical bugs from v1.6.0-v1.6.5.
+
+### Automatic Standby Initialization (v1.6.6)
+
+pgtwin v1.6.6 introduces **zero-touch standby deployment** - just provide an empty PGDATA and pgtwin automatically initializes it:
+
+| Feature | Description |
+|---------|-------------|
+| **Empty PGDATA Detection** | Automatically detects empty/missing/invalid PGDATA on startup |
+| **Automatic pg_basebackup** | Discovers primary, runs pg_basebackup in background, finalizes configuration |
+| **Zero Manual Steps** | Only `.pgpass` file required - everything else is automatic |
+| **Simplified Disk Replacement** | Disk replacement reduced from 10+ steps to just 3 commands |
+| **Fresh Node Deployment** | New nodes self-initialize when joining cluster |
+| **Corrupted Data Recovery** | Delete corrupted data, bring node online - automatic recovery |
+
+**Prerequisites**: Only requires `.pgpass` file with replication credentials
+
+**Use Case**: Disk replacement now takes 3 commands:
+```bash
+crm node standby psql2
+# Mount new disk at /var/lib/pgsql/data
+crm node online psql2  # Auto-initializes!
+```
+
+See [doc/FEATURE_AUTO_INITIALIZATION.md](doc/FEATURE_AUTO_INITIALIZATION.md) for complete details.
+
+### Pacemaker Notify Support (v1.6.6)
+
+pgtwin v1.6.6 adds **dynamic synchronous replication management** to prevent write blocking when standby fails:
+
+| Feature | Description |
+|---------|-------------|
+| **post-start Handler** | Automatically enables sync replication when standby connects |
+| **post-stop Handler** | Automatically disables sync replication when standby disconnects |
+| **Zero-Touch Operations** | No manual synchronous_standby_names changes needed |
+| **High Availability** | Prevents write outages during standby failures |
+| **Optimal Consistency** | Automatically uses strongest mode available (sync when possible, async when needed) |
+
+**Configuration**: Just add `notify="true"` to your clone meta:
+```bash
+clone postgres-clone postgres-db \
+  meta notify="true" promotable=true
+```
+
+**Benefit**: Standby maintenance no longer blocks writes on primary
+
+See [doc/FEATURE_NOTIFY_SUPPORT.md](doc/FEATURE_NOTIFY_SUPPORT.md) for complete details.
+
+### Critical Bug Fix (v1.6.6)
+
+pgtwin v1.6.6 fixes a **critical bug** that caused replication to fail after pg_basebackup recovery:
+
+| Issue | Impact | Fix |
+|-------|--------|-----|
+| Empty `primary_conninfo` | 100% replication failure after pg_basebackup | New `finalize_standby_config()` function |
+| Read-after-delete | Bug attempted to read file after deleting it | Read values before file deletion |
+| Broken recovery paths | Affected automatic recovery, manual failover, disk replacement | Unified config finalization across all paths |
+
+**Impact**: Affects v1.6.0 - v1.6.5. **Immediate upgrade recommended** if using automatic recovery or disk replacement procedures.
+
+See [doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md](doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md) for technical details.
 
 ### Advanced Features
 
@@ -400,11 +460,11 @@ sudo crm configure primitive postgres-db pgtwin \
 | Version | Date | Changes |
 |---------|------|---------|
 | **1.5.0** | 2025-01-02 | Configuration validation framework, production-safe timeouts |
-| **1.4.0** | 2024-12 | Async pg_basebackup, backup mode |
-| **1.3.0** | 2024-11 | Enhanced configuration checks |
-| **1.2.0** | 2024-10 | Disk space validation |
-| **1.1.0** | 2024-09 | Application name validation, .pgpass support |
-| **1.0.0** | 2024-08 | Initial release |
+| **1.4.0** | 2025-12 | Async pg_basebackup, backup mode |
+| **1.3.0** | 2025-11 | Enhanced configuration checks |
+| **1.2.0** | 2025-10 | Disk space validation |
+| **1.1.0** | 2025-10 | Application name validation, .pgpass support |
+| **1.0.0** | 2025-10 | Initial release |
 
 ---
 
