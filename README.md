@@ -416,6 +416,7 @@ See [QUICKSTART.md](QUICKSTART.md) for complete setup guide.
 | Document | Description |
 |----------|-------------|
 | [QUICKSTART.md](QUICKSTART.md) | Complete setup guide (PostgreSQL + Pacemaker) |
+| [QUICKSTART_DUAL_RING_HA.md](QUICKSTART_DUAL_RING_HA.md) | ⚠️ **Experimental**: Dual-ring Corosync setup (alternative to SBD) |
 | [CHEATSHEET.md](CHEATSHEET.md) | Administration command reference |
 | README.md | This file - overview and design decisions |
 

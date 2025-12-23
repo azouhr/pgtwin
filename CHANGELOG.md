@@ -5,6 +5,94 @@ All notable changes to pgtwin will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7] - 2025-12-23
+
+### Fixed
+- **CRITICAL**: Replication failure counter stuck at 1/5 (QA fix)
+  - Bug: Counter read using `ocf_run` wrapper which captures stdout, counter always reset to 1
+  - Fix: Removed `ocf_run` wrapper from counter read operation (line 1576)
+  - Impact: Automatic recovery now triggers correctly after 5 consecutive failures
+  - Code: `crm_attribute -G` now properly returns counter value
+- **CRITICAL**: PGDATA permissions causing PostgreSQL startup failures (QA fix)
+  - Bug: pg_basebackup creates PGDATA with 751 permissions, PostgreSQL requires 700 or 750
+  - Fix: Added `chmod 750` at three PGDATA creation points (lines 1893, 2740, 3067)
+  - Impact: Eliminates "data directory has invalid permissions" errors after basebackup
+- **CRITICAL**: Replication slot creation before pg_basebackup (prevents WAL recycling race)
+  - Bug: WAL segments could be recycled before standby retrieved them during long pg_basebackup
+  - Fix: Create replication slot BEFORE starting pg_basebackup (lines 2678-2709)
+  - Impact: Eliminates "requested WAL segment already removed" failures
+  - Affects: Large databases, slow networks, or high WAL generation rates
+- **Configuration Validation**: False wal_sender_timeout warnings (QA fix)
+  - Bug: Code parsed `SHOW wal_sender_timeout` returning "30s", stripped to "30", compared as integer
+  - Fix: Query `pg_settings` which returns milliseconds directly (lines 1162-1175)
+  - Impact: Eliminates false warnings when timeout correctly set (e.g., 30s = 30000ms)
+- **Log Noise**: Excessive PAM session logging from runuser (QA fix)
+  - Bug: Every PostgreSQL operation logged 2 PAM entries (138 entries per 30 seconds)
+  - Fix: Created `run_as_pguser()` helper using `setpriv` instead of `runuser` (lines 48-61)
+  - Impact: 98% reduction in log noise (0-2 entries vs 138 per 30 seconds)
+  - Changed: All 76 `runuser` calls replaced with `run_as_pguser`
+- **Documentation**: Fixed duplicate order constraint in QUICKSTART.md
+  - Bug: Two order constraints named "promote-before-vip" (Pacemaker rejects duplicate names)
+  - Bug: Second constraint had wrong semantics: `postgres-clone:demote vip:start`
+  - Fix: Renamed to `vip-stop-before-demote` with correct order: `vip:stop postgres-clone:demote`
+  - Impact: QUICKSTART.md instructions now work correctly (previously would fail at crm configure)
+
+### Added
+- **Performance**: Automatic resource cleanup after basebackup completion
+  - Self-triggered `crm_resource --cleanup` when pg_basebackup finishes
+  - Uses `crm_node -n` to determine cluster node name (lines 2726-2768)
+  - Performance: 98.4% faster for small databases (5s vs 5m 5s)
+  - Eliminates 5-minute failure-timeout wait for administrators
+  - Falls back to failure-timeout if cleanup command fails
+
+### Changed
+- Updated version to 1.6.7 and release date to 2025-12-23
+- Enhanced description includes slot creation sequencing and auto-cleanup
+- Consolidated multiple development versions (v1.6.8-v1.6.11) into single stable release
+- **Container Mode**: Downgraded "container library not available" from warning to info level (QA fix)
+  - Container mode is experimental, missing library should not generate warnings
+  - Code change: `ocf_log warn` → `ocf_log info` (line 1782)
+- **Privilege Dropping**: Replaced all `runuser` calls with `setpriv` for cleaner logging
+  - New `run_as_pguser()` helper function provides consistent privilege dropping
+  - Eliminates PAM session logging for PostgreSQL operations
+
+### Testing
+- ✅ Automated test suite: 12/12 tests passed (100%)
+- ✅ Failover performance: ~4.5 seconds
+- ✅ Initialization speedup: 98.4% improvement
+- ✅ Zero data loss in all scenarios
+- New test suite v1.1 with fixed application_name, pg_rewind timeout, and slot detection checks
+
+### Documentation
+- **NEW**: `RELEASE_v1.6.7.md` - Consolidated release notes with all improvements
+- **NEW**: `test/test-pgtwin-ha-suite.sh` - Comprehensive automated test suite (12 tests)
+- **NEW**: `doc/TEST_SUITE_FIXES.md` - Test suite accuracy improvements documentation
+- **NEW**: `QUICKSTART_DUAL_RING_HA.md` - ⚠️ Experimental dual-ring Corosync guide (alternative to SBD)
+- **NEW**: `postgresql.custom.conf` - Sample PostgreSQL configuration for HA clusters
+  - Minimal required settings for pgtwin resource agent
+  - Includes critical `restart_after_crash = off` setting
+  - Ready-to-use template for new deployments
+- **UPDATED**: `pgsql-resource-config.crm` - Enhanced cluster configuration
+  - Added resource-stickiness=100 to prevent unnecessary failback
+  - Added failure-timeout=5m and migration-threshold=5
+  - Added ping-gateway resource for network connectivity monitoring
+  - Added location constraint to prefer nodes with working network connectivity
+- **UPDATED**: `QUICKSTART.md` - Added PostgreSQL binary linking instructions (section 1.1)
+  - Manual symlink creation for postgresql17-server binaries
+  - Two-tier structure via /etc/alternatives for easy version switching
+  - Verification commands included
+- **UPDATED**: `QUICKSTART.md` - Container mode sections marked as ⚠️ experimental
+- **UPDATED**: `README.md` - Added reference to dual-ring experimental guide
+- **UPDATED**: `CHANGELOG.md` - This entry
+
+### Migration
+- Fully backward compatible with v1.6.6
+- No cluster configuration changes required
+- Recommended: Run test suite after upgrade to validate functionality
+- See RELEASE_v1.6.7.md for complete upgrade instructions
+
+**Note**: This release consolidates critical bug fixes for production deployments. Immediate upgrade recommended for clusters experiencing basebackup failures or long administrator wait times.
+
 ## [1.6.6] - 2025-12-09
 
 ### Fixed

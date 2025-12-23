@@ -33,6 +33,14 @@ property cib-bootstrap-options: \
     no-quorum-policy=ignore \
     cluster-recheck-interval=2min
 
+# Resource defaults - prevent unnecessary failback
+# Stickiness=100 means "prefer to stay on current node"
+# This prevents automatic failback when failed node recovers
+# Combined with location constraints (psql1:100, psql2:50):
+#   - Fresh start: prefers psql1 (100 > 50)
+#   - After failover to psql2: stays on psql2 (50+100 > 100)
+rsc_defaults resource-stickiness=100
+
 # Define the virtual IP for PostgreSQL clients
 primitive postgres-vip IPaddr2 \
     params ip=192.168.122.100 cidr_netmask=24 \
@@ -75,6 +83,8 @@ clone postgres-clone postgres-db \
         clone-node-max="1" \
         notify="true" \
         promotable="true" \
+        failure-timeout="5m" \
+        migration-threshold="5" \
         interleave="true" \
         target-role="Started"
 
@@ -92,6 +102,23 @@ order vip-stop-before-demote Mandatory: \
     postgres-vip:stop postgres-clone:demote \
     symmetrical=false
 
+# Network connectivity monitoring
+# Monitors gateway/network accessibility to prefer nodes with working connectivity
+primitive ping-gateway ocf:pacemaker:ping \
+    params \
+        host_list="192.168.122.1" \
+        multiplier="100" \
+        attempts="3" \
+        timeout="2" \
+    op monitor interval="10s" timeout="20s"
+
+clone ping-clone ping-gateway \
+    meta clone-max="2" clone-node-max="1"
+
 # Location constraints: Allow both nodes to be promoted, prefer psql1
 location prefer-psql1 postgres-clone role=Promoted 100: psql1
 location prefer-psql2 postgres-clone role=Promoted 50: psql2
+
+# Prefer promoted role on nodes with working network connectivity
+location prefer-connected-promoted postgres-clone role=Promoted \
+    rule 200: pingd gt 0

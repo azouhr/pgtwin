@@ -1,15 +1,21 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.6
-# Release Date: 2025-12-09
+# Version: 1.6.7
+# Release Date: 2025-12-23
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
 #               automatic replication recovery, dynamic promoted node discovery,
 #               automatic standby initialization, Pacemaker notify support,
+#               replication slot creation before basebackup (prevents WAL recycling),
+#               self-triggered resource cleanup after basebackup completion,
 #               and seamless container mode support (Podman/Docker)
 #
+
+# Set PATH to include standard system directories (Pacemaker has minimal PATH)
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH
+
 # OCF instance parameters:
 #   OCF_RESKEY_pgdata           - PostgreSQL data directory
 #   OCF_RESKEY_pghost           - IP address to bind to
@@ -38,6 +44,21 @@
 
 : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
 . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+# Helper function to run commands as PostgreSQL user
+# Uses setpriv instead of runuser to avoid PAM session logging noise
+run_as_pguser() {
+    local pguser="${OCF_RESKEY_pguser:-postgres}"
+    local pguid=$(id -u "$pguser" 2>/dev/null) || {
+        ocf_log err "Cannot determine UID for user: $pguser"
+        return 1
+    }
+    local pggid=$(id -g "$pguser" 2>/dev/null) || {
+        ocf_log err "Cannot determine GID for user: $pguser"
+        return 1
+    }
+    setpriv --reuid="$pguid" --regid="$pggid" --clear-groups "$@"
+}
 
 # Load container library (provides seamless container/bare-metal support)
 if [ -f "${OCF_FUNCTIONS_DIR}/pgtwin-container-lib.sh" ]; then
@@ -107,8 +128,8 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.6.6">
-<version>1.6.6</version>
+<resource-agent name="pgtwin" version="1.6.9">
+<version>1.6.9</version>
 
 <longdesc lang="en">
 Resource agent for PostgreSQL with advanced replication slot management,
@@ -170,9 +191,33 @@ Physical replication slot name
 
 <parameter name="max_slot_wal_keep_size" unique="0">
 <longdesc lang="en">
-Maximum replication slot WAL size in MB before forcing full resync
+Maximum size (in MB) for replication slot before automatic dropping.
+
+When a replication slot exceeds this size, it indicates the standby has been
+offline for a long time. The slot will be automatically dropped and the standby
+will be recovered via pg_basebackup when it reconnects.
+
+v1.6.9 Enhancement: Additional safety check compares slot size to database size.
+If slot size exceeds database size, the slot will be dropped regardless of this
+threshold, as pg_basebackup would be more efficient than replaying massive amounts
+of WAL.
+
+Values:
+  0 = Disable automatic slot dropping (manual management required)
+  &gt;0 = Drop slot if it exceeds this many MB OR exceeds database size
+
+Default: 1024 (1 GB)
+
+Examples:
+  0     = Disabled (never drop slots automatically)
+  512   = Drop if &gt; 512 MB
+  1024  = Drop if &gt; 1 GB (default)
+  10240 = Drop if &gt; 10 GB
+
+Recommendation: For production, use default (1024) or higher. Set to 0 only
+if you have monitoring and manual slot management procedures in place.
 </longdesc>
-<shortdesc lang="en">Max slot WAL size (MB)</shortdesc>
+<shortdesc lang="en">Max slot WAL size (MB), 0=disable</shortdesc>
 <content type="integer" default="${OCF_RESKEY_max_slot_wal_keep_size_default}" />
 </parameter>
 
@@ -339,6 +384,50 @@ Default: registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postg
 <content type="string" default="${OCF_RESKEY_container_image_default}" />
 </parameter>
 
+<parameter name="max_promotion_lag_bytes" unique="0">
+<longdesc lang="en">
+Maximum replication lag (in bytes) allowed before promoting a standby to primary.
+Only applies when rep_mode=async. In sync mode, PostgreSQL's synchronous replication
+guarantees the standby is caught up.
+
+This prevents data loss during planned failover by blocking promotion of standbys
+that are not caught up with the primary.
+
+Values:
+  -1 = Disable lag check (unsafe - may promote standby with significant lag)
+   0 = Require fully caught up (no lag allowed)
+  &gt;0 = Allow promotion if lag is less than this value in bytes
+
+Examples:
+  10485760    = 10 MB (default)
+  104857600   = 100 MB
+  1073741824  = 1 GB
+
+Default: 10485760 (10 MB)
+</longdesc>
+<shortdesc lang="en">Max promotion lag (bytes)</shortdesc>
+<content type="integer" default="${OCF_RESKEY_max_promotion_lag_bytes_default}" />
+</parameter>
+
+<parameter name="force_promotion" unique="0">
+<longdesc lang="en">
+Force promotion regardless of replication lag or sync state.
+
+DANGER: Setting this to true bypasses all promotion safety checks!
+This can result in data loss if the standby is not caught up with the primary.
+
+Only use this in emergency scenarios where you need to force failover
+despite the standby being out of sync.
+
+For normal operations, leave this set to false and let the safety checks
+prevent data loss.
+
+Default: false
+</longdesc>
+<shortdesc lang="en">Force unsafe promotion</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_force_promotion_default}" />
+</parameter>
+
 </parameters>
 
 <actions>
@@ -379,12 +468,17 @@ validate_application_name() {
 }
 
 # Get application name for replication
+# Sets global variable APPLICATION_NAME
 get_application_name() {
     if [ -n "${OCF_RESKEY_application_name}" ]; then
-        echo "${OCF_RESKEY_application_name}"
+        APPLICATION_NAME="${OCF_RESKEY_application_name}"
     else
         # Fallback to hostname, but sanitize it (replace hyphens with underscores)
-        hostname -s | tr '-' '_'
+        # Avoid command substitution by using temp file
+        hostname -s > /tmp/.pgtwin_hostname.$$
+        tr '-' '_' < /tmp/.pgtwin_hostname.$$ > /tmp/.pgtwin_appname.$$
+        read APPLICATION_NAME < /tmp/.pgtwin_appname.$$
+        rm -f /tmp/.pgtwin_hostname.$$ /tmp/.pgtwin_appname.$$
     fi
 }
 
@@ -393,7 +487,10 @@ get_application_name() {
 update_application_name_in_config() {
     # v1.7.0: Refactored to use ALTER SYSTEM instead of manual file editing
     # This function now handles both application_name and synchronous_standby_names
-    local app_name=$(get_application_name)
+    local app_name
+
+    get_application_name
+    app_name="$APPLICATION_NAME"
 
     if [ -z "$app_name" ]; then
         ocf_log warn "No application_name to set in configuration"
@@ -408,7 +505,7 @@ update_application_name_in_config() {
 
     # Set application_name using ALTER SYSTEM
     ocf_log info "Configuring application_name='${app_name}' using ALTER SYSTEM"
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET application_name = '${app_name}'\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET application_name = '${app_name}'\"" >/dev/null 2>&1
 
     if [ $? -ne 0 ]; then
         ocf_log warn "Failed to set application_name using ALTER SYSTEM"
@@ -417,7 +514,7 @@ update_application_name_in_config() {
 
     # If this is a promoted instance with rep_mode=sync, also configure synchronous_standby_names
     if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-        local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
+        local current_sync=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
         # Use '*' to match any standby (most robust for HA clusters)
         local expected_sync="*"
@@ -425,7 +522,7 @@ update_application_name_in_config() {
         # Only set if empty or different from expected
         if [ -z "$current_sync" ] || [ "$current_sync" != "$expected_sync" ]; then
             ocf_log info "Configuring synchronous_standby_names='${expected_sync}' for rep_mode=sync"
-            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${expected_sync}'\"" >/dev/null 2>&1
+            run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${expected_sync}'\"" >/dev/null 2>&1
 
             if [ $? -eq 0 ]; then
                 ocf_log info "Synchronous replication enabled: synchronous_standby_names='${expected_sync}'"
@@ -436,7 +533,7 @@ update_application_name_in_config() {
     fi
 
     # Reload configuration to apply changes
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
 
     if [ $? -eq 0 ]; then
         ocf_log debug "PostgreSQL configuration reloaded successfully"
@@ -587,7 +684,7 @@ pg_ctl_wrapper() {
     if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
         container_exec_as_postgres /usr/bin/pg_ctl "$@"
     else
-        runuser -u "${OCF_RESKEY_pguser}" -- "${PGCTL}" "$@"
+        run_as_pguser "${PGCTL}" "$@"
     fi
     return $?
 }
@@ -597,7 +694,7 @@ psql_wrapper() {
     if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
         container_exec_as_postgres /usr/bin/psql "$@"
     else
-        runuser -u "${OCF_RESKEY_pguser}" -- "${PSQL}" "$@"
+        run_as_pguser "${PSQL}" "$@"
     fi
     return $?
 }
@@ -607,7 +704,7 @@ pg_rewind_wrapper() {
     if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
         container_exec_as_postgres /usr/bin/pg_rewind "$@"
     else
-        runuser -u "${OCF_RESKEY_pguser}" -- "${PG_REWIND}" "$@"
+        run_as_pguser "${PG_REWIND}" "$@"
     fi
     return $?
 }
@@ -617,7 +714,7 @@ pg_basebackup_wrapper() {
     if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
         container_exec_as_postgres /usr/bin/pg_basebackup "$@"
     else
-        runuser -u "${OCF_RESKEY_pguser}" -- "${PG_BASEBACKUP}" "$@"
+        run_as_pguser "${PG_BASEBACKUP}" "$@"
     fi
     return $?
 }
@@ -731,7 +828,7 @@ check_disk_space_for_basebackup() {
         else
             # Fallback: try to get from primary
             ocf_log warn "Could not determine local disk usage, querying primary database size"
-            local db_size_bytes=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
+            local db_size_bytes=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
 
             if [ -n "$db_size_bytes" ] && [ "$db_size_bytes" -gt 0 ]; then
                 actual_disk_usage_mb=$((db_size_bytes / 1024 / 1024))
@@ -747,7 +844,7 @@ check_disk_space_for_basebackup() {
     else
         # PGDATA doesn't exist yet - use conservative estimate from primary
         ocf_log info "PGDATA does not exist, querying primary for size estimate"
-        local db_size_bytes=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
+        local db_size_bytes=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
 
         if [ -n "$db_size_bytes" ] && [ "$db_size_bytes" -gt 0 ]; then
             actual_disk_usage_mb=$((db_size_bytes / 1024 / 1024))
@@ -797,14 +894,16 @@ check_disk_space_for_basebackup() {
 }
 
 # Ensure .pgpass file exists in standard location
+# Sets global variable PGPASS_FILE on success
 ensure_pgpass() {
     local standard_pgpass="/var/lib/pgsql/.pgpass"
+    local pguser_group
 
     # If no pgpassfile parameter set, check if standard location exists
     if [ -z "${OCF_RESKEY_pgpassfile}" ]; then
         if [ -f "$standard_pgpass" ]; then
             ocf_log debug ".pgpass exists in standard location: $standard_pgpass"
-            echo "$standard_pgpass"
+            PGPASS_FILE="$standard_pgpass"
             return 0
         else
             ocf_log warn "No pgpassfile configured and $standard_pgpass does not exist"
@@ -816,7 +915,7 @@ ensure_pgpass() {
     if [ "${OCF_RESKEY_pgpassfile}" = "$standard_pgpass" ]; then
         if [ -f "$standard_pgpass" ]; then
             ocf_log debug ".pgpass exists in standard location: $standard_pgpass"
-            echo "$standard_pgpass"
+            PGPASS_FILE="$standard_pgpass"
             return 0
         else
             ocf_log err "Configured pgpassfile $standard_pgpass does not exist"
@@ -828,12 +927,18 @@ ensure_pgpass() {
     if [ -f "${OCF_RESKEY_pgpassfile}" ]; then
         ocf_log info "Copying .pgpass from ${OCF_RESKEY_pgpassfile} to $standard_pgpass"
         cp "${OCF_RESKEY_pgpassfile}" "$standard_pgpass"
-        chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "$standard_pgpass"
+
+        # Get group name without command substitution
+        id -gn ${OCF_RESKEY_pguser} > /tmp/.pgtwin_group.$$
+        read pguser_group < /tmp/.pgtwin_group.$$
+        rm -f /tmp/.pgtwin_group.$$
+
+        chown ${OCF_RESKEY_pguser}:${pguser_group} "$standard_pgpass"
         chmod 600 "$standard_pgpass"
 
         if [ $? -eq 0 ]; then
             ocf_log info ".pgpass successfully copied to standard location"
-            echo "$standard_pgpass"
+            PGPASS_FILE="$standard_pgpass"
             return 0
         else
             ocf_log err "Failed to copy .pgpass to standard location"
@@ -875,7 +980,7 @@ validate_pghba_config() {
     fi
 
     # Check for postgres database access (required for pg_rewind)
-    local postgres_access=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+    local postgres_access=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
         SELECT COUNT(*) FROM pg_hba_file_rules
         WHERE database @> '{postgres}'
         AND user_name @> '{${rep_user}}'
@@ -897,7 +1002,7 @@ validate_pghba_config() {
     fi
 
     # Check for replication database access (required for streaming replication and pg_basebackup)
-    local replication_access=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+    local replication_access=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
         SELECT COUNT(*) FROM pg_hba_file_rules
         WHERE database @> '{replication}'
         AND user_name @> '{${rep_user}}'
@@ -937,7 +1042,10 @@ validate_pghba_config() {
 check_postgresql_config() {
     local config_ok=0
     local warnings=0
-    local expected_app_name=$(get_application_name)
+    local expected_app_name
+
+    get_application_name
+    expected_app_name="$APPLICATION_NAME"
 
     ocf_log info "Validating PostgreSQL configuration for replication..."
 
@@ -948,7 +1056,7 @@ check_postgresql_config() {
     fi
 
     # 1. Check wal_level
-    local wal_level=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW wal_level\"" 2>/dev/null)
+    local wal_level=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW wal_level\"" 2>/dev/null)
     if [ "$wal_level" != "replica" ] && [ "$wal_level" != "logical" ]; then
         ocf_log err "CONFIGURATION ERROR: wal_level='${wal_level}' - MUST be 'replica' or 'logical' for replication!"
         ocf_log err "FIX: Set 'wal_level = replica' in postgresql.conf"
@@ -958,7 +1066,7 @@ check_postgresql_config() {
     fi
 
     # 2. Check max_wal_senders
-    local max_wal_senders=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_wal_senders\"" 2>/dev/null)
+    local max_wal_senders=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_wal_senders\"" 2>/dev/null)
     if [ -n "$max_wal_senders" ] && [ "$max_wal_senders" -lt 2 ]; then
         ocf_log err "CONFIGURATION ERROR: max_wal_senders='${max_wal_senders}' - MUST be at least 2 for replication!"
         ocf_log err "FIX: Set 'max_wal_senders = 10' (or higher) in postgresql.conf"
@@ -968,7 +1076,7 @@ check_postgresql_config() {
     fi
 
     # 3. Check max_replication_slots
-    local max_repl_slots=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_replication_slots\"" 2>/dev/null)
+    local max_repl_slots=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_replication_slots\"" 2>/dev/null)
     if [ -n "$max_repl_slots" ] && [ "$max_repl_slots" -lt 2 ]; then
         ocf_log err "CONFIGURATION ERROR: max_replication_slots='${max_repl_slots}' - MUST be at least 2!"
         ocf_log err "FIX: Set 'max_replication_slots = 10' (or higher) in postgresql.conf"
@@ -978,7 +1086,7 @@ check_postgresql_config() {
     fi
 
     # 4. Check hot_standby
-    local hot_standby=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW hot_standby\"" 2>/dev/null)
+    local hot_standby=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW hot_standby\"" 2>/dev/null)
     if [ "$hot_standby" != "on" ]; then
         ocf_log warn "CONFIGURATION WARNING: hot_standby='${hot_standby}' - RECOMMENDED: 'on' for standby read queries"
         ocf_log warn "FIX: Set 'hot_standby = on' in postgresql.conf"
@@ -989,7 +1097,7 @@ check_postgresql_config() {
 
     # 5. Check synchronous_commit (for sync replication mode)
     if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-        local sync_commit=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_commit\"" 2>/dev/null)
+        local sync_commit=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_commit\"" 2>/dev/null)
         if [ "$sync_commit" = "off" ] || [ "$sync_commit" = "local" ]; then
             ocf_log warn "CONFIGURATION WARNING: synchronous_commit='${sync_commit}' with rep_mode='sync'"
             ocf_log warn "RECOMMENDED: synchronous_commit='on' or 'remote_write' or 'remote_apply' for synchronous replication"
@@ -1001,7 +1109,7 @@ check_postgresql_config() {
     fi
 
     # 6. Check synchronous_standby_names
-    local sync_standby_names=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
+    local sync_standby_names=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
     if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         # Synchronous mode - should have standby configured
@@ -1040,7 +1148,7 @@ check_postgresql_config() {
     fi
 
     # 7. Check restart_after_crash (CRITICAL for HA clusters)
-    local restart_after_crash=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW restart_after_crash\"" 2>/dev/null)
+    local restart_after_crash=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW restart_after_crash\"" 2>/dev/null)
     if [ "$restart_after_crash" != "off" ]; then
         ocf_log err "CRITICAL ERROR: restart_after_crash='${restart_after_crash}' - MUST be 'off' for Pacemaker-managed clusters!"
         ocf_log err "FIX: Set 'restart_after_crash = off' in postgresql.conf IMMEDIATELY"
@@ -1052,24 +1160,22 @@ check_postgresql_config() {
     fi
 
     # 8. Check wal_sender_timeout (performance/reliability)
-    local wal_sender_timeout=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW wal_sender_timeout\"" 2>/dev/null)
-    if [ -n "$wal_sender_timeout" ]; then
-        # Extract numeric value (remove 'ms' or 's' suffix)
-        local timeout_value=$(echo "$wal_sender_timeout" | sed 's/[^0-9]//g')
-
-        if [ -n "$timeout_value" ] && [ "$timeout_value" -lt 10000 ]; then
-            ocf_log warn "PERFORMANCE WARNING: wal_sender_timeout=${wal_sender_timeout} (<10 seconds) is very aggressive"
+    # Query pg_settings to get value in base unit (milliseconds)
+    local timeout_ms=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT setting::int FROM pg_settings WHERE name = 'wal_sender_timeout'\"" 2>/dev/null)
+    if [ -n "$timeout_ms" ]; then
+        if [ "$timeout_ms" -lt 10000 ]; then
+            ocf_log warn "PERFORMANCE WARNING: wal_sender_timeout=${timeout_ms}ms (<10 seconds) is very aggressive"
             ocf_log warn "May cause false disconnections on network hiccups, GC pauses, or CPU spikes"
             ocf_log warn "RECOMMENDATION: Set to 15000-30000ms for production stability"
             ocf_log warn "FIX: Set 'wal_sender_timeout = 30000' in postgresql.conf"
             warnings=$((warnings + 1))
         else
-            ocf_log info "✓ wal_sender_timeout='${wal_sender_timeout}' (OK)"
+            ocf_log info "✓ wal_sender_timeout=${timeout_ms}ms (OK)"
         fi
     fi
 
     # 9. Check max_standby_streaming_delay (replication lag control)
-    local max_standby_delay=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_standby_streaming_delay\"" 2>/dev/null)
+    local max_standby_delay=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW max_standby_streaming_delay\"" 2>/dev/null)
     if [ "$max_standby_delay" = "-1" ]; then
         ocf_log warn "REPLICATION WARNING: max_standby_streaming_delay=-1 allows unbounded replication lag"
         ocf_log warn "Long-running queries on standby will delay WAL replay indefinitely"
@@ -1083,7 +1189,7 @@ check_postgresql_config() {
     fi
 
     # 10. Check archive_mode and archive_command (availability risk)
-    local archive_mode=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_mode\"" 2>/dev/null)
+    local archive_mode=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_mode\"" 2>/dev/null)
     if [ "$archive_mode" != "on" ]; then
         ocf_log info "INFO: archive_mode='${archive_mode}' (archiving disabled)"
         ocf_log info "OPTIONAL: Enable WAL archiving for point-in-time recovery"
@@ -1093,7 +1199,7 @@ check_postgresql_config() {
         ocf_log info "✓ archive_mode='${archive_mode}' (archiving enabled)"
 
         # Check archive_command for potential blocking issues
-        local archive_command=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_command\"" 2>/dev/null)
+        local archive_command=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_command\"" 2>/dev/null)
         if [ -n "$archive_command" ] && [ "$archive_command" != "/bin/true" ] && [ "$archive_command" != "" ]; then
             ocf_log info "Archive command: ${archive_command}"
 
@@ -1110,7 +1216,7 @@ check_postgresql_config() {
     fi
 
     # 11. Check listen_addresses (security notice)
-    local listen_addresses=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW listen_addresses\"" 2>/dev/null)
+    local listen_addresses=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW listen_addresses\"" 2>/dev/null)
     if [ "$listen_addresses" = "*" ]; then
         ocf_log info "SECURITY NOTICE: listen_addresses='*' (listening on all network interfaces)"
         ocf_log info "For production security, restrict to cluster network"
@@ -1205,7 +1311,7 @@ pgsql_is_promoted() {
     fi
 
     # Check if this is a primary (not in recovery mode)
-    local result=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
+    local result=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
 
     if [ "$result" = "f" ]; then
         return 0  # Is promoted (primary)
@@ -1265,11 +1371,11 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via VIP ${OCF_RESKEY_vip}"
 
         # Try to connect to VIP and check if it's promoted
-        local is_primary=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+        local is_primary=$(run_as_pguser sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
         if [ "$is_primary" = "t" ]; then
             # VIP responds and is primary, now get its hostname
-            promoted_node=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT split_part(inet_server_addr()::text, '.', 4)\"" 2>/dev/null)
+            promoted_node=$(run_as_pguser sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT split_part(inet_server_addr()::text, '.', 4)\"" 2>/dev/null)
 
             if [ -z "$promoted_node" ]; then
                 # Fallback: just use VIP directly
@@ -1287,7 +1393,7 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via node_list"
 
         for node in ${OCF_RESKEY_node_list}; do
-            local is_primary=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+            local is_primary=$(run_as_pguser sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
             if [ "$is_primary" = "t" ]; then
                 promoted_node="$node"
@@ -1336,7 +1442,7 @@ check_replication_health() {
     fi
 
     # Check if standby is receiving WAL
-    local wal_receiver_status=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT status FROM pg_stat_wal_receiver\"" 2>/dev/null)
+    local wal_receiver_status=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT status FROM pg_stat_wal_receiver\"" 2>/dev/null)
 
     if [ "$wal_receiver_status" = "streaming" ]; then
         ocf_log debug "Replication healthy: WAL receiver status = streaming"
@@ -1365,12 +1471,42 @@ pgsql_monitor() {
         fi
     fi
 
+    # OPTIMIZATION: If basebackup just completed (rc file very recent), trigger resource cleanup
+    # This makes Pacemaker retry the start operation immediately instead of waiting
+    local rc_file="${state_dir}/.pgtwin_basebackup_rc"
+    if [ -f "${rc_file}" ]; then
+        # Calculate file age without command substitution
+        local now_ts rc_file_ts rc_age
+        date +%s > /tmp/.pgtwin_now.$$
+        read now_ts < /tmp/.pgtwin_now.$$
+        stat -c %Y "${rc_file}" 2>/dev/null > /tmp/.pgtwin_rctime.$$ || echo 0 > /tmp/.pgtwin_rctime.$$
+        read rc_file_ts < /tmp/.pgtwin_rctime.$$
+        rm -f /tmp/.pgtwin_now.$$ /tmp/.pgtwin_rctime.$$
+        rc_age=$((now_ts - rc_file_ts))
+
+        if [ "$rc_age" -lt 30 ]; then
+            # Basebackup completed less than 30 seconds ago
+            local bb_rc
+            read bb_rc < "${rc_file}" 2>/dev/null || bb_rc="1"
+            rm -f "${rc_file}"  # Clean up tracking file
+
+            if [ "$bb_rc" -eq 0 ]; then
+                ocf_log info "Basebackup successfully completed (${rc_age}s ago), triggering resource cleanup to start PostgreSQL"
+                # Trigger Pacemaker to cleanup and retry start operation
+                # Use background job to avoid blocking monitor
+                (crm_resource --resource ${OCF_RESOURCE_INSTANCE} --cleanup >/dev/null 2>&1 &)
+            else
+                ocf_log err "Basebackup failed (${rc_age}s ago, exit code ${bb_rc})"
+            fi
+        fi
+    fi
+
     if ! pgsql_is_running; then
         return $OCF_NOT_RUNNING
     fi
 
     # Try to connect
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT 1' >/dev/null 2>&1"
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT 1' >/dev/null 2>&1"
     rc=$?
 
     if [ $rc -ne 0 ]; then
@@ -1386,33 +1522,33 @@ pgsql_monitor() {
         # SELF-HEALING: Verify and fix synchronous_standby_names if rep_mode=sync
         # Only enable sync mode if a standby is actually connected
         if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-            local standby_count=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'\"" 2>/dev/null)
-            local current_sync=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
+            local standby_count=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'\"" 2>/dev/null)
+            local current_sync=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
             if [ -n "$standby_count" ] && [ "$standby_count" -gt 0 ]; then
                 # Standby is connected, should be in sync mode
                 if [ "$current_sync" != "*" ]; then
                     ocf_log info "Monitor: Standby connected but synchronous_standby_names='$current_sync' - fixing to '*'"
-                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
-                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
                     ocf_log info "Monitor: synchronous_standby_names corrected to '*'"
                 fi
             else
                 # No standby connected, should NOT be in sync mode (would block writes)
                 if [ -n "$current_sync" ] && [ "$current_sync" != "" ]; then
                     ocf_log info "Monitor: No standby connected but synchronous_standby_names='$current_sync' - clearing to avoid blocking writes"
-                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
-                    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
                     ocf_log info "Monitor: synchronous_standby_names cleared (no standby connected)"
                 fi
             fi
         fi
 
         # Check for archive failures (can cause cluster to block)
-        local archive_mode=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_mode\"" 2>/dev/null)
+        local archive_mode=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW archive_mode\"" 2>/dev/null)
         if [ "$archive_mode" = "on" ]; then
-            local failed_archives=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT failed_count FROM pg_stat_archiver\"" 2>/dev/null)
-            local last_failed_time=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT last_failed_time FROM pg_stat_archiver WHERE last_failed_time IS NOT NULL\"" 2>/dev/null)
+            local failed_archives=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT failed_count FROM pg_stat_archiver\"" 2>/dev/null)
+            local last_failed_time=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT last_failed_time FROM pg_stat_archiver WHERE last_failed_time IS NOT NULL\"" 2>/dev/null)
 
             if [ -n "$failed_archives" ] && [ "$failed_archives" -gt 0 ]; then
                 if [ -n "$last_failed_time" ]; then
@@ -1437,7 +1573,7 @@ pgsql_monitor() {
             return $OCF_SUCCESS
         else
             # Replication is unhealthy, increment failure counter
-            local failure_count=$(ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null)
+            local failure_count=$(crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null || echo "0")
             failure_count=$((failure_count + 1))
             ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v $failure_count -l reboot 2>/dev/null
 
@@ -1482,24 +1618,96 @@ pgsql_monitor() {
 
 check_replication_slots() {
     # Check replication slot size and cleanup if needed
+    # v1.6.9: Enhanced with database size comparison and configurable disable
     if [ -z "${OCF_RESKEY_slot_name}" ]; then
         return 0
     fi
 
-    local slot_size=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024 FROM pg_replication_slots WHERE slot_name='${OCF_RESKEY_slot_name}'\"" 2>/dev/null)
+    # Special value 0 = disable automatic slot dropping
+    if [ "${OCF_RESKEY_max_slot_wal_keep_size}" = "0" ]; then
+        ocf_log debug "Automatic slot dropping disabled (max_slot_wal_keep_size=0)"
+        return 0
+    fi
 
-    if [ -n "$slot_size" ] && [ "$slot_size" != "" ]; then
-        local max_size=${OCF_RESKEY_max_slot_wal_keep_size}
+    # Get slot size in MB
+    local slot_size=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) / 1024 / 1024
+        FROM pg_replication_slots
+        WHERE slot_name='${OCF_RESKEY_slot_name}'
+    \"" 2>/dev/null)
 
-        if [ $(echo "$slot_size > $max_size" | bc 2>/dev/null || echo 0) -eq 1 ]; then
-            ocf_log warn "Replication slot ${OCF_RESKEY_slot_name} exceeded max size ($slot_size MB > $max_size MB), dropping slot"
+    if [ -z "$slot_size" ] || [ "$slot_size" = "" ]; then
+        # Slot doesn't exist or query failed
+        return 0
+    fi
 
-            # Drop the replication slot
-            runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_drop_replication_slot('${OCF_RESKEY_slot_name}')\"" 2>/dev/null
+    # Convert to integer for comparison
+    slot_size=$(printf "%.0f" "$slot_size" 2>/dev/null)
+
+    # Minimum slot size threshold: never drop slots smaller than this
+    # Prevents dropping fresh slots in development environments with tiny databases
+    local min_drop_threshold=500  # MB
+
+    if [ $(echo "$slot_size < $min_drop_threshold" | bc 2>/dev/null || echo 0) -eq 1 ]; then
+        ocf_log debug "Replication slot ${OCF_RESKEY_slot_name} size ${slot_size} MB below minimum drop threshold (${min_drop_threshold} MB) - not dropping"
+        return 0
+    fi
+
+    local max_size=${OCF_RESKEY_max_slot_wal_keep_size}
+    local should_drop=false
+    local drop_reason=""
+
+    # Check 1: Exceeds configured threshold
+    if [ $(echo "$slot_size > $max_size" | bc 2>/dev/null || echo 0) -eq 1 ]; then
+        should_drop=true
+        drop_reason="exceeds configured max_slot_wal_keep_size ($slot_size MB > $max_size MB)"
+    fi
+
+    # Check 2: Slot size exceeds database size (additional safety check)
+    # Query database size in MB
+    local db_size_mb=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT pg_database_size('postgres') / 1024 / 1024
+    \"" 2>/dev/null)
+
+    if [ -n "$db_size_mb" ] && [ "$db_size_mb" != "" ]; then
+        db_size_mb=$(printf "%.0f" "$db_size_mb" 2>/dev/null)
+
+        if [ $(echo "$slot_size > $db_size_mb" | bc 2>/dev/null || echo 0) -eq 1 ]; then
+            ocf_log warn "Replication slot size ($slot_size MB) exceeds database size ($db_size_mb MB)"
+            ocf_log warn "This indicates standby has been offline for a very long time"
+            ocf_log warn "pg_basebackup would be more efficient than replaying all accumulated WAL"
+
+            # Override should_drop even if under configured threshold
+            should_drop=true
+            drop_reason="exceeds database size ($slot_size MB > $db_size_mb MB) - pg_basebackup more efficient"
+        fi
+    else
+        ocf_log debug "Could not determine database size for slot comparison"
+    fi
+
+    # Drop slot if any condition met
+    if [ "$should_drop" = "true" ]; then
+        ocf_log warn "Replication slot ${OCF_RESKEY_slot_name} will be dropped: ${drop_reason}"
+        ocf_log info "Standby will be automatically recovered via pg_basebackup when it reconnects"
+
+        # Drop the replication slot
+        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"
+            SELECT pg_drop_replication_slot('${OCF_RESKEY_slot_name}')
+        \"" 2>/dev/null
+
+        local drop_rc=$?
+
+        if [ $drop_rc -eq 0 ]; then
+            ocf_log info "Replication slot ${OCF_RESKEY_slot_name} dropped successfully"
 
             # Mark that full resync is needed
-            touch "${PGDATA}/.need_full_resync"
+            run_as_pguser touch "${PGDATA}/.need_full_resync"
+            ocf_log info "Created .need_full_resync marker - standby will trigger pg_basebackup"
+        else
+            ocf_log err "Failed to drop replication slot ${OCF_RESKEY_slot_name} (rc=$drop_rc)"
         fi
+    else
+        ocf_log debug "Replication slot ${OCF_RESKEY_slot_name} size OK: ${slot_size} MB (max: ${max_size} MB)"
     fi
 }
 
@@ -1514,6 +1722,7 @@ cleanup_old_replication_slot() {
 is_valid_pgdata() {
     # Check if PGDATA exists and contains a valid PostgreSQL cluster
     # Returns 0 if valid, 1 if empty/missing/invalid
+    # Note: This does NOT check version compatibility - use validate_pg_version() separately
 
     if [ ! -d "${PGDATA}" ]; then
         ocf_log debug "PGDATA does not exist: ${PGDATA}"
@@ -1533,6 +1742,84 @@ is_valid_pgdata() {
     fi
 
     ocf_log debug "PGDATA is valid: ${PGDATA}"
+    return 0
+}
+
+validate_pg_version() {
+    # Validate PostgreSQL version matches between data directory and binary/container
+    # Returns 0 if valid or no data exists, 1 if version mismatch
+
+    local data_version=""
+    local expected_version=""
+
+    # Get data version from PG_VERSION file
+    if [ -f "${PGDATA}/PG_VERSION" ]; then
+        data_version=$(cat "${PGDATA}/PG_VERSION" 2>/dev/null | tr -d '[:space:]')
+        ocf_log debug "Data directory PostgreSQL version: ${data_version}"
+    else
+        # No data exists yet - validation passes (will be initialized)
+        ocf_log debug "No PG_VERSION file found - assuming new installation"
+        return 0
+    fi
+
+    # Get expected version based on mode
+    if [ "${OCF_RESKEY_container_mode}" = "true" ] || [ "${OCF_RESKEY_container_mode}" = "yes" ]; then
+        # Container mode: use configured pg_major_version
+        if [ -n "${OCF_RESKEY_pg_major_version}" ]; then
+            expected_version="${OCF_RESKEY_pg_major_version}"
+            ocf_log debug "Container mode: Expected PostgreSQL version from config: ${expected_version}"
+        else
+            ocf_log err "Container mode enabled but pg_major_version not configured"
+            return 1
+        fi
+    else
+        # Bare-metal mode: get version from installed PostgreSQL binary
+        # Source container library if not already loaded
+        if ! type pgtwin_get_pg_major_version >/dev/null 2>&1; then
+            if [ -f /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh ]; then
+                . /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+            else
+                ocf_log info "Container library not available (container mode is experimental)"
+                # Fallback: try to get version from binary directly
+                local version_output=$(/usr/bin/postgres --version 2>/dev/null)
+                expected_version=$(echo "$version_output" | grep -oP '\d+' | head -n 1)
+            fi
+        fi
+
+        if type pgtwin_get_pg_major_version >/dev/null 2>&1; then
+            expected_version=$(pgtwin_get_pg_major_version)
+        fi
+
+        if [ -z "$expected_version" ]; then
+            ocf_log err "Cannot determine PostgreSQL binary version"
+            return 1
+        fi
+        ocf_log debug "Bare-metal mode: Expected PostgreSQL version from binary: ${expected_version}"
+    fi
+
+    # Compare versions
+    if [ "${data_version}" != "${expected_version}" ]; then
+        ocf_log err "PostgreSQL version mismatch detected!"
+        ocf_log err "  Data directory version: ${data_version} (${PGDATA}/PG_VERSION)"
+        ocf_log err "  Expected version: ${expected_version}"
+        ocf_log err ""
+        ocf_log err "This mismatch can cause:"
+        ocf_log err "  - Startup failures"
+        ocf_log err "  - Data corruption"
+        ocf_log err "  - Incompatibility errors"
+        ocf_log err ""
+        ocf_log err "Resolution options:"
+        if [ "${OCF_RESKEY_container_mode}" = "true" ] || [ "${OCF_RESKEY_container_mode}" = "yes" ]; then
+            ocf_log err "  1. Use matching PostgreSQL version (set pg_major_version='${data_version}' in cluster config)"
+        else
+            ocf_log err "  1. Install PostgreSQL ${data_version} package to match existing data"
+        fi
+        ocf_log err "  2. Backup data and reinitialize with PostgreSQL ${expected_version}"
+        ocf_log err "  3. Perform pg_upgrade (manual procedure, requires cluster stop)"
+        return 1
+    fi
+
+    ocf_log info "PostgreSQL version validation passed: ${expected_version}"
     return 0
 }
 
@@ -1565,12 +1852,13 @@ pgsql_start() {
         ocf_log info "PGDATA is empty or invalid - triggering automatic standby initialization"
 
         # Ensure .pgpass exists
-        local pgpass_file=$(ensure_pgpass)
+        ensure_pgpass
         if [ $? -ne 0 ]; then
             ocf_log err "Cannot initialize standby: .pgpass file not configured or invalid"
             ocf_log err "Please create ${OCF_RESKEY_pgpassfile} with replication credentials"
             return $OCF_ERR_CONFIGURED
         fi
+        local pgpass_file="$PGPASS_FILE"
 
         # Discover primary node from Pacemaker cluster
         local primary_host=$(discover_promoted_node)
@@ -1602,6 +1890,22 @@ pgsql_start() {
                 ocf_log err "Failed to create PGDATA directory: ${PGDATA}"
                 return $OCF_ERR_GENERIC
             }
+            chmod 750 "${PGDATA}"
+        fi
+
+        # CRITICAL: pg_basebackup requires PGDATA to be completely empty
+        # Check for any leftover files and fail with clear error
+        find "${PGDATA}" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l > /tmp/.pgtwin_filecount.$$
+        local file_count
+        read file_count < /tmp/.pgtwin_filecount.$$
+        rm -f /tmp/.pgtwin_filecount.$$
+
+        if [ "$file_count" -gt 0 ]; then
+            ocf_log err "Cannot run pg_basebackup: PGDATA directory is not empty"
+            ocf_log err "Found $file_count file(s) in ${PGDATA}"
+            ocf_log err "pg_basebackup requires a completely empty directory"
+            ocf_log err "Please manually verify and remove contents: rm -rf ${PGDATA}/* ${PGDATA}/.*"
+            return $OCF_ERR_GENERIC
         fi
 
         chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}"
@@ -1622,6 +1926,17 @@ pgsql_start() {
         fi
     fi
 
+    # Version validation: If PGDATA exists with data, validate version compatibility
+    # This check is critical to prevent:
+    # - Starting PostgreSQL 17 container with PostgreSQL 18 data
+    # - Starting PostgreSQL 18 binary with PostgreSQL 17 data
+    if [ -f "${PGDATA}/PG_VERSION" ]; then
+        if ! validate_pg_version; then
+            ocf_log err "Cannot start PostgreSQL: version mismatch between data and binary/container"
+            return $OCF_ERR_CONFIGURED
+        fi
+    fi
+
     # Container mode: Ensure container is running before starting PostgreSQL
     if [ "${OCF_RESKEY_container_mode}" = "true" ]; then
         if type pgtwin_ensure_container_running >/dev/null 2>&1; then
@@ -1639,6 +1954,85 @@ pgsql_start() {
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
+
+        # Non-blocking timeline divergence warning (best effort)
+        # This helps admins detect timeline issues before PostgreSQL startup fails
+        local local_timeline=""
+        if command -v pg_controldata >/dev/null 2>&1; then
+            local_timeline=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null | \
+                grep "Latest checkpoint's TimeLineID:" | awk '{print $NF}')
+        fi
+
+        if [ -n "$local_timeline" ]; then
+            ocf_log info "Local timeline: ${local_timeline}"
+
+            # Try to find a node to query for timeline comparison (non-blocking, best effort)
+            # Method 1: Try Pacemaker-discovered promoted node first (most reliable)
+            local node_to_check=$(discover_promoted_node)
+
+            # Method 2: If no promoted node found (e.g., during failover/demotion), try other cluster nodes
+            # PostgreSQL may still be running on them even if not marked "Promoted" yet
+            if [ -z "$node_to_check" ]; then
+                ocf_log debug "No promoted node found via Pacemaker, trying other cluster nodes"
+                local current_node=$(get_cluster_node_name)
+                for node in ${OCF_RESKEY_node_list}; do
+                    if [ "$node" != "$current_node" ]; then
+                        node_to_check="$node"
+                        ocf_log debug "Will try to query timeline from cluster node: ${node_to_check}"
+                        break
+                    fi
+                done
+            fi
+
+            if [ -n "$node_to_check" ]; then
+                local rep_user=$(get_replication_user)
+                if [ -n "$rep_user" ]; then
+                    # Try to query timeline from the node (works even if being demoted)
+                    local other_timeline=$(run_as_pguser sh -c \
+                        "${PSQL} -h ${node_to_check} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \
+                        'SELECT timeline_id FROM pg_control_checkpoint()' 2>/dev/null" || echo "")
+
+                    if [ -n "$other_timeline" ]; then
+                        ocf_log info "Other node timeline: ${other_timeline} (${node_to_check})"
+
+                        if [ "$local_timeline" != "$other_timeline" ]; then
+                            local current_node=$(get_cluster_node_name)
+
+                            ocf_log warn "⚠️  TIMELINE DIVERGENCE DETECTED ⚠️
+This node (${current_node}) timeline: ${local_timeline}
+Other node (${node_to_check}) timeline: ${other_timeline}
+Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
+
+                            # Stop PostgreSQL before recovery
+                            if pgsql_is_running; then
+                                pgsql_stop
+                            fi
+
+                            # Call recover_standby which tries pg_rewind first, then pg_basebackup
+                            # We'll parse the result to determine if it was safe
+                            recover_standby "${node_to_check}"
+                            local recovery_rc=$?
+
+                            if [ $recovery_rc -eq 0 ]; then
+                                ocf_log info "✅ Automatic recovery succeeded - continuing startup"
+                                # PostgreSQL is stopped after recovery, will be started by normal flow below
+                            else
+                                # Recovery failed - this should be rare with the fallback logic
+                                ocf_log err "❌ Automatic recovery failed"
+                                ocf_log err "Manual intervention required - check logs and data directory"
+                                return $OCF_ERR_GENERIC
+                            fi
+                        fi
+                    else
+                        ocf_log debug "Could not query timeline from ${node_to_check} (may be stopped or unreachable)"
+                    fi
+                else
+                    ocf_log debug "Could not determine replication user for timeline check"
+                fi
+            else
+                ocf_log debug "No other cluster node available for timeline comparison"
+            fi
+        fi
 
         # Safety check: Verify standby configuration before starting
         # This catches cases where manual pg_basebackup was done or config was corrupted
@@ -1675,7 +2069,7 @@ pgsql_start() {
     fi
 
     # Start PostgreSQL
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} -w -t 60 start" >/dev/null 2>&1
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -w -t 60 start" >/dev/null 2>&1
     rc=$?
 
     if [ $rc -ne 0 ]; then
@@ -1686,7 +2080,7 @@ pgsql_start() {
     # Wait for PostgreSQL to be ready
     local count=0
     while [ $count -lt 60 ]; do
-        if runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT 1' >/dev/null 2>&1"; then
+        if run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT 1' >/dev/null 2>&1"; then
             ocf_log info "PostgreSQL started successfully"
 
             # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
@@ -1718,7 +2112,7 @@ pgsql_stop() {
 
     ocf_log info "Stopping PostgreSQL"
 
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} -m fast stop" >/dev/null 2>&1
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -m fast stop" >/dev/null 2>&1
     rc=$?
 
     # Wait for stop
@@ -1743,7 +2137,7 @@ pgsql_stop() {
 
     # Force stop if needed
     ocf_log warn "PostgreSQL did not stop gracefully, forcing stop"
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} -m immediate stop" >/dev/null 2>&1
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -m immediate stop" >/dev/null 2>&1
 
     sleep 2
 
@@ -1763,6 +2157,133 @@ pgsql_stop() {
     return $OCF_ERR_GENERIC
 }
 
+check_replication_lag() {
+    # Return replay lag in bytes from standby perspective
+    # Returns 0 if already primary or if lag cannot be determined
+
+    if pgsql_is_promoted; then
+        echo "0"
+        return 0
+    fi
+
+    local lag=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"
+        SELECT COALESCE(
+            pg_wal_lsn_diff(pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn()),
+            0
+        )
+    \"" 2>/dev/null)
+
+    if [ -z "$lag" ]; then
+        echo "0"
+        return 1
+    fi
+
+    echo "${lag}"
+    return 0
+}
+
+check_promotion_safety() {
+    # Check if it's safe to promote this standby node
+    # Returns: 0 = safe to promote
+    #          1 = not safe (not caught up)
+    #          2 = forced (safety checks bypassed)
+
+    local force_promotion=${OCF_RESKEY_force_promotion:-false}
+
+    if [ "$force_promotion" = "true" ]; then
+        ocf_log warn "force_promotion=true - BYPASSING ALL SAFETY CHECKS (DANGEROUS!)"
+        ocf_log warn "This may result in data loss if standby is not caught up"
+        return 2  # Forced
+    fi
+
+    # If already primary, always safe
+    if pgsql_is_promoted; then
+        return 0
+    fi
+
+    # Check if we're in sync mode
+    if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+        ocf_log info "Promotion safety check: rep_mode=sync - checking synchronous replication state"
+
+        # Discover current primary to query sync state
+        local primary_host=$(discover_promoted_node)
+        if [ -z "$primary_host" ]; then
+            ocf_log warn "Cannot discover primary node to check sync state"
+            ocf_log warn "Allowing promotion (fail-open for cluster recovery scenarios)"
+            return 0
+        fi
+
+        # Get our application_name
+        local app_name
+        get_application_name
+        app_name="$APPLICATION_NAME"
+        ocf_log info "Checking if application_name='${app_name}' is synchronized on primary ${primary_host}"
+
+        # Query primary: Is this standby in sync state?
+        local sync_state=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -Atc \"
+            SELECT sync_state
+            FROM pg_stat_replication
+            WHERE application_name='${app_name}'
+                AND state='streaming'
+        \"" 2>/dev/null)
+
+        if [ "$sync_state" = "sync" ]; then
+            ocf_log info "✅ Promotion safety check PASSED: Node has sync_state='sync' (PostgreSQL guarantees caught up)"
+            return 0
+        elif [ "$sync_state" = "potential" ]; then
+            ocf_log warn "❌ Promotion safety check FAILED: Node has sync_state='potential' (still catching up to sync)"
+            ocf_log warn "Standby is connected and streaming but not yet fully synchronized"
+            ocf_log warn "Blocking promotion - will retry on next monitor cycle"
+            ocf_log warn "To force promotion anyway (DANGEROUS), set force_promotion=true"
+            return 1
+        elif [ "$sync_state" = "async" ]; then
+            ocf_log warn "❌ Promotion safety check FAILED: Node has sync_state='async' (not in synchronous replication)"
+            ocf_log warn "This can happen during startup while standby is catching up"
+            ocf_log warn "Blocking promotion until synchronous replication is established"
+            return 1
+        elif [ -z "$sync_state" ]; then
+            ocf_log warn "❌ Promotion safety check FAILED: Node not found in pg_stat_replication on primary"
+            ocf_log warn "Standby may not be connected or replication may not be active"
+            ocf_log warn "Blocking promotion - check replication connectivity"
+            return 1
+        else
+            ocf_log warn "❌ Promotion safety check FAILED: Unknown sync_state='${sync_state}'"
+            return 1
+        fi
+    else
+        # Async mode - check lag
+        ocf_log info "Promotion safety check: rep_mode=async - checking replication lag"
+
+        local max_lag=${OCF_RESKEY_max_promotion_lag_bytes:-10485760}  # 10MB default
+
+        if [ "$max_lag" -eq -1 ]; then
+            ocf_log info "max_promotion_lag_bytes=-1 - skipping lag check (unsafe but requested)"
+            return 0
+        fi
+
+        local lag_bytes=$(check_replication_lag)
+        local lag_check_rc=$?
+
+        if [ $lag_check_rc -ne 0 ]; then
+            ocf_log warn "Could not determine replication lag - allowing promotion (fail-open)"
+            return 0
+        fi
+
+        if [ "$lag_bytes" -le "$max_lag" ]; then
+            ocf_log info "✅ Promotion safety check PASSED: Replication lag ${lag_bytes} bytes <= threshold ${max_lag} bytes"
+            return 0
+        else
+            ocf_log warn "❌ Promotion safety check FAILED: Replication lag ${lag_bytes} bytes > threshold ${max_lag} bytes"
+            ocf_log warn "Standby is not caught up yet - blocking promotion"
+            ocf_log warn "Current lag: $(numfmt --to=iec ${lag_bytes} 2>/dev/null || echo ${lag_bytes}) bytes"
+            ocf_log warn "Threshold: $(numfmt --to=iec ${max_lag} 2>/dev/null || echo ${max_lag}) bytes"
+            ocf_log warn "Wait for standby to catch up or increase max_promotion_lag_bytes"
+            ocf_log warn "To force promotion anyway (DANGEROUS), set force_promotion=true"
+            return 1
+        fi
+    fi
+}
+
 pgsql_promote() {
     local rc
 
@@ -1776,11 +2297,25 @@ pgsql_promote() {
         return $OCF_ERR_GENERIC
     fi
 
+    # NEW v1.6.8: Check promotion safety before allowing promotion
+    check_promotion_safety
+    local safety_rc=$?
+
+    if [ $safety_rc -eq 1 ]; then
+        ocf_log err "Promotion safety check failed - node is not ready for promotion"
+        ocf_log err "Standby is still catching up or not in sync state"
+        ocf_log err "Pacemaker will retry promotion on next monitor cycle once node is caught up"
+        ocf_log err "To force immediate promotion (DANGEROUS), set force_promotion=true"
+        return $OCF_ERR_GENERIC
+    elif [ $safety_rc -eq 2 ]; then
+        ocf_log warn "⚠️  FORCED PROMOTION - Safety checks bypassed! This may cause data loss!"
+    fi
+
     ocf_log info "Promoting PostgreSQL to primary"
 
     # Promote using pg_ctl (it will remove standby.signal automatically)
     # Note: Do NOT manually remove standby.signal - pg_ctl promote handles it
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PGCTL} -D ${PGDATA} promote" >/dev/null 2>&1
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} promote" >/dev/null 2>&1
     rc=$?
 
     if [ $rc -ne 0 ]; then
@@ -1833,8 +2368,8 @@ check_timeline_divergence() {
     local local_timeline=""
 
     if command -v pg_controldata >/dev/null 2>&1; then
-        local_checkpoint_lsn=$(runuser -u ${OCF_RESKEY_pguser} -- pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint location:" | awk '{print $NF}')
-        local_timeline=$(runuser -u ${OCF_RESKEY_pguser} -- pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint's TimeLineID:" | awk '{print $NF}')
+        local_checkpoint_lsn=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint location:" | awk '{print $NF}')
+        local_timeline=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null | grep "Latest checkpoint's TimeLineID:" | awk '{print $NF}')
     fi
 
     if [ -z "$local_checkpoint_lsn" ] || [ -z "$local_timeline" ]; then
@@ -1845,8 +2380,8 @@ check_timeline_divergence() {
     ocf_log info "Local PGDATA state: timeline=${local_timeline}, checkpoint_lsn=${local_checkpoint_lsn}"
 
     # Try to get primary's current WAL position
-    local primary_current_lsn=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_current_wal_lsn()\"" 2>/dev/null)
-    local primary_timeline=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT timeline_id FROM pg_control_checkpoint()\"" 2>/dev/null)
+    local primary_current_lsn=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_current_wal_lsn()\"" 2>/dev/null)
+    local primary_timeline=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT timeline_id FROM pg_control_checkpoint()\"" 2>/dev/null)
 
     if [ -z "$primary_current_lsn" ] || [ -z "$primary_timeline" ]; then
         ocf_log warn "Could not query primary for timeline/LSN, will attempt demotion and let PostgreSQL detect issues"
@@ -1864,7 +2399,7 @@ check_timeline_divergence() {
 
     # Check if local checkpoint is ahead of primary's current position
     # This indicates the local node has WAL that the primary doesn't have
-    local lsn_compare=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_wal_lsn_diff('${local_checkpoint_lsn}', '${primary_current_lsn}')\"" 2>/dev/null)
+    local lsn_compare=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_wal_lsn_diff('${local_checkpoint_lsn}', '${primary_current_lsn}')\"" 2>/dev/null)
 
     if [ -n "$lsn_compare" ] && [ "$lsn_compare" -gt 0 ]; then
         ocf_log warn "WAL divergence detected: local checkpoint ${local_checkpoint_lsn} is ahead of primary ${primary_current_lsn} by $lsn_compare bytes"
@@ -1879,8 +2414,13 @@ check_timeline_divergence() {
 pgsql_demote() {
     local rc
     local primary_host=""
-    local rep_user=$(get_replication_user)
-    local app_name=$(get_application_name)
+    local rep_user
+    local app_name
+
+    rep_user=$(get_replication_user)
+
+    get_application_name
+    app_name="$APPLICATION_NAME"
 
     if ! pgsql_is_promoted; then
         ocf_log info "PostgreSQL is already demoted"
@@ -1947,10 +2487,10 @@ pgsql_demote() {
     ocf_log info "No timeline divergence detected, proceeding with normal demotion"
 
     # Create standby.signal
-    touch "${PGDATA}/standby.signal"
+    run_as_pguser touch "${PGDATA}/standby.signal"
 
     # Update postgresql.auto.conf for replication with validated application name
-    cat > "${PGDATA}/postgresql.auto.conf" <<EOF
+    run_as_pguser sh -c "cat > ${PGDATA}/postgresql.auto.conf" <<EOF
 primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
@@ -1972,7 +2512,7 @@ create_replication_slot() {
     ocf_log info "Creating replication slot ${OCF_RESKEY_slot_name}"
 
     # Check if slot already exists
-    local slot_exists=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${OCF_RESKEY_slot_name}'\"" 2>/dev/null)
+    local slot_exists=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${OCF_RESKEY_slot_name}'\"" 2>/dev/null)
 
     if [ "$slot_exists" = "1" ]; then
         ocf_log info "Replication slot ${OCF_RESKEY_slot_name} already exists"
@@ -1980,7 +2520,7 @@ create_replication_slot() {
     fi
 
     # Create the slot
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}')\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}')\"" >/dev/null 2>&1
 
     if [ $? -eq 0 ]; then
         ocf_log info "Replication slot ${OCF_RESKEY_slot_name} created successfully"
@@ -2001,8 +2541,14 @@ create_replication_slot() {
 finalize_standby_config() {
     local primary_host="$1"
     local rep_user="$2"
-    local app_name=$(get_application_name)
-    local pgpass_file=$(ensure_pgpass)
+    local app_name
+    local pgpass_file
+
+    get_application_name
+    app_name="$APPLICATION_NAME"
+
+    ensure_pgpass
+    pgpass_file="$PGPASS_FILE"
 
     if [ -z "$primary_host" ] || [ -z "$rep_user" ]; then
         ocf_log err "finalize_standby_config: Missing required parameters (host='${primary_host}', user='${rep_user}')"
@@ -2021,14 +2567,14 @@ finalize_standby_config() {
         ocf_log warn "PostgreSQL is running during finalization - using ALTER SYSTEM (prefer to avoid this)"
 
         # Use ALTER SYSTEM if PostgreSQL is already running
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'\"" >/dev/null 2>&1
+        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'\"" >/dev/null 2>&1
 
         if [ $? -ne 0 ]; then
             ocf_log err "Failed to set primary_conninfo via ALTER SYSTEM"
             return 1
         fi
 
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_slot_name = '${OCF_RESKEY_slot_name}'\"" >/dev/null 2>&1
+        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_slot_name = '${OCF_RESKEY_slot_name}'\"" >/dev/null 2>&1
 
         if [ $? -ne 0 ]; then
             ocf_log err "Failed to set primary_slot_name via ALTER SYSTEM"
@@ -2036,7 +2582,7 @@ finalize_standby_config() {
         fi
 
         # Reload configuration
-        runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
 
         ocf_log info "Standby configuration updated via ALTER SYSTEM (requires PostgreSQL restart to take effect)"
     else
@@ -2044,7 +2590,7 @@ finalize_standby_config() {
 
         # Preferred method: Direct file update when PostgreSQL is stopped
         # This overwrites pg_basebackup -R generated config to ensure correctness
-        cat > "${PGDATA}/postgresql.auto.conf" <<EOF
+        run_as_pguser sh -c "cat > ${PGDATA}/postgresql.auto.conf" <<EOF
 # Do not edit this file manually!
 # It will be overwritten by the ALTER SYSTEM command.
 primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'
@@ -2056,7 +2602,6 @@ EOF
             return 1
         fi
 
-        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}/postgresql.auto.conf"
         chmod 600 "${PGDATA}/postgresql.auto.conf"
 
         ocf_log info "postgresql.auto.conf updated successfully"
@@ -2066,8 +2611,7 @@ EOF
     # pg_basebackup -R should create this, but be defensive
     if [ ! -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Creating missing standby.signal"
-        touch "${PGDATA}/standby.signal"
-        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}/standby.signal"
+        run_as_pguser touch "${PGDATA}/standby.signal"
     fi
 
     ocf_log info "Standby configuration finalized successfully"
@@ -2077,8 +2621,13 @@ EOF
 recover_standby() {
     local primary_host="$1"
     local rc
-    local rep_user=$(get_replication_user)
-    local app_name=$(get_application_name)
+    local rep_user
+    local app_name
+
+    rep_user=$(get_replication_user)
+
+    get_application_name
+    app_name="$APPLICATION_NAME"
 
     ocf_log info "Attempting to recover standby from primary ${primary_host} using replication user '${rep_user}'"
 
@@ -2092,22 +2641,23 @@ recover_standby() {
         ocf_log info "Attempting pg_rewind"
 
         # Ensure .pgpass is in standard location
-        local pgpass_file=$(ensure_pgpass)
+        ensure_pgpass
         if [ $? -ne 0 ]; then
             ocf_log warn "Cannot ensure .pgpass file, skipping pg_rewind"
         else
+            local pgpass_file="$PGPASS_FILE"
             ocf_log info "Using .pgpass file: ${pgpass_file}"
 
             # Test connectivity before attempting pg_rewind
             ocf_log debug "Testing connectivity to ${primary_host} as ${rep_user}"
-            runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" psql -h "${primary_host}" -p "${OCF_RESKEY_pgport}" -U "${rep_user}" -d postgres -Atc "SELECT 1" >/dev/null 2>&1
+            run_as_pguser env PGPASSFILE="${pgpass_file}" psql -h "${primary_host}" -p "${OCF_RESKEY_pgport}" -U "${rep_user}" -d postgres -Atc "SELECT 1" >/dev/null 2>&1
             if [ $? -ne 0 ]; then
                 ocf_log warn "Cannot connect to primary ${primary_host} as ${rep_user}, pg_rewind will likely fail"
             fi
 
             # Run pg_rewind with proper environment variable passing
             ocf_log info "Executing pg_rewind to sync from ${primary_host}"
-            runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" \
+            run_as_pguser env PGPASSFILE="${pgpass_file}" \
                 ${PG_REWIND} \
                 --target-pgdata="${PGDATA}" \
                 --source-server="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} dbname=postgres sslmode=prefer" \
@@ -2187,7 +2737,8 @@ recover_standby() {
     # Create fresh PGDATA directory
     mkdir -p "${PGDATA}"
     chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}"
-    ocf_log info "Created fresh PGDATA directory at ${PGDATA}"
+    chmod 750 "${PGDATA}"
+    ocf_log info "Created fresh PGDATA directory at ${PGDATA} with permissions 750"
 
     # Start asynchronous pg_basebackup
     start_async_basebackup "${primary_host}" "${rep_user}"
@@ -2210,12 +2761,46 @@ start_async_basebackup() {
     ocf_log info "Starting asynchronous pg_basebackup from ${primary_host}"
 
     # Ensure .pgpass is in standard location
-    local pgpass_file=$(ensure_pgpass)
+    ensure_pgpass
     if [ $? -ne 0 ]; then
         ocf_log err "Cannot ensure .pgpass file for pg_basebackup"
         return $OCF_ERR_CONFIGURED
     fi
+    local pgpass_file="$PGPASS_FILE"
     ocf_log info "Using .pgpass file for pg_basebackup: ${pgpass_file}"
+
+    # BUG FIX v1.6.10: Create replication slot BEFORE pg_basebackup
+    # This prevents WAL recycling race condition between basebackup completion
+    # and standby startup (can be minutes/hours with large DBs or slow startups)
+    if [ -n "${OCF_RESKEY_slot_name}" ]; then
+        ocf_log info "Ensuring replication slot '${OCF_RESKEY_slot_name}' exists on primary ${primary_host}"
+
+        # Idempotent slot creation: creates only if doesn't exist, using single SQL query
+        # Store SQL in variable and execute via psql, writing result to temp file to avoid command substitution
+        local slot_sql="SELECT CASE WHEN (SELECT count(*) FROM pg_replication_slots WHERE slot_name = '${OCF_RESKEY_slot_name}') = 0 THEN (SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}', true))::text ELSE 'already_exists' END"
+        local slot_result_file="${state_dir}/.pgtwin_slot_result.$$"
+
+        # Note: PGPASSFILE env var doesn't work with runuser, but psql automatically uses ~/.pgpass
+        # ensure_pgpass() already ensures the file is at /var/lib/pgsql/.pgpass
+        run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" > "${slot_result_file}" 2>&1
+        local slot_rc=$?
+        local slot_result
+        read slot_result < "${slot_result_file}" 2>/dev/null || slot_result=""
+        rm -f "${slot_result_file}"
+
+        if [ $slot_rc -eq 0 ]; then
+            if [ "$slot_result" = "already_exists" ]; then
+                ocf_log info "Replication slot '${OCF_RESKEY_slot_name}' already exists on primary (reusing it)"
+            else
+                ocf_log info "Replication slot '${OCF_RESKEY_slot_name}' created successfully on primary"
+                ocf_log info "WAL is now protected from recycling during basebackup and standby startup"
+            fi
+        else
+            ocf_log err "Failed to ensure replication slot exists: ${slot_result}"
+            ocf_log err "pg_basebackup will likely fail due to missing slot"
+            return $OCF_ERR_GENERIC
+        fi
+    fi
 
     # Create progress marker with correct ownership
     cat > "${pid_file}" <<EOF
@@ -2225,18 +2810,53 @@ user=${rep_user}
 timeout=${OCF_RESKEY_basebackup_timeout}
 pgdata=${PGDATA}
 EOF
-    chown ${OCF_RESKEY_pguser}:$(id -gn ${OCF_RESKEY_pguser}) "${pid_file}"
+    # Get group name without command substitution
+    id -gn ${OCF_RESKEY_pguser} > /tmp/.pgtwin_pidfile_group.$$
+    local pidfile_group
+    read pidfile_group < /tmp/.pgtwin_pidfile_group.$$
+    rm -f /tmp/.pgtwin_pidfile_group.$$
+    chown ${OCF_RESKEY_pguser}:${pidfile_group} "${pid_file}"
+
+    # Get current cluster node name for cleanup trigger
+    local node_name=$(crm_node -n 2>/dev/null)
+    if [ -z "$node_name" ]; then
+        ocf_log warn "Could not determine cluster node name, cleanup trigger may not work"
+        node_name=$(hostname)
+    fi
 
     # Start pg_basebackup in background
+    # Note: PGPASSFILE env var doesn't work with runuser, but psql/pg_basebackup automatically use ~/.pgpass
     (
-        runuser -u ${OCF_RESKEY_pguser} -- env PGPASSFILE="${pgpass_file}" PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress > "${log_file}" 2>&1
-        echo $? > "${rc_file}"
+        run_as_pguser env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress > "${log_file}" 2>&1
+        local basebackup_rc=$?
+        echo ${basebackup_rc} > "${rc_file}"
+
+        # NEW v1.6.8: Trigger automatic cleanup after basebackup completion
+        # This eliminates the 5 minute failure-timeout wait for small databases
+        # If cleanup fails, the existing failure-timeout mechanism still applies
+        if [ ${basebackup_rc} -eq 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Basebackup completed successfully, triggering resource cleanup" >> "${log_file}"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Basebackup failed with exit code ${basebackup_rc}, triggering resource cleanup" >> "${log_file}"
+        fi
+
+        # Trigger cleanup to allow immediate restart (instead of waiting 5 minutes)
+        # Use full path to ensure command is found, and suppress errors if cleanup fails
+        /usr/sbin/crm_resource --resource "${OCF_RESOURCE_INSTANCE}" --node "${node_name}" --cleanup >> "${log_file}" 2>&1
+        local cleanup_rc=$?
+
+        if [ ${cleanup_rc} -eq 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup triggered successfully" >> "${log_file}"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup failed (rc=${cleanup_rc}), relying on failure-timeout" >> "${log_file}"
+        fi
     ) &
 
     local bg_pid=$!
     echo "pid=${bg_pid}" >> "${pid_file}"
 
     ocf_log info "pg_basebackup started in background with PID ${bg_pid}, log: ${log_file}"
+    ocf_log info "Automatic cleanup will be triggered when basebackup completes (new in v1.6.8)"
 
     # Return success for now, monitor will check progress
     return $OCF_SUCCESS
@@ -2375,8 +2995,8 @@ disable_sync_replication() {
     ocf_log info "Disabling synchronous replication due to standby failure"
 
     # Update postgresql.auto.conf to disable sync replication
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
 
     ocf_log info "Synchronous replication disabled"
 }
@@ -2385,8 +3005,8 @@ enable_sync_replication() {
     ocf_log info "Enabling synchronous replication (standby connected)"
 
     # Update postgresql.auto.conf to enable sync replication
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
-    runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_reload_conf()\"" >/dev/null 2>&1
 
     ocf_log info "Synchronous replication enabled"
 }
@@ -2417,7 +3037,7 @@ pgsql_notify() {
         post-stop)
             # After a node stops, check if we need to disable sync replication
             if pgsql_is_promoted; then
-                local active_standbys=$(runuser -u ${OCF_RESKEY_pguser} -- sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication\"" 2>/dev/null)
+                local active_standbys=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication\"" 2>/dev/null)
 
                 if [ "$active_standbys" = "0" ] && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
                     disable_sync_replication
@@ -2442,14 +3062,21 @@ pgsql_validate() {
             ocf_log err "Cannot create PGDATA directory ${PGDATA} - check parent directory exists and permissions"
             return $OCF_ERR_INSTALLED
         }
-        # Set ownership
-        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}" 2>/dev/null || {
-            ocf_log warn "Cannot set ownership on ${PGDATA} - may need manual intervention"
+        # Set ownership and permissions
+        chown ${OCF_RESKEY_pguser}:${OCF_RESKEY_pguser} "${PGDATA}" 2>/dev/null && \
+        chmod 750 "${PGDATA}" 2>/dev/null || {
+            ocf_log warn "Cannot set ownership/permissions on ${PGDATA} - may need manual intervention"
         }
     elif [ -z "$(ls -A ${PGDATA} 2>/dev/null)" ]; then
         ocf_log info "PostgreSQL data directory ${PGDATA} is empty - will be auto-initialized on start"
     elif [ ! -f "${PGDATA}/PG_VERSION" ]; then
         ocf_log warn "PostgreSQL data directory ${PGDATA} exists but missing PG_VERSION - may be corrupted, will attempt auto-initialization"
+    else
+        # PGDATA exists with valid data - validate version compatibility
+        if ! validate_pg_version; then
+            ocf_log err "PostgreSQL version validation failed in validate phase"
+            return $OCF_ERR_CONFIGURED
+        fi
     fi
 
     # Validate application_name if provided
