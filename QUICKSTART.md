@@ -7,14 +7,15 @@
 ## Prerequisites
 
 - 2 Linux nodes (SUSE/openSUSE/RHEL/CentOS)
-- PostgreSQL 17.x installed on both nodes
+- **Choose deployment mode**:
+  - **Bare-Metal**: PostgreSQL 17.x installed on both nodes
+  - **Container**: Podman or Docker installed (PostgreSQL runs in containers)
 - Pacemaker 3.0.1+ and Corosync installed
 - Network connectivity between nodes
 - Optional: Shared block device for SBD STONITH fencing
 
 ---
-
-## Part 1: PostgreSQL Configuration for HA
+## Part 1: PostgreSQL Configuration for HA -- Bare-Metal Mode
 
 ### 1.1 Install PostgreSQL 17
 
@@ -30,6 +31,29 @@ sudo zypper install postgresql17 postgresql17-server postgresql17-contrib
 sudo dnf install postgresql17 postgresql17-server postgresql17-contrib
 
 **NOTE**: There seems to be an issue installing postgresql17 at least in Tumbleweed, where it also installs postgres-18. This is not addressed here.
+
+**IMPORTANT**: After installing `postgresql17-server`, the binaries may not be linked to `/usr/bin`. You need to create the symlinks manually:
+
+```bash
+# On both nodes - Link PostgreSQL binaries via alternatives system
+# Step 1: Create symlinks in /etc/alternatives pointing to PostgreSQL 17 binaries
+for f in /usr/lib/postgresql17/bin/*; do
+    sudo ln -sf "$f" "/etc/alternatives/$(basename "$f")"
+done
+
+# Step 2: Create symlinks in /usr/bin pointing to alternatives
+for f in /usr/lib/postgresql17/bin/*; do
+    sudo ln -sf "/etc/alternatives/$(basename "$f")" "/usr/bin/$(basename "$f")"
+done
+
+# Verify binaries are accessible
+which psql pg_ctl initdb
+psql --version
+```
+
+This creates a two-tier symlink structure:
+- `/usr/bin/psql` → `/etc/alternatives/psql` → `/usr/lib/postgresql17/bin/psql`
+- This allows easy switching between PostgreSQL versions using the alternatives system
 ```
 
 ### 1.2 Initialize PostgreSQL (Primary Node Only)
@@ -57,8 +81,11 @@ wal_sender_timeout = 30000             # 30 seconds (prevents false disconnectio
 max_standby_streaming_delay = 60000    # 60 seconds (bounds replication lag)
 max_standby_archive_delay = 60000      # 60 seconds (bounds replication lag)
 
-# REPLICATION
+# NETWORK & CONNECTION
+port = 5432                            # PostgreSQL listening port (change if running multiple instances)
 listen_addresses = '*'                 # Or specific IPs: 'localhost,192.168.122.60'
+
+# REPLICATION
 synchronous_commit = on                # For zero data loss (sync replication)
 synchronous_standby_names = '*'        # Match any standby
 
@@ -88,6 +115,14 @@ Include custom config in `/var/lib/pgsql/data/postgresql.conf`:
 ```ini
 include = 'postgresql.custom.conf'
 ```
+
+**Using Non-Standard Ports**:
+
+If you change the port (e.g., `port = 5433` for running multiple PostgreSQL versions):
+- Update `postgresql.custom.conf` on both nodes
+- Match the port in cluster configuration: `pgport="5433"` (see section 2.7)
+- Update firewall rules to allow the new port
+- This allows running multiple PostgreSQL instances on the same host
 
 ### 1.4 Configure pg_hba.conf
 
@@ -320,6 +355,9 @@ sudo firewall-cmd --list-services
 
 ---
 
+
+---
+
 ## Part 2: Pacemaker Cluster Setup
 
 ### 2.1 Install Cluster Software (Both Nodes)
@@ -340,18 +378,12 @@ sudo zypper ar https://download.opensuse.org/repositories/home:azouhr:d3v/openSU
 sudo zypper in pgtwin
 
 # For others, there is no package available yet:
-# Copy pgtwin agent to OCF directory
 sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
 sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify installation
 ls -l /usr/lib/ocf/resource.d/heartbeat/pgtwin
-
-# Optional: Test agent metadata
-sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 ```
-
-**NOTE**: Testing with `ocf-tester` requires setting environment variables and can be complex. It's recommended to test the agent once the cluster is configured, where Pacemaker will set all required variables automatically.
 
 ### 2.3 Configure Cluster (Node 1)
 
@@ -359,7 +391,7 @@ sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data
 sudo crm cluster init --name CLUSTERNAME
 ```
 
-Answer the questions you are asked. For SBD, you will need a shared block device. You should be aware of a persistent device name of that block device.
+Answer the questions you are asked. For SBD, you will need a shared block device.
 
 ### 2.4 Configure Cluster (Node 2)
 
@@ -379,9 +411,161 @@ sudo crm configure property \
 
 **Note**: Set `stonith-enabled=true` in production with proper SBD configuration!
 
-### 2.6 Create PostgreSQL Resource
+---
 
-Make sure that your nodelist reflects your infrastructure.
+### 2.6 Prepare for PostgreSQL Resource
+
+**Choose your deployment mode** and follow the appropriate preparation section:
+
+#### 2.6.1 Bare-Metal Mode Preparation
+
+**If using bare-metal mode** (PostgreSQL installed directly on hosts):
+
+✅ **Checklist**:
+- PostgreSQL 17 packages installed (from Part 1)
+- postgres user exists (auto-created by package installation)
+- PGDATA initialized and configured (from Part 1)
+
+**No additional preparation needed** - proceed to section 2.7.
+
+---
+
+#### 2.6.2 Container Mode Preparation
+
+> ⚠️ **EXPERIMENTAL FEATURE**
+>
+> Container mode is an experimental feature that has received limited production testing.
+> While the implementation is technically sound and uses secure `--user` flag for proper
+> UID/GID isolation, this deployment mode is newer than bare-metal deployments.
+>
+> **Recommendations**:
+> - ✅ Use for testing and development environments
+> - ✅ Use when PostgreSQL packages are not available for your platform
+> - ⚠️ **For production**: Prefer bare-metal mode (section 2.6.1) until more field testing
+> - ⚠️ Requires Podman 3.0+ or Docker 20.10+
+> - ⚠️ Test thoroughly in staging before production use
+>
+> **Status**: Experimental - Feedback Welcome
+
+**If using container mode** (PostgreSQL runs in containers):
+
+**Step 1: Install Container Runtime** (Both Nodes)
+
+```bash
+# Install Podman (recommended) or Docker
+sudo zypper install podman
+
+# Verify installation
+podman --version
+```
+
+**Step 2: Create PostgreSQL User** (Both Nodes)
+
+Container mode requires a user on the host that matches the `pguser` parameter you'll configure in step 2.7.
+
+**Default configuration** (`pguser` not specified, defaults to "postgres"):
+
+```bash
+# Check if postgres user exists
+if ! id postgres &>/dev/null; then
+    echo "Creating postgres user and group..."
+    sudo groupadd -r postgres
+    sudo useradd -r -g postgres -d /var/lib/pgsql -s /bin/bash -c "PostgreSQL Server" postgres
+    sudo mkdir -p /var/lib/pgsql/data
+    sudo chown postgres:postgres /var/lib/pgsql
+fi
+
+# Verify
+id postgres
+# Expected: uid=26(postgres) gid=26(postgres)  [openSUSE]
+#           uid=999(postgres) gid=999(postgres) [RHEL/CentOS]
+```
+
+**Custom username** (if you plan to use `pguser="dbadmin"` or similar):
+
+```bash
+# Example: Creating "dbadmin" user instead of "postgres"
+PGUSER="dbadmin"  # ← Change this to match your pguser parameter
+
+if ! id "$PGUSER" &>/dev/null; then
+    echo "Creating $PGUSER user and group..."
+    sudo groupadd -r "$PGUSER"
+    sudo useradd -r -g "$PGUSER" -d /var/lib/pgsql -s /bin/bash -c "PostgreSQL Server" "$PGUSER"
+    sudo mkdir -p /var/lib/pgsql/data
+    sudo chown "$PGUSER:$PGUSER" /var/lib/pgsql
+fi
+```
+
+**⚠️ CRITICAL**: The username created here **MUST** match the `pguser` parameter in your cluster configuration (step 2.7).
+
+**Step 3: Install Container Library** (Both Nodes)
+
+```bash
+# Install the container library
+sudo cp pgtwin-container-lib.sh /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+sudo chmod 644 /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+```
+
+**Container Mode Benefits**:
+- ✅ No PostgreSQL packages needed on host
+- ✅ Easy version switching (change `pg_major_version` parameter)
+- ✅ Container isolation
+- ✅ Same security model as bare-metal (uses `--user` flag)
+- ✅ Parallel operation of different versions of PostgreSQL (Vendor or PostgreSQL Version)
+
+**Ready** - proceed to section 2.7.
+
+---
+
+### 2.7 Create PostgreSQL Resource
+
+**This configuration works for BOTH bare-metal and container mode.**
+
+The only differences are the parameters marked with **[CONTAINER]** below.
+
+```bash
+sudo crm configure primitive postgres-db pgtwin \
+  params \
+    pgdata="/var/lib/pgsql/data" \
+    pgport="5432" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+    backup_before_basebackup="true" \
+    basebackup_timeout="3600" \
+    pgpassfile="/var/lib/pgsql/.pgpass" \
+    slot_name="ha_slot" \
+    # --- Container Mode Parameters (add these if using containers) ---
+    # container_mode="true" \              # [CONTAINER] Enable container mode
+    # pg_major_version="17" \              # [CONTAINER] PostgreSQL version
+    # container_name="postgres-ha" \       # [CONTAINER] Container name
+    # container_image="..." \              # [CONTAINER] Optional: custom image
+    # pguser="postgres" \                  # [OPTIONAL] Custom username (default: postgres)
+  op start timeout="120s" interval="0" \
+  op stop timeout="120s" interval="0" \
+  op monitor interval="10s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted" \
+  op promote timeout="120s" interval="0" \
+  op demote timeout="120s" interval="0" \
+  op notify timeout="90s" interval="0"
+  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
+
+```
+
+**Parameter Guide**:
+
+| Parameter | Bare-Metal | Container Mode | Notes |
+|-----------|-----------|----------------|-------|
+| `pgdata` | Required | Required | Same for both |
+| `pgport` | Required | Required | Same for both |
+| `rep_mode` | Required | Required | Same for both |
+| `node_list` | Required | Required | Same for both |
+| `pguser` | Optional | Optional | **If set, must match host username** |
+| `container_mode` | - | **"true"** | Enables container mode |
+| `pg_major_version` | - | **"17"** | PostgreSQL major version |
+| `container_name` | - | **"postgres-ha"** | Container name |
+| `container_image` | - | Optional | Custom image (auto-detected if not set) |
+
+**Example: Bare-Metal Configuration**
 
 ```bash
 sudo crm configure primitive postgres-db pgtwin \
@@ -401,51 +585,148 @@ sudo crm configure primitive postgres-db pgtwin \
   op promote timeout="120s" interval="0" \
   op demote timeout="120s" interval="0" \
   op notify timeout="90s" interval="0"
+  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
+
 ```
 
-### 2.7 Create Clone Resource
+**Example: Container Mode Configuration**
+
+```bash
+sudo crm configure primitive postgres-db pgtwin \
+  params \
+    container_mode="true" \
+    pg_major_version="17" \
+    container_name="postgres-ha" \
+    pgdata="/var/lib/pgsql/data" \
+    pgport="5432" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+    backup_before_basebackup="true" \
+    basebackup_timeout="3600" \
+    pgpassfile="/var/lib/pgsql/.pgpass" \
+    slot_name="ha_slot" \
+  op start timeout="120s" interval="0" \
+  op stop timeout="120s" interval="0" \
+  op monitor interval="10s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted" \
+  op promote timeout="120s" interval="0" \
+  op demote timeout="120s" interval="0" \
+  op notify timeout="90s" interval="0" \
+  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
+
+```
+
+---
+
+### 2.8 Create Clone Resource
 
 ```bash
 sudo crm configure clone postgres-clone postgres-db \
   meta \
     promotable="true" \
-    notify="true" \
+    promoted-node-max="1" \
     clone-max="2" \
     clone-node-max="1" \
-    failure-timeout="5m"
+    notify="true" \
+    failure-timeout="5m" \
+    migration-threshold="5" \
+    interleave="true"
 ```
 
-**About failure-timeout:**
-- Automatically clears failures after 5 minutes
-- Essential for automatic standby initialization (eliminates need for manual cleanup)
-- When pg_basebackup is running, start returns "Not running" → Pacemaker marks as failed
-- After 5 minutes, Pacemaker automatically retries
-- For large databases (>100GB), multiple retries will occur until basebackup completes
-- This is **expected behavior** - no manual intervention needed!
-
-### 2.8 Create Virtual IP Resource
+### 2.9 Create Virtual IP Resource
 
 ```bash
 sudo crm configure primitive vip IPaddr2 \
   params ip="192.168.122.20" \
   op monitor interval="10s"
+  meta is-managed=true target-role=Started
 ```
 
-### 2.9 Create Constraints
+### 2.10 Create Network Monitoring Resource (Recommended)
+
+The ping resource monitors external network connectivity and helps the cluster make intelligent failover decisions.
+
+**Benefits:**
+- Detects network isolation vs. complete node failure
+- Prefers primary role on nodes with working external connectivity
+- Prevents running database on nodes unreachable by clients
+- Complements SBD/STONITH fencing
 
 ```bash
+# Create ping resource - monitors gateway connectivity
+sudo crm configure primitive ping-gateway ocf:pacemaker:ping \
+  params \
+    host_list="192.168.122.1" \
+    multiplier="100" \
+    attempts="3" \
+    timeout="2" \
+  op monitor interval="10s" timeout="20s"
+
+# Clone to run on all nodes
+sudo crm configure clone ping-clone ping-gateway \
+  meta clone-max="2" clone-node-max="1"
+```
+
+**Configuration:**
+- `host_list`: Gateway IP, DNS server, or critical network host to monitor
+- `multiplier`: Score added when target is reachable (default: 100)
+- `attempts`: Number of ping attempts before declaring failure
+- `timeout`: Seconds to wait for each ping response
+
+### 2.11 Create Constraints
+
+```bash
+# Set resource stickiness to prevent unnecessary failback
+# Stickiness=100 means "prefer to stay on current node"
+# Combined with location constraints (psql1:100, psql2:50):
+#   - Fresh start: prefers psql1 (100 > 50)
+#   - After failover to psql2: stays on psql2 (50+100 > 100)
+sudo crm configure rsc_defaults resource-stickiness=100
+
 # VIP follows promoted (primary) instance
 sudo crm configure colocation vip-with-postgres inf: vip postgres-clone:Promoted
 
 # VIP starts after promotion
-sudo crm configure order postgres-before-vip Mandatory: postgres-clone:promote vip:start
+sudo crm configure order promote-before-vip Mandatory: postgres-clone:promote vip:start \
+     symmetrical=false
+
+# VIP stops before demotion
+sudo crm configure order vip-stop-before-demote Mandatory: vip:stop postgres-clone:demote \
+     symmetrical=false
 
 # Prefer node 1 as primary
 sudo crm configure location postgres-on-psql1 postgres-clone role=Promoted 100: psql1
 sudo crm configure location postgres-on-psql2 postgres-clone role=Promoted 50: psql2
+
+# Prefer promoted role on nodes with working network connectivity (if using ping resource)
+sudo crm configure location prefer-connected-promoted postgres-clone role=Promoted \
+     rule 200: pingd gt 0
 ```
 
-### 2.10 Verify Configuration
+**How resource placement works:**
+
+**Resource stickiness (prevents unnecessary failback):**
+- Stickiness=100 adds 100 points to the currently running node
+- Prevents automatic migration back to preferred node after recovery
+- Example: psql2 is primary after failover → psql2 score: 50+100=150 > psql1: 100
+- Admin can still manually migrate: `sudo crm resource move postgres-clone psql1`
+
+**Initial placement (fresh cluster start):**
+- psql1: 100 (location) + 0 (not running) = 100
+- psql2: 50 (location) + 0 (not running) = 50
+- Result: psql1 becomes primary
+
+**After failover (psql2 is now primary):**
+- psql1: 100 (location) + 0 (not running) = 100
+- psql2: 50 (location) + 100 (stickiness) = 150
+- Result: psql2 stays primary (prevents automatic failback)
+
+**Connectivity-based placement:**
+- Nodes with working connectivity: base score (100/50) + stickiness (0/100) + connectivity (200) = 300/350
+- Nodes without connectivity: base score (100/50) + stickiness (0/100) = 100/150
+- Cluster prefers to run primary on connected nodes
+
+### 2.12 Verify Configuration
 
 ```bash
 # Check configuration syntax
@@ -458,81 +739,17 @@ sudo crm configure show
 sudo crm status
 ```
 
-Expected status (if you used controlled startup with node 2 in standby):
-```
-Cluster Summary:
-  * Stack: corosync
-  * Current DC: pg1
-  * 2 nodes configured
-  * 4 resource instances configured
+### 2.13 Bring Node 2 Online (If Using Controlled Startup)
 
-Node List:
-  * Node pg2: standby
-  * Online: [ pg1 ]
-
-Full List of Resources:
-  * stonith-sbd (stonith:fence_sbd): Started pg1
-  * Clone Set: postgres-clone [postgres-db] (promotable):
-    * Promoted: [ pg1 ]
-    * Stopped: [ pg2 ]
-  * vip (ocf:heartbeat:IPaddr2): Started pg1
-```
-
-### 2.11 Bring Node 2 Online (If Using Controlled Startup)
-
-If you put node 2 in standby mode in section 1.10, now is the time to bring it online. This will trigger **automatic standby initialization**.
+If you put node 2 in standby mode in section 1.10, now bring it online:
 
 ```bash
 # Bring node 2 online
 sudo crm node online pg2
 
-# Watch automatic initialization progress
-sudo journalctl -u pacemaker -f
-
-# You should see:
-# "PGDATA is empty or invalid - triggering automatic standby initialization"
-# "Discovered promoted node: pg1"
-# "Auto-initializing standby from primary: pg1"
-# "Starting asynchronous pg_basebackup from pg1"
-# ... progress updates ...
-# "Asynchronous pg_basebackup completed successfully"
-# "PostgreSQL started successfully"
-```
-
-**Monitor progress:**
-```bash
-# In another terminal, watch pg_basebackup progress
-sudo tail -f /var/lib/pgsql/.pgtwin_basebackup.log
-
-# In another terminal, watch cluster status
+# Watch status
 watch -n 2 'sudo crm status'
 ```
-
-**How long does it take?**
-- Small database (<1GB): 1-2 minutes
-- Medium database (10GB): 5-10 minutes
-- Large database (100GB): 30-60 minutes
-
-**When complete, you should see:**
-```
-Cluster Summary:
-  * Stack: corosync
-  * Current DC: pg1
-  * 2 nodes configured
-  * 4 resource instances configured
-
-Node List:
-  * Online: [ pg1 pg2 ]
-
-Full List of Resources:
-  * stonith-sbd (stonith:fence_sbd): Started pg1
-  * Clone Set: postgres-clone [postgres-db] (promotable):
-    * Promoted: [ pg1 ]
-    * Unpromoted: [ pg2 ]  ← Node 2 is now a standby!
-  * vip (ocf:heartbeat:IPaddr2): Started pg1
-```
-
-If you didn't use controlled startup (both nodes started simultaneously), automatic initialization already happened during cluster startup. You should already see both nodes running.
 
 ---
 
@@ -552,8 +769,8 @@ sudo -u postgres psql -c "SELECT pg_is_in_recovery();"  # Should be 't' (true)
 ### 3.2 Test VIP
 
 ```bash
-# From any node or client
-ping 192.168.122.20
+# From any node or client              
+ping 192.168.122.20                    
 
 # Connect via VIP
 psql -h 192.168.122.20 -U postgres -c "SELECT inet_server_addr();"
@@ -569,7 +786,7 @@ sudo crm resource move postgres-clone psql2
 sudo crm_mon
 
 # IMPORTANT: Clear the constraint after move!
-sudo crm resource clear postgres-clone
+sudo crm resource clear postgres-clone 
 ```
 
 ---
@@ -779,6 +996,398 @@ Before deploying to production, verify:
   - PostgreSQL log monitoring
   - Disk space alerts (especially for WAL)
   - Replication lag alerts
+
+---
+
+## Appendix A: Migrating from Bare-Metal to Container Mode
+
+> ⚠️ **EXPERIMENTAL FEATURE**
+>
+> Container mode is experimental. See section 2.6.2 for details and recommendations.
+
+**This section is for existing clusters migrating from bare-metal to container mode.**
+
+If you're setting up a new cluster, you don't need this section.
+
+---
+
+### Overview
+
+Migrating from bare-metal to container mode is straightforward since v1.6.7+ uses the `--user` flag to run containers as the host's postgres user.
+
+**Key Principle**: Container will run as whatever user owns PGDATA, so keep ownership unchanged.
+
+### Prerequisites
+
+- Existing bare-metal cluster running pgtwin
+- Podman or Docker installed on both nodes
+- pgtwin v1.6.7+ and container library installed
+
+### Migration Procedure
+
+**Step 1: Identify Current PostgreSQL User**
+
+```bash
+# Check current PGDATA ownership
+ls -ld /var/lib/pgsql/data
+# Example: drwx------ 1 postgres postgres 566 Dec 11 09:53 /var/lib/pgsql/data
+
+# Get username
+PGUSER=$(stat -c '%U' /var/lib/pgsql/data)
+echo "Current PostgreSQL user: $PGUSER"
+```
+
+**Step 2: Stop Cluster Resources**
+
+```bash
+# On node 1
+sudo crm resource stop postgres-clone
+
+# Wait for all resources to stop
+watch -n 2 'sudo crm status'
+# Wait until: "Stopped: [ psql1 psql2 ]"
+```
+
+**Step 3: Verify PostgreSQL is Stopped**
+
+```bash
+# On both nodes
+sudo systemctl status postgresql
+# Should show: "inactive (dead)"
+
+ps aux | grep postgres | grep -v grep
+# Should return nothing
+```
+
+**Step 4: Backup Configuration (Recommended)**
+
+```bash
+# On node 1 - save current config
+sudo crm configure show postgres-db > /tmp/postgres-db-backup.crm
+```
+
+**Step 5: Install Container Runtime and Library** (Both Nodes)
+
+```bash
+# Install Podman
+sudo zypper install podman
+
+# Install container library
+sudo cp pgtwin-container-lib.sh /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+sudo chmod 644 /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+```
+
+**Step 6: Update Cluster Configuration**
+
+```bash
+# On node 1 - add container mode parameters
+# Get current config
+sudo crm configure edit postgres-db
+
+# Add these parameters:
+# container_mode="true"
+# pg_major_version="17"
+# container_name="postgres-ha"
+# pguser="postgres"  ← MUST match $PGUSER from Step 1!
+
+# Alternative: Use crm configure primitive to rebuild
+```
+
+**Example updated configuration**:
+
+```bash
+sudo crm configure primitive postgres-db pgtwin \
+  params \
+    container_mode="true" \
+    pg_major_version="17" \
+    container_name="postgres-ha" \
+    pguser="postgres" \  # ← Matches bare-metal username
+    pgdata="/var/lib/pgsql/data" \
+    pgport="5432" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+    backup_before_basebackup="true" \
+    pgpassfile="/var/lib/pgsql/.pgpass" \
+    slot_name="ha_slot" \
+  op start timeout="120s" interval="0s" \
+  op stop timeout="120s" interval="0s" \
+  op monitor interval="8s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted" \
+  op promote timeout="120s" interval="0s" \
+  op demote timeout="120s" interval="0s" \
+  op notify timeout="90s" interval="0s"
+```
+
+**⚠️ CRITICAL**: The `pguser` parameter **MUST** match the username that owns PGDATA (from Step 1).
+
+**Step 7: Start Cluster Resources**
+
+```bash
+# On node 1
+sudo crm resource start postgres-clone
+
+# Monitor startup
+watch -n 2 'sudo crm status'
+
+# Watch logs
+sudo journalctl -u pacemaker -f
+```
+
+**Expected log output**:
+```
+INFO: Detected host 'postgres' UID:GID = 26:26
+INFO: ✓ PGDATA ownership correct (postgres 26:26)
+INFO: ✓ Startup validation passed: Ownership correct
+INFO: Creating PostgreSQL container: postgres-ha
+INFO: Container postgres-ha started successfully
+INFO: PostgreSQL started successfully
+```
+
+**Step 8: Verify Container Mode Operation**
+
+```bash
+# Check containers are running
+sudo podman ps
+# Should show postgres-ha container
+
+# Check PostgreSQL is accessible
+sudo podman exec postgres-ha psql -U postgres -c "SELECT version();"
+
+# Check replication (on primary)
+sudo podman exec postgres-ha psql -U postgres -x -c "SELECT * FROM pg_stat_replication;"
+
+# Verify cluster status
+sudo crm status
+# Should show: Promoted: [ psql1 ], Unpromoted: [ psql2 ]
+```
+
+**Step 9: Test Failover**
+
+```bash
+# Test manual failover
+sudo crm resource move postgres-clone psql2
+watch -n 2 'sudo crm status'
+
+# Clear constraint
+sudo crm resource clear postgres-clone
+```
+
+### Migration Complete!
+
+**What changed**:
+- PostgreSQL now runs in containers
+- File ownership unchanged (still owned by postgres user)
+- Container runs as postgres user (via `--user` flag)
+- No data migration needed
+- Same security model
+
+### Rollback Plan
+
+If needed, revert to bare-metal:
+
+```bash
+# Stop cluster
+sudo crm resource stop postgres-clone
+
+# Restore original config
+sudo crm configure load update /tmp/postgres-db-backup.crm
+
+# Start cluster
+sudo crm resource start postgres-clone
+```
+
+---
+
+## Advanced: Multi-Instance Setup (Container Mode)
+
+> ⚠️ **EXPERIMENTAL FEATURE**
+>
+> Container mode is experimental. See section 2.6.2 for details and recommendations.
+> Multi-instance setups add additional complexity and should be tested thoroughly.
+
+**Running multiple PostgreSQL databases on the same hardware with different users.**
+
+### Why Multi-Instance?
+
+- Run production, staging, and development databases on one pair of servers
+- Resource isolation via different system users
+- Separate credentials (.pgpass files) per instance
+- Different PostgreSQL versions possible (change `pg_major_version`)
+
+### Architecture
+
+Each instance requires:
+- **Different host user** (postgres, postgres1, postgres2, etc.)
+- **Different HOME directory** (/var/lib/pgsql, /var/lib/pgsql1, /var/lib/pgsql2)
+- **Different PGDATA directory**
+- **Different port** (5432, 5433, 5434, etc.)
+- **Different container name**
+
+| Instance | Host User | HOME | PGDATA | Port | Container |
+|----------|-----------|------|--------|------|-----------|
+| Production | postgres (UID 476) | /var/lib/pgsql | /var/lib/pgsql/data | 5432 | postgres-ha |
+| Staging | postgres1 (UID 475) | /var/lib/pgsql1 | /var/lib/pgsql1/data | 5433 | postgres1-ha |
+| Development | postgres2 (UID 555) | /var/lib/pgsql2 | /var/lib/pgsql2/data | 5434 | postgres2-ha |
+
+### Setup Steps
+
+#### 1. Create Additional Users
+
+On **both nodes**:
+
+```bash
+# Create postgres1 user for staging instance
+groupadd -r postgres1
+mkdir -p /var/lib/pgsql1
+useradd -r -g postgres1 -d /var/lib/pgsql1 -s /bin/bash postgres1
+chown postgres1:postgres1 /var/lib/pgsql1
+
+# Create postgres2 user for development instance
+groupadd -r postgres2
+mkdir -p /var/lib/pgsql2
+useradd -r -g postgres2 -d /var/lib/pgsql2 -s /bin/bash postgres2
+chown postgres2:postgres2 /var/lib/pgsql2
+```
+
+**IMPORTANT**: On standby node, create users with **SAME UID** as primary:
+
+```bash
+# On primary, get UIDs
+ssh root@psql1 "echo postgres=$(id -u postgres) postgres1=$(id -u postgres1) postgres2=$(id -u postgres2)"
+# Output: postgres=476 postgres1=475 postgres2=555
+
+# On standby, create with matching UIDs
+useradd -r -u 476 -g postgres -d /var/lib/pgsql -s /bin/bash postgres
+useradd -r -u 475 -g postgres1 -d /var/lib/pgsql1 -s /bin/bash postgres1
+useradd -r -u 555 -g postgres2 -d /var/lib/pgsql2 -s /bin/bash postgres2
+```
+
+#### 2. Initialize Each Instance (Primary Node)
+
+```bash
+# Instance 1: Production (default postgres user)
+sudo ./container-mode-primary-init.sh
+
+# Instance 2: Staging (postgres1 user)
+sudo PGUSER=postgres1 PGDATA=/var/lib/pgsql1/data \
+     REPLICATION_PASSWORD=staging123 \
+     ./container-mode-primary-init.sh
+
+# Instance 3: Development (postgres2 user)
+sudo PGUSER=postgres2 PGDATA=/var/lib/pgsql2/data \
+     REPLICATION_PASSWORD=dev123 \
+     ./container-mode-primary-init.sh
+```
+
+Each instance creates its own .pgpass file:
+- `/var/lib/pgsql/.pgpass` (production)
+- `/var/lib/pgsql1/.pgpass` (staging)
+- `/var/lib/pgsql2/.pgpass` (development)
+
+#### 3. Copy .pgpass Files to Standby
+
+```bash
+# Copy each .pgpass file separately
+scp root@psql1:/var/lib/pgsql/.pgpass root@psql2:/var/lib/pgsql/
+scp root@psql1:/var/lib/pgsql1/.pgpass root@psql2:/var/lib/pgsql1/
+scp root@psql1:/var/lib/pgsql2/.pgpass root@psql2:/var/lib/pgsql2/
+
+# Fix permissions on standby
+ssh root@psql2 "chown postgres:postgres /var/lib/pgsql/.pgpass && chmod 600 /var/lib/pgsql/.pgpass"
+ssh root@psql2 "chown postgres1:postgres1 /var/lib/pgsql1/.pgpass && chmod 600 /var/lib/pgsql1/.pgpass"
+ssh root@psql2 "chown postgres2:postgres2 /var/lib/pgsql2/.pgpass && chmod 600 /var/lib/pgsql2/.pgpass"
+```
+
+#### 4. Configure Pacemaker Resources
+
+Create separate resources for each instance:
+
+```bash
+# Production instance (port 5432)
+sudo crm configure primitive postgres-db pgtwin \
+  params \
+    container_mode="true" \
+    pg_major_version="17" \
+    container_name="postgres-ha" \
+    pguser="postgres" \
+    pgdata="/var/lib/pgsql/data" \
+    pgport="5432" \
+    pgpassfile="/var/lib/pgsql/.pgpass" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+  op start timeout="120s" interval="0" \
+  op stop timeout="120s" interval="0" \
+  op monitor interval="10s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted"
+
+# Staging instance (port 5433)
+sudo crm configure primitive postgres1-db pgtwin \
+  params \
+    container_mode="true" \
+    pg_major_version="17" \
+    container_name="postgres1-ha" \
+    pguser="postgres1" \
+    pgdata="/var/lib/pgsql1/data" \
+    pgport="5433" \
+    pgpassfile="/var/lib/pgsql1/.pgpass" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+  op start timeout="120s" interval="0" \
+  op stop timeout="120s" interval="0" \
+  op monitor interval="10s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted"
+
+# Development instance (port 5434)
+sudo crm configure primitive postgres2-db pgtwin \
+  params \
+    container_mode="true" \
+    pg_major_version="17" \
+    container_name="postgres2-ha" \
+    pguser="postgres2" \
+    pgdata="/var/lib/pgsql2/data" \
+    pgport="5434" \
+    pgpassfile="/var/lib/pgsql2/.pgpass" \
+    rep_mode="sync" \
+    node_list="psql1 psql2" \
+  op start timeout="120s" interval="0" \
+  op stop timeout="120s" interval="0" \
+  op monitor interval="10s" timeout="60s" role="Unpromoted" \
+  op monitor interval="3s" timeout="60s" role="Promoted"
+
+# Create clones (one per instance)
+sudo crm configure clone postgres-clone postgres-db \
+  meta promotable="true" target-role="Started"
+
+sudo crm configure clone postgres1-clone postgres1-db \
+  meta promotable="true" target-role="Started"
+
+sudo crm configure clone postgres2-clone postgres2-db \
+  meta promotable="true" target-role="Started"
+```
+
+### How Container UID Mapping Works
+
+The container user is always named "postgres", but its UID changes to match the host user:
+
+```
+Host: postgres1 (UID 475)  →  Container: postgres (UID 475)
+Host: postgres2 (UID 555)  →  Container: postgres (UID 555)
+```
+
+This is handled automatically by `pgtwin_fix_container_user_id()` function which:
+1. Detects host user UID:GID
+2. Modifies container's `/etc/passwd` and `/etc/group`
+3. Changes postgres user UID:GID to match host
+
+**No permission issues** - Container postgres (UID 475) can access files owned by host postgres1 (UID 475).
+
+### Key Points
+
+✅ **Separate HOME directories** - Each user has own .pgpass file
+✅ **Automatic UID matching** - Container postgres UID changes to match host user
+✅ **No duplicate users** - Container user always named "postgres"
+✅ **Port isolation** - Each instance uses different port
+✅ **Resource isolation** - Different system users prevent cross-contamination
 
 ---
 
