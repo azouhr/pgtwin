@@ -25,7 +25,7 @@ sudo zypper ref
 sudo zypper up   # or 'zypper dup' on Tumbleweed
 
 # On both nodes (openSUSE/SUSE)
-sudo zypper install postgresql17 postgresql17-server postgresql17-contrib
+sudo zypper install postgresql17 postgresql17-server postgresql17-contrib sudo
 
 # On both nodes (RHEL/CentOS)
 sudo dnf install postgresql17 postgresql17-server postgresql17-contrib

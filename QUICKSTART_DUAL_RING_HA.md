@@ -292,6 +292,71 @@ ip route show
 
 ---
 
+### Troubleshooting: Removing Unwanted Default Gateway
+
+If you accidentally configured eth1 with a gateway (or NetworkManager auto-configured one), you'll end up with **two default routes**. This causes routing conflicts and must be fixed.
+
+#### Detecting the Problem
+
+```bash
+# Check routing table
+ip route show
+
+# Problem: You see TWO default routes like this:
+# default via 192.168.1.1 dev eth0 proto static metric 100
+# default via 10.10.10.1 dev eth1 proto static metric 101  ← UNWANTED!
+# 10.10.10.0/24 dev eth1 proto kernel scope link src 10.10.10.1
+# 192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.10
+```
+
+#### Solution: Delete the Second Default Gateway
+
+**Method 1: Remove gateway from eth1 connection permanently**
+
+```bash
+# Remove the gateway setting from eth1 connection
+sudo nmcli connection modify eth1 ipv4.gateway ""
+
+# Prevent future default routes on this connection
+sudo nmcli connection modify eth1 ipv4.never-default yes
+
+# Reactivate the connection to apply changes
+sudo nmcli connection down eth1
+sudo nmcli connection up eth1
+
+# Verify: Should now have only ONE default route
+ip route show
+# Expected: default via 192.168.1.1 dev eth0 (only one!)
+```
+
+**Method 2: Temporarily delete the route (not persistent across reboots)**
+
+```bash
+# Find the unwanted default route
+ip route show | grep "^default"
+
+# Delete the eth1 default route (replace 10.10.10.1 with your gateway)
+sudo ip route del default via 10.10.10.1 dev eth1
+
+# Verify
+ip route show
+# Expected: Only one default route via eth0
+```
+
+**⚠️ Note**: Method 2 is temporary - the route will come back after reboot or connection restart. Always use Method 1 for permanent fix.
+
+#### Why This Matters
+
+Having two default gateways causes:
+- **Unpredictable routing** - traffic may go out the wrong interface
+- **Failed connections** - packets sent via Ring 1 (direct link) can't reach internet
+- **Application issues** - PostgreSQL and cluster communication may fail
+- **Monitoring failures** - ping-gateway resource may ping via wrong interface
+
+**Always ensure only ONE default gateway** (via Ring 0/eth0 for external connectivity).
+
+---
+
 ### Creating Connections from Scratch (If Needed)
 
 If connections don't exist for your interfaces, create them:
