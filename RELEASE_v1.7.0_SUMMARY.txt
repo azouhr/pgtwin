@@ -1,0 +1,203 @@
+# pgtwin v1.7.0 Release Summary
+
+## Release Information
+
+**Release Date:** 2026-01-02
+**Tag:** v1.7.0
+**Type:** Combined Bugfix + Feature Release
+**Previous Release:** v1.6.7 (2025-12-23)
+
+## Components
+
+### pgtwin v1.6.18 (Production Ready) ✅
+- Status: Production Ready
+- 11 critical bugfixes since v1.6.7
+- Backward compatible
+
+### pgtwin-migrate v1.0.6 (⚠️ EXPERIMENTAL)
+- Status: EXPERIMENTAL
+- First public release
+- Zero-downtime PostgreSQL migration agent
+- Test thoroughly before production use
+
+## Critical Bugfixes (pgtwin)
+
+1. **v1.6.18**: Synchronous standby names handling
+   - Fixed async clusters being forced to sync mode
+   
+2. **v1.6.16**: VIP colocation during failover
+   - Fixed VIP starting on wrong node
+   
+3. **v1.6.15**: XML cluster discovery
+   - Fixed standby incorrectly identified as primary
+   
+4. **v1.6.14**: Config detection enhancement
+   - More robust postgres -C usage
+   
+5. **v1.6.13**: Parallel cluster discovery
+   - Fixed race condition and timeline check
+
+6-11. Additional fixes for slot management, promotion safety, etc.
+
+## New: pgtwin-migrate (⚠️ EXPERIMENTAL)
+
+**Tagline:** A Pacemaker OCF agent that orchestrates PostgreSQL cluster migrations via logical replication (major version upgrades, vendor migrations, hosting provider changes, etc.)
+
+**Use Cases:**
+- Major version upgrades (PG15 → PG17)
+- Vendor migrations (on-prem → cloud)
+- Hosting provider changes
+- Architecture changes (physical → containers)
+
+**Key Features (v1.0.6):**
+- Zero-downtime cutover (VIP swap in seconds)
+- Bidirectional DDL replication
+- Self-healing reconciliation
+- Cluster-wide state management
+- Idempotent operations
+
+**Changelog:**
+- v1.0.6: Cluster attribute scope fix, auto-cleanup, stale detection
+- v1.0.5: Cutover window optimization (98% faster)
+- v1.0.4: Bidirectional DDL replication
+- v1.0.3: Completion detection, resource scoping
+
+## Files in Release
+
+### Core Files
+- pgtwin (v1.6.18) - Main HA agent
+- pgtwin-migrate (v1.0.6) - Migration agent (EXPERIMENTAL)
+- pgtwin-container-lib.sh - Container support library
+- VERSION - Contains "1.7.0"
+
+### Documentation
+- RELEASE_v1.7.0.md - Complete release notes
+- CHANGELOG.md - Updated with v1.7.0 changes
+- README.md - Updated with pgtwin-migrate section
+- README-pgtwin-migrate.md - Migration agent guide (NEW)
+- PGTWIN_CONCEPTS.md - Conceptual overview (NEW)
+- MIGRATION_DOCUMENTATION_INDEX.md - Full workflow (NEW)
+- DOCUMENTATION_INDEX.md - Master doc index (NEW)
+- QUICKSTART.md - Quick start guide
+
+### Configuration
+- pgsql-resource-config.crm - Example cluster config
+- postgresql.custom.conf - Example PostgreSQL config
+
+## Installation
+
+### pgtwin (Production)
+```bash
+sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin
+sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin
+
+# If using container mode
+sudo cp pgtwin-container-lib.sh /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+sudo chmod 644 /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
+```
+
+### pgtwin-migrate (⚠️ Experimental)
+```bash
+# IMPORTANT: Test thoroughly in non-production first
+sudo cp pgtwin-migrate /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate
+sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate
+
+# Read documentation before use
+# - README-pgtwin-migrate.md
+# - MIGRATION_DOCUMENTATION_INDEX.md
+```
+
+## Upgrade Path
+
+### From v1.6.7 → v1.7.0
+
+1. Backup configuration:
+   ```bash
+   crm configure show > /tmp/cluster-backup.crm
+   ```
+
+2. Deploy new pgtwin:
+   ```bash
+   for node in node1 node2; do
+       scp pgtwin root@$node:/usr/lib/ocf/resource.d/heartbeat/
+       ssh root@$node "chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin"
+   done
+   ```
+
+3. No reconfiguration needed - backward compatible
+
+4. Verify:
+   ```bash
+   crm status
+   ```
+
+## Breaking Changes
+
+**None** - All changes backward compatible
+
+## Known Issues
+
+### pgtwin
+None known
+
+### pgtwin-migrate (⚠️ Experimental)
+- New table DML delay (<2 minutes, no data loss)
+- Manual subscription refresh may be needed
+- Automatic refresh planned for v1.1+
+
+## Testing Recommendations
+
+### pgtwin
+- Test failover: `crm resource move postgres-clone node2`
+- Test recovery: `crm node standby node1; crm node online node1`
+- Monitor: `watch -n 2 'crm status'`
+
+### pgtwin-migrate
+- **MUST test in non-production first**
+- Deploy two test clusters
+- Run complete migration workflow
+- Validate reverse replication
+- Test fallback scenarios
+
+## Git Information
+
+**Commit:** 8965e6d
+**Tag:** v1.7.0
+**Branch:** main
+
+**Commit Message:**
+Release v1.7.0: Combined bugfix + experimental pgtwin-migrate
+
+- pgtwin v1.6.18: 11 critical bugfixes (v1.6.8-v1.6.18)
+- pgtwin-migrate v1.0.6: EXPERIMENTAL zero-downtime migration agent
+- Added comprehensive migration documentation
+- Backward compatible - safe upgrade from v1.6.7
+
+## Next Release
+
+**v1.8.0 or v2.0.0** - Expected to promote pgtwin-migrate to production-ready
+
+## License
+
+GPL-2.0-or-later
+
+## Support
+
+- Documentation: See doc/ directory
+- Release notes: RELEASE_v1.7.0.md
+- Migration guide: README-pgtwin-migrate.md
+
+---
+
+**IMPORTANT NOTES:**
+
+1. ✅ pgtwin v1.6.18 is production-ready - safe to upgrade
+2. ⚠️ pgtwin-migrate v1.0.6 is EXPERIMENTAL - test thoroughly
+3. ✅ All changes backward compatible
+4. ✅ No configuration changes required for pgtwin upgrade
+5. ⚠️ pgtwin-migrate requires complete documentation review before use
+
+---
+
+Generated: 2026-01-02
+Release Manager: pgtwin project team
