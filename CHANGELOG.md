@@ -1,3 +1,44 @@
+## [1.7.0] - 2026-01-02
+
+### Added
+- **EXPERIMENTAL: pgtwin-migrate v1.0.6** - Zero-downtime PostgreSQL migration agent
+  - Orchestrates PostgreSQL cluster migrations via logical replication
+  - Use cases: Major version upgrades, vendor migrations, hosting provider changes
+  - Features: Bidirectional DDL replication, self-healing, cluster-wide state management
+  - Status: EXPERIMENTAL - test thoroughly before production use
+  - Documentation: README-pgtwin-migrate.md, MIGRATION_DOCUMENTATION_INDEX.md
+
+### Fixed (pgtwin v1.6.18)
+- **CRITICAL**: Synchronous standby names handling (v1.6.18)
+  - Bug: `update_application_name_in_config()` unconditionally wrote sync setting
+  - Fix: Only write sync setting when rep_mode=sync
+  - Impact: Prevents async clusters from being forced to sync mode
+- **CRITICAL**: VIP colocation during failover (v1.6.16)
+  - Bug: VIP started on demoting node instead of promoting node
+  - Fix: Added colocation constraint check
+  - Impact: Ensures VIP always on promoted (primary) node
+- **CRITICAL**: XML cluster discovery during failover (v1.6.15)
+  - Bug: CIB XML parsing incorrectly identified standby as primary
+  - Fix: Enhanced XML parsing with proper Promoted role detection
+  - Impact: Prevents operations on read-only nodes
+- Configuration detection using postgres -C (v1.6.14)
+- Parallel cluster discovery race condition (v1.6.13)
+- Timeline check breaking cluster discovery (v1.6.13)
+- Replication slot conflict handling (v1.6.9)
+- Double-failure detection (v1.6.8)
+
+### Changed
+- Updated to version 1.7.0
+- Enhanced logging and error messages throughout
+- Improved synchronous replication handling (v1.6.17)
+- Better single-node scenario handling (v1.6.13)
+
+### Documentation
+- Added README-pgtwin-migrate.md - Complete migration agent guide
+- Added MIGRATION_DOCUMENTATION_INDEX.md - Full migration workflow
+- Updated PGTWIN_CONCEPTS.md - Added pgtwin-migrate overview
+- Enhanced QUICKSTART.md with migration references
+
 # Changelog
 
 All notable changes to pgtwin will be documented in this file.

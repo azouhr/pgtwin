@@ -24,6 +24,39 @@
 
 ---
 
+## ⚠️ NEW: pgtwin-migrate (Experimental)
+
+**v1.7.0 introduces pgtwin-migrate** - A Pacemaker OCF agent that orchestrates PostgreSQL cluster migrations via logical replication (major version upgrades, vendor migrations, hosting provider changes, etc.)
+
+### Status: EXPERIMENTAL
+
+pgtwin-migrate enables **zero-downtime PostgreSQL migrations** using logical replication between two parallel clusters. While tested in development, it should be:
+- ✅ Tested thoroughly in non-production environments first
+- ✅ Used with caution in production
+- ⚠️ Considered experimental until v2.0.0
+
+### Use Cases
+
+- **Major version upgrades** (e.g., PostgreSQL 15 → 17)
+- **Vendor migrations** (e.g., on-premise → cloud)
+- **Hosting provider changes** (e.g., AWS → self-hosted)
+- **Architecture changes** (e.g., physical → containerized)
+
+### Key Features
+
+- ✅ **Zero-downtime cutover** - VIP swap completes in seconds
+- ✅ **Bidirectional DDL replication** - Schema changes replicate automatically
+- ✅ **Self-healing** - Automatically fixes missing components
+- ✅ **Idempotent** - Works regardless of cluster state
+
+### Documentation
+
+- **[README-pgtwin-migrate.md](README-pgtwin-migrate.md)** - Complete usage guide
+- **[MIGRATION_DOCUMENTATION_INDEX.md](MIGRATION_DOCUMENTATION_INDEX.md)** - Full workflow
+- **[PGTWIN_CONCEPTS.md](PGTWIN_CONCEPTS.md)** - Conceptual overview
+
+---
+
 ## Quick Start
 
 ```bash
