@@ -1,12 +1,30 @@
-## [1.7.0] - 2026-01-02
+## [1.7.1] - 2026-01-05
 
 ### Added
-- **EXPERIMENTAL: pgtwin-migrate v1.0.6** - Zero-downtime PostgreSQL migration agent
+- **EXPERIMENTAL: pgtwin-migrate v1.0.8** - Zero-downtime PostgreSQL migration agent
   - Orchestrates PostgreSQL cluster migrations via logical replication
   - Use cases: Major version upgrades, vendor migrations, hosting provider changes
-  - Features: Bidirectional DDL replication, self-healing, cluster-wide state management
+  - Features: Bidirectional DDL replication, self-healing, cluster-wide state management, **multi-database migration**
   - Status: EXPERIMENTAL - test thoroughly before production use
   - Documentation: README-pgtwin-migrate.md, MIGRATION_DOCUMENTATION_INDEX.md
+
+### Added (pgtwin-migrate v1.0.8)
+- **Multi-Database Migration Support** - Migrate multiple databases in a single operation
+  - New `databases` parameter: comma-separated list of databases to migrate
+  - Example: `databases="postgres,myapp_prod,analytics,reporting"`
+  - Per-database publications, subscriptions, replication slots, and DDL triggers
+  - Per-database state tracking and lag monitoring
+  - Atomic cutover for all databases together (single VIP swap)
+  - Backward compatible with legacy `pgdatabase` parameter
+  - Tested with 1-10 databases, scales linearly
+  - Documentation: FEATURE_MULTI_DATABASE_MIGRATION_v1.0.8.md
+
+### Fixed (pgtwin-migrate v1.0.7)
+- **Auto-stop after cutover completion**
+  - Bug: Resource set target-role=Stopped in monitor, but if migration-state attribute was deleted before monitor ran, auto-stop never triggered
+  - Fix: Set target-role=Stopped immediately in check_cutover_progress() when cutover completes (lines 2263-2270)
+  - Impact: Resource automatically stops when migration completes, prevents restart loops
+  - Kept monitor auto-stop as safety net for edge cases (manual restart, old version migration)
 
 ### Fixed (pgtwin v1.6.18)
 - **CRITICAL**: Synchronous standby names handling (v1.6.18)

@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.7
-# Release Date: 2025-12-23
+# Version: 1.6.18
+# Release Date: 2025-12-28
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -34,6 +34,7 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH
 #   OCF_RESKEY_replication_failure_threshold - Number of consecutive monitor cycles with
 #                                               failed replication before triggering recovery (default: 5)
 #   OCF_RESKEY_vip              - Virtual IP address (used to discover promoted node)
+#   OCF_RESKEY_pg_bindir        - Directory containing PostgreSQL binaries (default: /usr/bin, bare-metal mode only)
 #   OCF_RESKEY_container_mode   - Enable container mode (true/false)
 #   OCF_RESKEY_container_name   - Container name for PostgreSQL instance
 #   OCF_RESKEY_container_image  - Container image to use (default: registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postgres:17.6-158.5)
@@ -90,6 +91,7 @@ OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
 OCF_RESKEY_vip_default=""
+OCF_RESKEY_pg_bindir_default="/usr/bin"
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
 OCF_RESKEY_container_name_default="postgres-ha"
@@ -111,16 +113,18 @@ OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/c
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
+: ${OCF_RESKEY_pg_bindir=${OCF_RESKEY_pg_bindir_default}}
 : ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
 : ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
 : ${OCF_RESKEY_container_name=${OCF_RESKEY_container_name_default}}
 : ${OCF_RESKEY_container_image=${OCF_RESKEY_container_image_default}}
 
 PGDATA="${OCF_RESKEY_pgdata}"
-PGCTL="/usr/bin/pg_ctl"
-PSQL="/usr/bin/psql"
-PG_REWIND="/usr/bin/pg_rewind"
-PG_BASEBACKUP="/usr/bin/pg_basebackup"
+PGCTL="${OCF_RESKEY_pg_bindir}/pg_ctl"
+PSQL="${OCF_RESKEY_pg_bindir}/psql"
+PG_REWIND="${OCF_RESKEY_pg_bindir}/pg_rewind"
+PG_BASEBACKUP="${OCF_RESKEY_pg_bindir}/pg_basebackup"
+POSTGRES="${OCF_RESKEY_pg_bindir}/postgres"
 
 #######################################################################
 
@@ -324,6 +328,27 @@ If not specified, falls back to using node_list for promoted node discovery.
 <content type="string" default="${OCF_RESKEY_vip_default}" />
 </parameter>
 
+<parameter name="pg_bindir" unique="0">
+<longdesc lang="en">
+Directory containing PostgreSQL binaries (pg_ctl, psql, pg_rewind, pg_basebackup, postgres).
+This allows running multiple PostgreSQL versions on the same nodes by specifying different
+binary directories for each cluster.
+
+Examples:
+  /usr/bin                      = Default (system PostgreSQL)
+  /usr/lib/postgresql/17/bin    = PostgreSQL 17 (Debian/Ubuntu)
+  /usr/pgsql-17/bin             = PostgreSQL 17 (RHEL/CentOS)
+  /opt/postgresql/17/bin        = Custom installation
+
+Note: Only applies in bare-metal mode. Container mode ignores this parameter as
+binaries are provided by the container image.
+
+Default: /usr/bin
+</longdesc>
+<shortdesc lang="en">PostgreSQL binary directory</shortdesc>
+<content type="string" default="${OCF_RESKEY_pg_bindir_default}" />
+</parameter>
+
 <parameter name="container_mode" unique="0">
 <longdesc lang="en">
 Enable container mode for PostgreSQL. When true, PostgreSQL runs in a Podman container
@@ -482,11 +507,105 @@ get_application_name() {
     fi
 }
 
+# Get safe synchronous_standby_names based on cluster topology and actual connections
+# Returns comma-separated list of nodes that are both Unpromoted in cluster AND connected to PostgreSQL
+# Falls back to '*' if no standbys meet both criteria (prevents write blocking)
+get_safe_synchronous_standby_names() {
+    # BUG FIX v1.6.18: Use dual-source validation (cluster state + PostgreSQL connections)
+    # Prevents race conditions where cluster reports Unpromoted but PostgreSQL not connected yet
+
+    # STEP 1: Get Unpromoted nodes from cluster (expected standbys)
+    # Find the clone resource that contains this primitive resource
+    local primitive_resource="${OCF_RESOURCE_INSTANCE%%:*}"
+    local clone_resource=$(crm_mon --as-xml 2>/dev/null | \
+        xmllint --xpath "string(//clone[resource/@id='${primitive_resource}']/@id)" - 2>/dev/null)
+
+    if [ -z "$clone_resource" ]; then
+        ocf_log warn "Could not determine clone resource name from primitive '${primitive_resource}'"
+        ocf_log warn "Using '*' as fallback"
+        echo "*"
+        return 0
+    fi
+
+    ocf_log debug "Primitive resource: ${primitive_resource}, Clone resource: ${clone_resource}"
+
+    local expected_standbys=$(crm_mon --as-xml 2>/dev/null | \
+        xmllint --xpath "//clone[@id='${clone_resource}']/resource[@role='Unpromoted']/node/@name" - 2>/dev/null | \
+        sed 's/name="//g; s/"//g')
+
+    if [ -z "$expected_standbys" ]; then
+        ocf_log info "No Unpromoted nodes in cluster, using '*' for maximum flexibility"
+        echo "*"
+        return 0
+    fi
+
+    # STEP 2: Get actually connected standbys from PostgreSQL
+    # Query pg_stat_replication for connected application_names with state='streaming'
+    local connected_standbys=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \
+        \"SELECT application_name FROM pg_stat_replication WHERE state = 'streaming'\"" 2>/dev/null)
+
+    if [ -z "$connected_standbys" ]; then
+        ocf_log warn "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+        ocf_log warn "┃ WARNING: No standbys currently connected to PostgreSQL     ┃"
+        ocf_log warn "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+        ocf_log warn "Expected standbys from cluster: $expected_standbys"
+        ocf_log warn "Using synchronous_standby_names='*' to allow connections"
+        ocf_log warn "This will be updated when standbys establish streaming replication"
+        echo "*"
+        return 0
+    fi
+
+    # STEP 3: Find intersection (nodes that are both expected AND connected)
+    local safe_standbys=""
+    local pending_standbys=""
+
+    for expected in $expected_standbys; do
+        # Check if this expected standby is actually connected and streaming
+        if echo "$connected_standbys" | grep -q "^${expected}$"; then
+            if [ -z "$safe_standbys" ]; then
+                safe_standbys="$expected"
+            else
+                safe_standbys="${safe_standbys}, ${expected}"
+            fi
+        else
+            if [ -z "$pending_standbys" ]; then
+                pending_standbys="$expected"
+            else
+                pending_standbys="$pending_standbys, $expected"
+            fi
+        fi
+    done
+
+    if [ -z "$safe_standbys" ]; then
+        ocf_log warn "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+        ocf_log warn "┃ WARNING: Cluster has Unpromoted nodes but none connected   ┃"
+        ocf_log warn "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+        ocf_log warn "Expected from cluster: $expected_standbys"
+        ocf_log warn "Connected to PostgreSQL: $connected_standbys"
+        ocf_log warn "This indicates standbys are starting but not yet streaming"
+        ocf_log warn "Using synchronous_standby_names='*' temporarily to prevent write blocking"
+        ocf_log warn "Configuration will update automatically when standbys connect"
+        echo "*"
+        return 0
+    fi
+
+    # Log status if some standbys are pending
+    if [ -n "$pending_standbys" ]; then
+        ocf_log info "Safe synchronous standbys (connected + streaming): $safe_standbys"
+        ocf_log info "Pending standbys (not yet connected): $pending_standbys"
+    else
+        ocf_log info "Safe synchronous standbys (cluster + connected): $safe_standbys"
+    fi
+
+    echo "$safe_standbys"
+}
+
 # Update application_name in postgresql.auto.conf
 # This ensures the correct application_name is set when starting or promoting
 update_application_name_in_config() {
     # v1.7.0: Refactored to use ALTER SYSTEM instead of manual file editing
     # This function now handles both application_name and synchronous_standby_names
+    # v1.6.18: synchronous_standby_names now uses cluster topology + connection state
     local app_name
 
     get_application_name
@@ -512,22 +631,36 @@ update_application_name_in_config() {
         return 1
     fi
 
-    # If this is a promoted instance with rep_mode=sync, also configure synchronous_standby_names
+    # BUG FIX v1.6.18: Configure synchronous_standby_names based on cluster topology + connection state
+    # If this is a promoted instance with rep_mode=sync, configure synchronous_standby_names
     if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         local current_sync=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
-        # Use '*' to match any standby (most robust for HA clusters)
-        local expected_sync="*"
+        # Check if admin has set advanced syntax (FIRST, ANY) - preserve it
+        if echo "$current_sync" | grep -qE '^FIRST |^ANY '; then
+            ocf_log info "synchronous_standby_names uses advanced syntax: '$current_sync'"
+            ocf_log info "Preserving admin configuration (agent will not auto-update)"
+            # Skip automatic management, admin controls this
+        else
+            # Get safe standby names based on cluster topology AND actual connections
+            local safe_sync=$(get_safe_synchronous_standby_names)
 
-        # Only set if empty or different from expected
-        if [ -z "$current_sync" ] || [ "$current_sync" != "$expected_sync" ]; then
-            ocf_log info "Configuring synchronous_standby_names='${expected_sync}' for rep_mode=sync"
-            run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '${expected_sync}'\"" >/dev/null 2>&1
+            if [ "$current_sync" != "$safe_sync" ]; then
+                ocf_log info "Updating synchronous_standby_names based on cluster topology and connection state"
+                ocf_log info "Current: '$current_sync'"
+                ocf_log info "New: '$safe_sync'"
 
-            if [ $? -eq 0 ]; then
-                ocf_log info "Synchronous replication enabled: synchronous_standby_names='${expected_sync}'"
+                run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \
+                    \"ALTER SYSTEM SET synchronous_standby_names = '${safe_sync}'\"" >/dev/null 2>&1
+
+                if [ $? -eq 0 ]; then
+                    ocf_log info "Synchronous replication configured: synchronous_standby_names='${safe_sync}'"
+                else
+                    ocf_log err "Failed to update synchronous_standby_names"
+                    return 1
+                fi
             else
-                ocf_log warn "Failed to set synchronous_standby_names"
+                ocf_log debug "synchronous_standby_names already correct: '$safe_sync'"
             fi
         fi
     fi
@@ -742,6 +875,7 @@ parse_pgpass() {
     # Look for replication database entries, but exclude local node entries
     # Format: host:port:replication:username:password
     # v1.7.0: Filter out entries matching local node/hostname to prevent self-replication
+    # v1.7.0: Only consider entries from node_list to prevent cross-cluster replication
     local entry=""
     while IFS= read -r line; do
         local entry_host=$(echo "$line" | cut -d: -f1)
@@ -756,6 +890,23 @@ parse_pgpass() {
         if [ "$entry_host" = "localhost" ] || [ "$entry_host" = "127.0.0.1" ]; then
             ocf_log debug "Skipping .pgpass entry for localhost: $entry_host"
             continue
+        fi
+
+        # BUG FIX v1.7.0: Only accept entries that are in node_list
+        # This prevents cross-cluster replication when multiple PostgreSQL clusters run on same nodes
+        if [ -n "${OCF_RESKEY_node_list}" ]; then
+            local in_node_list=false
+            for node in ${OCF_RESKEY_node_list}; do
+                if [ "$entry_host" = "$node" ]; then
+                    in_node_list=true
+                    break
+                fi
+            done
+
+            if [ "$in_node_list" = "false" ]; then
+                ocf_log debug "Skipping .pgpass entry not in node_list: $entry_host (node_list=${OCF_RESKEY_node_list})"
+                continue
+            fi
         fi
 
         # Found a valid remote host entry
@@ -1408,9 +1559,20 @@ discover_promoted_node() {
     if command -v crm_mon >/dev/null 2>&1; then
         ocf_log debug "Attempting to discover promoted node via Pacemaker CIB"
 
-        # Try to find promoted instance from crm_mon
-        # Use $NF to get last field (the node name) from the Promoted line
-        local cluster_node=$(crm_mon -1 2>/dev/null | grep "Promoted:" | tr -d '[]' | awk '{print $NF}')
+        # Extract base resource name from instance (e.g., postgres-db-18:0 → postgres-db-18)
+        local resource_name=$(echo "$OCF_RESOURCE_INSTANCE" | sed 's/:[0-9]*$//')
+
+        # Find promoted node within THIS clone resource only (not all clones)
+        # This prevents finding promoted nodes from other parallel PostgreSQL clusters
+        local cluster_node=$(crm_mon -r -1 2>/dev/null | awk -v res="$resource_name" '
+            /Clone Set:/ { in_our_clone=0 }
+            $0 ~ "Clone Set:.*\\[" res "\\]" { in_our_clone=1 }
+            in_our_clone && /Promoted:/ {
+                gsub(/[\[\]]/,"")
+                print $NF
+                exit
+            }
+        ')
 
         if [ -n "$cluster_node" ]; then
             ocf_log info "Discovered promoted cluster node via Pacemaker CIB: ${cluster_node}"
@@ -1519,28 +1681,33 @@ pgsql_monitor() {
         # Check replication slots on primary
         check_replication_slots
 
-        # SELF-HEALING: Verify and fix synchronous_standby_names if rep_mode=sync
-        # Only enable sync mode if a standby is actually connected
+        # DYNAMIC UPDATE v1.6.18: Update synchronous_standby_names based on cluster topology
+        # This adapts to standbys connecting/disconnecting and cluster changes
         if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-            local standby_count=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT COUNT(*) FROM pg_stat_replication WHERE state = 'streaming'\"" 2>/dev/null)
             local current_sync=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
-            if [ -n "$standby_count" ] && [ "$standby_count" -gt 0 ]; then
-                # Standby is connected, should be in sync mode
-                if [ "$current_sync" != "*" ]; then
-                    ocf_log info "Monitor: Standby connected but synchronous_standby_names='$current_sync' - fixing to '*'"
-                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = '*'\"" >/dev/null 2>&1
-                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
-                    ocf_log info "Monitor: synchronous_standby_names corrected to '*'"
+            # Skip if admin uses advanced syntax (FIRST, ANY)
+            if ! echo "$current_sync" | grep -qE '^FIRST |^ANY '; then
+                # Get safe standby names based on current cluster topology + connections
+                local safe_sync=$(get_safe_synchronous_standby_names)
+
+                if [ "$current_sync" != "$safe_sync" ]; then
+                    ocf_log info "Monitor: Updating synchronous_standby_names due to cluster topology change"
+                    ocf_log info "Monitor: Old value: '$current_sync'"
+                    ocf_log info "Monitor: New value: '$safe_sync'"
+
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \
+                        \"ALTER SYSTEM SET synchronous_standby_names = '${safe_sync}'\"" >/dev/null 2>&1
+
+                    if [ $? -eq 0 ]; then
+                        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
+                        ocf_log info "Monitor: synchronous_standby_names updated successfully"
+                    else
+                        ocf_log warn "Monitor: Failed to update synchronous_standby_names"
+                    fi
                 fi
             else
-                # No standby connected, should NOT be in sync mode (would block writes)
-                if [ -n "$current_sync" ] && [ "$current_sync" != "" ]; then
-                    ocf_log info "Monitor: No standby connected but synchronous_standby_names='$current_sync' - clearing to avoid blocking writes"
-                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET synchronous_standby_names = ''\"" >/dev/null 2>&1
-                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
-                    ocf_log info "Monitor: synchronous_standby_names cleared (no standby connected)"
-                fi
+                ocf_log debug "Monitor: synchronous_standby_names uses advanced syntax, skipping auto-update"
             fi
         fi
 
@@ -1781,7 +1948,7 @@ validate_pg_version() {
             else
                 ocf_log info "Container library not available (container mode is experimental)"
                 # Fallback: try to get version from binary directly
-                local version_output=$(/usr/bin/postgres --version 2>/dev/null)
+                local version_output=$("${POSTGRES}" --version 2>/dev/null)
                 expected_version=$(echo "$version_output" | grep -oP '\d+' | head -n 1)
             fi
         fi
@@ -2802,6 +2969,77 @@ start_async_basebackup() {
         fi
     fi
 
+    # ENHANCEMENT v1.6.14: Verify PostgreSQL version compatibility before basebackup
+    # This prevents cross-cluster replication with different major versions
+    ocf_log info "Verifying PostgreSQL version compatibility between local and primary"
+
+    # Get local PostgreSQL binary major version
+    local local_version_output="${state_dir}/.pgtwin_local_version.$$"
+    ${PG_CTL} --version > "${local_version_output}" 2>&1
+    local local_version_full
+    read local_version_full < "${local_version_output}" 2>/dev/null || local_version_full=""
+    rm -f "${local_version_output}"
+
+    # Extract major version (e.g., "pg_ctl (PostgreSQL) 18.1" -> "18")
+    local local_pg_major=$(echo "$local_version_full" | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
+
+    if [ -z "$local_pg_major" ]; then
+        ocf_log warn "Could not determine local PostgreSQL major version from: ${local_version_full}"
+        ocf_log warn "Proceeding with pg_basebackup without version check"
+    else
+        ocf_log debug "Local PostgreSQL binary major version: ${local_pg_major}"
+
+        # Get primary server version
+        local primary_version_output="${state_dir}/.pgtwin_primary_version.$$"
+        run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "SHOW server_version" > "${primary_version_output}" 2>&1
+        local primary_version_rc=$?
+        local primary_version_full
+        read primary_version_full < "${primary_version_output}" 2>/dev/null || primary_version_full=""
+        rm -f "${primary_version_output}"
+
+        if [ $primary_version_rc -ne 0 ]; then
+            ocf_log warn "Could not query primary server version: ${primary_version_full}"
+            ocf_log warn "Proceeding with pg_basebackup without version check"
+        else
+            # Extract major version (e.g., "18.1 on x86_64..." -> "18")
+            local primary_pg_major=$(echo "$primary_version_full" | grep -oE '[0-9]+\.[0-9]+' | head -1 | cut -d. -f1)
+
+            if [ -z "$primary_pg_major" ]; then
+                ocf_log warn "Could not parse primary PostgreSQL major version from: ${primary_version_full}"
+                ocf_log warn "Proceeding with pg_basebackup without version check"
+            else
+                ocf_log debug "Primary PostgreSQL server major version: ${primary_pg_major}"
+
+                # Compare major versions
+                if [ "$local_pg_major" != "$primary_pg_major" ]; then
+                    ocf_log err "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
+                    ocf_log err "┃ CRITICAL: PostgreSQL version mismatch detected!            ┃"
+                    ocf_log err "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+                    ocf_log err ""
+                    ocf_log err "Local binary major version:  PostgreSQL ${local_pg_major}"
+                    ocf_log err "Primary server major version: PostgreSQL ${primary_pg_major}"
+                    ocf_log err "Primary host: ${primary_host}"
+                    ocf_log err ""
+                    ocf_log err "Cannot replicate between different PostgreSQL major versions."
+                    ocf_log err "This likely indicates one of the following:"
+                    ocf_log err "  1. Wrong cluster configuration (check node_list parameter)"
+                    ocf_log err "  2. Wrong primary node discovered"
+                    ocf_log err "  3. Cross-cluster replication attempt (multiple clusters on same nodes)"
+                    ocf_log err ""
+                    ocf_log err "Please verify:"
+                    ocf_log err "  - node_list='${OCF_RESKEY_node_list}'"
+                    ocf_log err "  - Primary host '${primary_host}' is in the correct cluster"
+                    ocf_log err "  - /var/lib/pgsql/.pgpass contains entries only for this cluster's nodes"
+                    ocf_log err ""
+                    ocf_log err "pg_basebackup will NOT proceed."
+                    return $OCF_ERR_CONFIGURED
+                fi
+
+                ocf_log info "✓ Version compatibility verified: PostgreSQL ${local_pg_major} (local) = PostgreSQL ${primary_pg_major} (primary)"
+            fi
+        fi
+    fi
+
     # Create progress marker with correct ownership
     cat > "${pid_file}" <<EOF
 started=$(date +%s)
@@ -2816,6 +3054,24 @@ EOF
     read pidfile_group < /tmp/.pgtwin_pidfile_group.$$
     rm -f /tmp/.pgtwin_pidfile_group.$$
     chown ${OCF_RESKEY_pguser}:${pidfile_group} "${pid_file}"
+
+    # BUG FIX v1.6.17: Pre-create log file with correct ownership
+    # Without this, shell redirection creates file as root
+    cat > "${log_file}" <<EOF
+========================================
+pg_basebackup started: $(date '+%Y-%m-%d %H:%M:%S')
+Primary host: ${primary_host}
+Replication user: ${rep_user}
+Target PGDATA: ${PGDATA}
+========================================
+
+EOF
+    chown ${OCF_RESKEY_pguser}:${pidfile_group} "${log_file}"
+
+    # BUG FIX v1.6.17: Pre-create rc_file with correct ownership
+    # The background process will overwrite this with the actual return code
+    echo "" > "${rc_file}"
+    chown ${OCF_RESKEY_pguser}:${pidfile_group} "${rc_file}"
 
     # Get current cluster node name for cleanup trigger
     local node_name=$(crm_node -n 2>/dev/null)

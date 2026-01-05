@@ -87,7 +87,7 @@ listen_addresses = '*'                 # Or specific IPs: 'localhost,192.168.122
 
 # REPLICATION
 synchronous_commit = on                # For zero data loss (sync replication)
-synchronous_standby_names = '*'        # Match any standby
+synchronous_standby_names = ''         # IMPORTANT: Start with empty (async mode) - pgtwin will enable sync based on rep_mode
 
 # ARCHIVE (optional - for PITR)
 archive_mode = off                     # Enable if you need point-in-time recovery
@@ -145,14 +145,10 @@ host    all             all             192.168.122.0/24        scram-sha-256
 
 ### 1.5 Start PostgreSQL on Primary (Temporarily)
 
-**IMPORTANT**: Before starting PostgreSQL, temporarily disable synchronous replication to avoid hanging when creating the replication user (since no standby is connected yet).
+Start PostgreSQL on node 1 to create the replication user:
 
 ```bash
-# On node 1 only - backup the config and temporarily disable synchronous_standby_names
-sudo cp -a /var/lib/pgsql/data/postgresql.custom.conf /var/lib/pgsql/data/postgresql.custom.conf.backup
-sudo sed -i "s/^synchronous_standby_names = .*/synchronous_standby_names = ''/" /var/lib/pgsql/data/postgresql.custom.conf
-
-# Start PostgreSQL temporarily
+# On node 1 only - start PostgreSQL temporarily
 sudo systemctl start postgresql
 
 # Test connection
@@ -161,7 +157,7 @@ sudo -u postgres psql -c "SHOW wal_level;"
 sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
 ```
 
-**Why this is necessary**: With `synchronous_standby_names = '*'` configured, PostgreSQL will wait for a standby to confirm every write operation. Since the standby doesn't exist yet, commands like `CREATE ROLE` will hang indefinitely. We temporarily disable this setting and restore the original configuration after setup is complete.
+**Note**: Since `synchronous_standby_names = ''` (async mode) in our initial configuration, PostgreSQL will start normally without hanging. pgtwin will enable synchronous replication automatically based on the cluster's `rep_mode` parameter once both nodes are online.
 
 ### 1.6 Create Replication User
 
@@ -169,7 +165,33 @@ sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
 # On primary node (while PostgreSQL is running)
 sudo -u postgres psql << EOF
 CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
+GRANT pg_read_all_data TO replicator;
 EOF
+```
+
+### 1.6.1 Grant pg_rewind Permissions
+
+**CRITICAL for fast recovery**: Grant the replication user permissions for pg_rewind to access system files. Without these permissions, pg_rewind will fail and pgtwin will fall back to the slower pg_basebackup.
+
+```bash
+# On primary node - grant pg_rewind system function permissions
+sudo -u postgres psql << EOF
+GRANT EXECUTE ON FUNCTION pg_ls_dir(text, boolean, boolean) TO replicator;
+GRANT EXECUTE ON FUNCTION pg_stat_file(text, boolean) TO replicator;
+GRANT EXECUTE ON FUNCTION pg_read_binary_file(text) TO replicator;
+GRANT EXECUTE ON FUNCTION pg_read_binary_file(text, bigint, bigint, boolean) TO replicator;
+EOF
+```
+
+**Why this is needed:**
+- pg_rewind performs fast timeline reconciliation after failover
+- Reads system files (`pg_control`, WAL files) to calculate minimal changes
+- Without these grants: pg_rewind fails → falls back to full pg_basebackup (slow)
+- With these grants: pg_rewind succeeds → seconds instead of minutes recovery
+
+**Note:** These permissions are also required in `pg_hba.conf` (configured in section 1.4):
+```
+host    postgres     replicator      192.168.122.0/24        scram-sha-256
 ```
 
 ### 1.7 Create Replication Slot
@@ -322,17 +344,14 @@ ls -l /var/lib/pgsql/data/standby.signal
 
 **NOTE**: The `-S ha_slot` parameter uses the replication slot created in step 1.7. This ensures the primary retains all necessary WAL files during the initial copy.
 
-### 1.11 Restore Configuration and Stop PostgreSQL
+### 1.11 Stop PostgreSQL
 
 ```bash
-# On node 1 - restore original configuration with synchronous replication enabled
-sudo mv /var/lib/pgsql/data/postgresql.custom.conf.backup /var/lib/pgsql/data/postgresql.custom.conf
-
-# Stop PostgreSQL - Pacemaker will manage it from now on
+# On node 1 - stop PostgreSQL - Pacemaker will manage it from now on
 sudo systemctl stop postgresql
 ```
 
-**NOTE**: We restore the original configuration with `synchronous_standby_names = '*'` now that the standby is ready. When Pacemaker starts the cluster, both nodes will be available for synchronous replication.
+**NOTE**: pgtwin will manage `synchronous_standby_names` automatically based on the cluster's `rep_mode` parameter. When you configure the cluster with `rep_mode=sync`, pgtwin notify support will enable synchronous replication dynamically once both nodes are online.
 
 
 ### 1.12 Configure Firewall (Both Nodes)
@@ -683,7 +702,9 @@ sudo crm configure clone ping-clone ping-gateway \
 #   - After failover to psql2: stays on psql2 (50+100 > 100)
 sudo crm configure rsc_defaults resource-stickiness=100
 
-# VIP follows promoted (primary) instance
+# ⚠️ CRITICAL: VIP MUST run on same node as promoted database
+# This colocation constraint ensures VIP follows promoted (primary) instance
+# Without this, VIP can run on wrong node → connection failures!
 sudo crm configure colocation vip-with-postgres inf: vip postgres-clone:Promoted
 
 # VIP starts after promotion
