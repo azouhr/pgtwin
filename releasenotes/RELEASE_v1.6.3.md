@@ -110,11 +110,11 @@ get_cluster_node_name() {
 
 ```bash
 # On both nodes
-sudo cp pgsql-ha /usr/lib/ocf/resource.d/heartbeat/pgsql-ha
-sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgsql-ha
+sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin
+sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify version
-sudo /usr/lib/ocf/resource.d/heartbeat/pgsql-ha meta-data | grep version
+sudo /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data | grep version
 
 # Cleanup and restart
 sudo crm resource cleanup postgres-clone
@@ -153,21 +153,18 @@ crm_attribute -N $(crm_node -n) -n postgres-replication-failures -v 0 -l reboot
 
 ```bash
 # Verify version
-head -5 pgsql-ha | grep Version
+head -5 pgtwin | grep Version
 # Output: # Version: 1.6.3
 
-head -5 pgtwin/pgtwin | grep Version
-# Output: # Version: 1.6.3
-
-cat pgtwin/VERSION
+cat VERSION
 # Output: 1.6.3
 
 # Test helper function
-bash -c 'source pgsql-ha; get_cluster_node_name'
+bash -c 'source pgtwin; get_cluster_node_name'
 # Output: psql1 (cluster node name)
 
 # Verify no hostname -s in critical paths
-grep -n 'crm_attribute.*hostname' pgsql-ha
+grep -n 'crm_attribute.*hostname' pgtwin
 # Output: (empty - all fixed)
 ```
 
@@ -241,12 +238,10 @@ Planned improvements:
 
 | File | Change Type | Description |
 |------|-------------|-------------|
-| pgsql-ha | Enhanced | Added `get_cluster_node_name()` helper function |
-| pgsql-ha | Fixed | 6 locations using cluster node name instead of hostname |
-| pgtwin/pgtwin | Enhanced | Added `get_cluster_node_name()` helper function |
-| pgtwin/pgtwin | Fixed | 6 locations using cluster node name instead of hostname |
-| pgtwin/QUICKSTART.md | Fixed | PostgreSQL startup sequence and slot creation |
-| pgtwin/VERSION | Updated | 1.6.2 → 1.6.3 |
+| pgtwin | Enhanced | Added `get_cluster_node_name()` helper function |
+| pgtwin | Fixed | 6 locations using cluster node name instead of hostname |
+| QUICKSTART.md | Fixed | PostgreSQL startup sequence and slot creation |
+| VERSION | Updated | 1.6.2 → 1.6.3 |
 
 ---
 
@@ -284,8 +279,7 @@ v1.6.3 (2025-11-05)
 [FIXED] QUICKSTART.md: Create replication slot before pg_basebackup
 [FIXED] QUICKSTART.md: Simplified ocf-tester verification
 [UPDATED] VERSION: 1.6.2 → 1.6.3
-[UPDATED] pgsql-ha header: Version and release date
-[UPDATED] pgtwin/pgtwin header: Version and release date
+[UPDATED] pgtwin header: Version and release date
 
 v1.6.2 (2025-11-03)
 -------------------
@@ -312,9 +306,9 @@ v1.6.1 (2025-11-03)
 
 ## Support
 
-- **Issues**: Report at project repository
+- **Issues**: https://github.com/azouhr/pgtwin/issues
 - **Documentation**: README.md, QUICKSTART.md
-- **Testing**: Validated with syntax check and cluster testing
+- **License**: GPL-2.0-or-later
 
 ---
 

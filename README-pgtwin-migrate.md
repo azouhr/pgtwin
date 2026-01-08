@@ -26,10 +26,10 @@ pgtwin-migrate enables **zero-downtime PostgreSQL migrations** by orchestrating 
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                      BEFORE MIGRATION                                │
+│                      BEFORE MIGRATION                               │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  Source Cluster (PG17)              Target Cluster (PG18)            │
+│                                                                     │
+│  Source Cluster (PG17)              Target Cluster (PG18)           │
 │  ┌────────────────┐                 ┌────────────────┐              │
 │  │ Primary (RW)   │──────────────>  │ Primary (RW)   │              │
 │  │ pgtwin01       │  Logical Rep    │ pgtwin02       │              │
@@ -38,16 +38,16 @@ pgtwin-migrate enables **zero-downtime PostgreSQL migrations** by orchestrating 
 │  │ Standby        │                 │ Standby        │              │
 │  │ pgtwin11       │                 │ pgtwin12       │              │
 │  └────────────────┘                 └────────────────┘              │
-│                                                                       │
+│                                                                     │
 │  Production VIP: 192.168.60.100 → Points to Source (PG17)           │
-│                                                                       │
+│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       AFTER CUTOVER                                  │
+│                       AFTER CUTOVER                                 │
 ├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  Source Cluster (PG17)              Target Cluster (PG18)            │
+│                                                                     │
+│  Source Cluster (PG17)              Target Cluster (PG18)           │
 │  ┌────────────────┐                 ┌────────────────┐              │
 │  │ Primary (RW)   │  <──────────────│ Primary (RW)   │              │
 │  │ pgtwin01       │  Logical Rep    │ pgtwin02       │              │
@@ -56,10 +56,10 @@ pgtwin-migrate enables **zero-downtime PostgreSQL migrations** by orchestrating 
 │  │ Standby        │                 │ Standby        │              │
 │  │ pgtwin11       │                 │ pgtwin12       │              │
 │  └────────────────┘                 └────────────────┘              │
-│                                                                       │
+│                                                                     │
 │  Production VIP: 192.168.60.100 → Points to Target (PG18)           │
-│  Applications now running on new PostgreSQL version!                 │
-│                                                                       │
+│  Applications now running on new PostgreSQL version!                │
+│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
