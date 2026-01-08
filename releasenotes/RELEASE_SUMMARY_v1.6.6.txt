@@ -1,0 +1,222 @@
+========================================
+pgtwin v1.6.6 Release Preparation Summary
+========================================
+
+RELEASE DATE: 2025-12-09
+STATUS: Ready for GitHub Release
+
+========================================
+COMPLETED TASKS
+========================================
+
+✅ 1. Updated pgtwin version to 1.6.6
+   - Version header: 1.6.6
+   - Release date: 2025-12-09
+   - Updated description to include auto-init and notify support
+
+✅ 2. Created comprehensive documentation
+   - github/doc/FEATURE_NOTIFY_SUPPORT.md (NEW)
+   - github/doc/FEATURE_AUTO_INITIALIZATION.md (MOVED)
+   - github/doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md (MOVED)
+   - github/doc/MANUAL_RECOVERY_GUIDE.md (MOVED)
+
+✅ 3. Created release notes
+   - github/RELEASE_v1.6.6.md (Complete release documentation)
+
+✅ 4. Updated CHANGELOG
+   - github/CHANGELOG.md with detailed v1.6.6 entry
+   - Comprehensive listing of all changes
+
+✅ 5. Updated VERSION file
+   - github/VERSION: 1.6.6
+
+✅ 6. Updated README.md
+   - Added v1.6.6 feature sections
+   - Documented automatic standby initialization
+   - Documented Pacemaker notify support
+   - Documented critical bug fix
+
+✅ 7. Updated CLAUDE.md
+   - Updated current version to 1.6.6
+   - Added notify feature to v1.6.6 entry
+   - Updated code location references
+   - Added links to documentation
+
+✅ 8. Copied updated files to github subdirectory
+   - github/pgtwin (v1.6.6)
+   - All documentation updated and organized
+
+========================================
+GITHUB DIRECTORY STRUCTURE
+========================================
+
+github/
+├── doc/                                      [NEW DIRECTORY]
+│   ├── BUGFIX_PG_BASEBACKUP_FINALIZATION.md  [MOVED]
+│   ├── FEATURE_AUTO_INITIALIZATION.md        [MOVED]
+│   ├── FEATURE_NOTIFY_SUPPORT.md             [NEW]
+│   └── MANUAL_RECOVERY_GUIDE.md              [MOVED]
+├── BUILD.md
+├── CHANGELOG.md                              [UPDATED v1.6.6]
+├── CHEATSHEET.md
+├── LICENSE
+├── MAINTENANCE_GUIDE.md
+├── Makefile
+├── pgsql-resource-config.crm
+├── pgtwin                                    [UPDATED v1.6.6]
+├── pgtwin.spec
+├── PROJECT_SUMMARY.md
+├── QUICKSTART.md
+├── README.md                                 [UPDATED v1.6.6]
+├── RELEASE_v1.6.1.md
+├── RELEASE_v1.6.2.md
+├── RELEASE_v1.6.3.md
+├── RELEASE_v1.6.4.md
+├── RELEASE_v1.6.5.md
+├── RELEASE_v1.6.6.md                         [NEW]
+├── RELEASE_v1.7.0_TASKS.md
+└── VERSION                                   [UPDATED: 1.6.6]
+
+========================================
+KEY CHANGES IN v1.6.6
+========================================
+
+1. CRITICAL BUG FIX: pg_basebackup Configuration Finalization
+   - Fixed read-after-delete bug causing empty primary_conninfo
+   - New finalize_standby_config() function (lines 1838-1912)
+   - Safety check in pgsql_start() detects and fixes broken configs
+   - Affects v1.6.0-v1.6.5, IMMEDIATE upgrade recommended
+
+2. MAJOR FEATURE: Automatic Standby Initialization
+   - is_valid_pgdata() function (lines 1483-1506)
+   - Auto-init logic in pgsql_start() (lines 1530-1590)
+   - Updated pgsql_validate() allows empty PGDATA (lines 2360-2375)
+   - Disk replacement: 10+ steps → 3 steps
+
+3. MAJOR FEATURE: Pacemaker Notify Support
+   - pgsql_notify() handler (lines 2393-2429)
+   - enable_sync_replication() (lines 2383-2391)
+   - disable_sync_replication() (lines 2373-2381)
+   - Prevents write blocking when standby fails
+   - Requires notify="true" in clone meta
+
+========================================
+DOCUMENTATION HIGHLIGHTS
+========================================
+
+doc/FEATURE_NOTIFY_SUPPORT.md:
+  - Complete notify feature guide
+  - Implementation details
+  - Configuration requirements
+  - Usage scenarios and troubleshooting
+  - Migration guide from v1.6.5
+
+doc/FEATURE_AUTO_INITIALIZATION.md:
+  - Zero-touch deployment guide
+  - Prerequisites and use cases
+  - Technical implementation details
+  - Performance characteristics
+  - Troubleshooting guide
+
+doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md:
+  - Root cause analysis
+  - Fix description with code examples
+  - Testing recommendations
+  - Impact assessment and upgrade notes
+
+RELEASE_v1.6.6.md:
+  - Executive summary
+  - Complete feature descriptions
+  - Upgrade instructions
+  - Testing recommendations
+  - Breaking changes (none)
+  - Migration path
+
+========================================
+TESTING CHECKLIST
+========================================
+
+Before GitHub release, test:
+
+□ Bug fix verification:
+  - Trigger automatic recovery
+  - Verify correct primary_conninfo values
+  - Confirm replication works
+
+□ Auto-initialization verification:
+  - Empty PGDATA on standby
+  - Bring node online
+  - Verify automatic pg_basebackup
+  - Confirm replication established
+
+□ Notify support verification:
+  - Put standby in maintenance
+  - Verify sync replication disabled
+  - Bring standby back online
+  - Verify sync replication re-enabled
+
+========================================
+RELEASE PREPARATION STEPS
+========================================
+
+For GitHub release:
+
+1. Commit all changes to git:
+   cd /home/claude/postgresHA
+   git add .
+   git commit -m "Release v1.6.6: Bug fix + Auto-init + Notify support"
+
+2. Tag the release:
+   git tag -a v1.6.6 -m "pgtwin v1.6.6 - Production Ready Release"
+
+3. Push to GitHub:
+   git push origin master
+   git push origin v1.6.6
+
+4. Create GitHub release:
+   - Use RELEASE_v1.6.6.md content
+   - Attach pgtwin binary from github/pgtwin
+   - Mark as "Latest Release"
+
+========================================
+INSTALLATION INSTRUCTIONS (for users)
+========================================
+
+Standard installation:
+  sudo cp github/pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin
+  sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin
+
+Enable notify support (optional but recommended):
+  crm configure edit
+  # Add notify="true" to clone meta
+
+Verify version:
+  /usr/lib/ocf/resource.d/heartbeat/pgtwin meta-data | grep -i version
+
+========================================
+BACKWARD COMPATIBILITY
+========================================
+
+✅ Fully backward compatible with v1.6.x
+✅ No cluster configuration changes required
+✅ No breaking changes
+✅ Optional notify support (requires notify="true")
+✅ Auto-initialization only triggers on empty PGDATA
+
+========================================
+UPGRADE PRIORITY
+========================================
+
+CRITICAL: Immediate upgrade recommended if using:
+  - Automatic recovery (v1.6.0+)
+  - Manual failover/recovery procedures
+  - Disk replacement workflows
+
+RECOMMENDED: Upgrade for all v1.6.x users to get:
+  - Bug fix for configuration finalization
+  - Zero-touch standby deployment
+  - Dynamic sync replication management
+
+========================================
+STATUS: READY FOR RELEASE ✅
+========================================
