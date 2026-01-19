@@ -1,3 +1,66 @@
+## [1.7.3] - 2026-01-19
+
+### Added
+- **NEW: pgtwin-migrate-setup v1.0.0** - Interactive setup wizard for migration configuration
+  - Guided step-by-step configuration collection
+  - Configuration file generation (reusable `.conf` files)
+  - CRM snippet generation (ready-to-use Pacemaker configuration)
+  - Validation of cluster connectivity, database access, VIP resources
+  - Template support: load existing configs with `--config FILE`
+
+### Added (pgtwin-migrate v2.0.0 EXPERIMENTAL)
+- **Bidirectional Failover**: New `production_cluster` parameter replaces `cutover_ready`
+  - Change `production_cluster` to switch which cluster is production
+  - Supports failback (cutover → source) in addition to cutover (source → target)
+  - Clean transition: old direction DELETED, new direction CREATED fresh
+- **Dynamic Database Discovery**: Discovers databases at runtime from production cluster
+  - No explicit `databases` parameter needed (auto-discover)
+  - New databases detected automatically every 10th monitor cycle
+  - Replication set up automatically for new databases
+- **Direction-Aware Start Function**: Correctly handles both forward and reverse directions
+  - Checks for publications matching current `production_cluster`
+  - Sets up replication for the correct direction
+  - Sets CIB state appropriately (`FORWARD_REPLICATION` or `CUTOVER_COMPLETE`)
+- **New Database Auto-Setup**: Monitor detects databases without replication
+  - Creates database on subscriber if it doesn't exist
+  - Copies schema from publisher to subscriber
+  - Creates publication and subscription with `copy_data=true`
+  - Sets up DDL trigger
+
+### Changed (pgtwin-migrate v2.0.0 EXPERIMENTAL)
+- **Parameter Changes**:
+  - `production_cluster` (NEW) - Which cluster should be production
+  - `finalize_replication` (NEW) - When true, stop cleans up all replication infrastructure
+  - `stability_timeout` (NEW) - Seconds to wait for cluster stability before cutover
+  - `cutover_ready` (REMOVED) - Replaced by `production_cluster`
+- Version bumped to 2.0.0 due to breaking parameter changes
+
+### Changed (pgtwin v1.7.3)
+- Version bump for release coordination (no functional changes from v1.7.2)
+- For v1.7.2 changes (FQDN hostname mismatch bugfix), see RELEASE_v1.7.2.md
+
+### Documentation
+- **NEW**: `releasenotes/RELEASE_v1.7.3.md` - Complete release notes
+- **NEW**: `README-pgtwin-migrate-setup.md` - Setup wizard documentation (planned)
+- **UPDATED**: `CHANGELOG.md` - This entry
+
+### Migration
+- **pgtwin**: No changes required from v1.7.2
+- **pgtwin-migrate v1.x → v2.0**:
+  1. Complete any in-progress migrations
+  2. Stop and delete old migration resource
+  3. Deploy pgtwin-migrate v2.0
+  4. Use pgtwin-migrate-setup to generate new configuration
+  5. Test with non-production data first
+- **WARNING**: pgtwin-migrate v2.0 parameter changes are breaking - requires reconfiguration
+
+### Known Limitations (pgtwin-migrate v2.0)
+- `max_logical_replication_workers` limit - PostgreSQL default is 4 workers, increase for many databases
+- Initial sync for new databases uses `copy_data=true` (database must exist on subscriber)
+- Complex schema changes during migration may need manual coordination
+
+---
+
 ## [1.7.1] - 2026-01-05
 
 ### Added

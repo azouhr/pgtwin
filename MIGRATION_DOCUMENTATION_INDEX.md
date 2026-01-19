@@ -1,8 +1,26 @@
 # PostgreSQL Migration Documentation - Complete Index
 
-**Last Updated**: 2025-12-27
-**Status**: PRODUCTION READY
-**Total Documentation**: 6 files, 107KB
+**Last Updated**: 2026-01-19
+**Status**: pgtwin-migrate v2.0.0 EXPERIMENTAL
+**Total Documentation**: 7+ files
+
+---
+
+## What's New in v2.0.0
+
+**pgtwin-migrate v2.0.0** is a major redesign with bidirectional failover capability:
+
+- **`production_cluster` parameter** - Replaces `cutover_ready`. Change this to switch production between clusters.
+- **Dynamic database discovery** - No explicit `databases` parameter needed. Databases discovered at runtime.
+- **Direction-aware start function** - Correctly handles both forward and reverse directions.
+- **New database auto-setup** - Monitor detects databases without replication and sets them up automatically.
+
+**pgtwin-migrate-setup v1.0.0** - NEW interactive setup wizard:
+- Guided configuration collection
+- Configuration file generation (`.conf` files)
+- CRM snippet generation (ready-to-use Pacemaker configuration)
+
+> **WARNING**: pgtwin-migrate v2.0.0 is EXPERIMENTAL. Test thoroughly before production use.
 
 ---
 
@@ -11,12 +29,20 @@
 ### For Administrators Planning Migration
 ➡️ **START HERE**: [MIGRATION_PLANNING_WORKSHEET.md](MIGRATION_PLANNING_WORKSHEET.md)
 
+### For Quick Setup (NEW)
+➡️ **RECOMMENDED**: Run `pgtwin-migrate-setup` for interactive configuration
+
 ### For Implementation
 1. [ADMIN_PREPARATION_PGTWIN_MIGRATE.md](ADMIN_PREPARATION_PGTWIN_MIGRATE.md)
 2. [MIGRATION_SETUP_COMPLETE.md](MIGRATION_SETUP_COMPLETE.md)
 
-### For Production Cutover
-➡️ **CRITICAL**: [MIGRATION_CUTOVER_PROCEDURE.md](MIGRATION_CUTOVER_PROCEDURE.md)
+### For Production Cutover (v2.0 Method)
+```bash
+# Change production_cluster to trigger cutover
+crm_resource --resource migration-forward \
+  --set-parameter production_cluster \
+  --parameter-value postgres-clone-18
+```
 
 ### For Post-Migration
 ➡️ [POST_MIGRATION_CLEANUP.md](POST_MIGRATION_CLEANUP.md)
@@ -25,7 +51,7 @@
 ➡️ [CUTOVER_CLEANUP_COMPLETE.md](CUTOVER_CLEANUP_COMPLETE.md) - Complete record of production cutover
 
 ### Design Documents
-➡️ [DESIGN_PGTWIN_MIGRATE_CUTOVER_AUTOMATION.md](DESIGN_PGTWIN_MIGRATE_CUTOVER_AUTOMATION.md) - Cutover automation design (future v2.0)
+➡️ [DESIGN_PGTWIN_MIGRATE_CUTOVER_AUTOMATION.md](DESIGN_PGTWIN_MIGRATE_CUTOVER_AUTOMATION.md) - Cutover automation design
 
 ---
 
@@ -165,7 +191,7 @@
 
 ---
 
-## Migration Workflow
+## Migration Workflow (v2.0)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -176,38 +202,53 @@
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STEP 1: SETUP (2-4 hours)                                      │
+│ STEP 1: SETUP (30 minutes - 2 hours)                    🆕     │
 ├─────────────────────────────────────────────────────────────────┤
-│ Document: ADMIN_PREPARATION_PGTWIN_MIGRATE.md                  │
-│ Configure clusters, deploy agent, test replication             │
+│ Tool: pgtwin-migrate-setup (interactive wizard)                │
+│ Generates: migration-forward.conf, migration-forward.crm       │
+│ Then: crm configure load update migration-forward.crm          │
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STEP 2: DATA MIGRATION (days to weeks)                         │
+│ STEP 2: START MIGRATION                                        │
 ├─────────────────────────────────────────────────────────────────┤
-│ Reference: MIGRATION_SETUP_COMPLETE.md                         │
+│ Command: crm resource start migration-forward                  │
+│ Databases discovered automatically (v2.0)                      │
+│ Replication set up for all discovered databases                │
+└─────────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ STEP 3: DATA SYNC (days to weeks)                              │
+├─────────────────────────────────────────────────────────────────┤
+│ Monitor: crm_attribute -G -n migration-state -q                │
+│ New databases detected and synced automatically (v2.0)         │
 │ Monitor replication, verify consistency, test apps             │
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STEP 3: PRODUCTION CUTOVER (5-15 minutes)              ⭐      │
+│ STEP 4: CUTOVER (seconds)                               ⭐ 🆕  │
 ├─────────────────────────────────────────────────────────────────┤
-│ Document: MIGRATION_CUTOVER_PROCEDURE.md                       │
-│ Move application VIP to PG18, verify applications              │
+│ Command: crm_resource --resource migration-forward \           │
+│          --set-parameter production_cluster \                  │
+│          --parameter-value postgres-clone-18                   │
+│ Reverse replication starts automatically                       │
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STEP 4: STABILITY PERIOD (7-30 days)                           │
+│ STEP 5: STABILITY + OPTIONAL FAILBACK (7-30 days)              │
 ├─────────────────────────────────────────────────────────────────┤
-│ Reference: MIGRATION_SETUP_COMPLETE.md                         │
 │ Monitor PG18, keep PG17 as backup with reverse replication     │
+│ Can failback by changing production_cluster back (v2.0)        │
 └─────────────────────────────────────────────────────────────────┘
                             ↓
 ┌─────────────────────────────────────────────────────────────────┐
-│ STEP 5: CLEANUP (30-60 minutes)                                │
+│ STEP 6: FINALIZE (when confident)                              │
 ├─────────────────────────────────────────────────────────────────┤
-│ Document: POST_MIGRATION_CLEANUP.md                            │
-│ Remove migration resources, optionally decommission PG17       │
+│ Command: crm_resource --resource migration-forward \           │
+│          --set-parameter finalize_replication \                │
+│          --parameter-value true                                │
+│ Then: crm resource stop migration-forward                      │
+│ Document: POST_MIGRATION_CLEANUP.md for remaining cleanup      │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -333,10 +374,12 @@ ALTER SUBSCRIPTION pgtwin_migrate_forward_sub REFRESH PUBLICATION WITH (copy_dat
 
 | Document | Version | Last Updated | Status |
 |----------|---------|--------------|--------|
+| README-pgtwin-migrate.md | 2.0 | 2026-01-19 | v2.0 EXPERIMENTAL |
+| MIGRATION_DOCUMENTATION_INDEX.md | 2.0 | 2026-01-19 | Updated for v2.0 |
 | MIGRATION_PLANNING_WORKSHEET.md | 1.0 | 2025-12-27 | Current |
-| ADMIN_PREPARATION_PGTWIN_MIGRATE.md | 1.0 | 2025-12-27 | Current |
+| ADMIN_PREPARATION_PGTWIN_MIGRATE.md | 1.0 | 2025-12-27 | Partially superseded by pgtwin-migrate-setup |
 | MIGRATION_SETUP_COMPLETE.md | 1.0 | 2025-12-27 | Current |
-| MIGRATION_CUTOVER_PROCEDURE.md | 1.0 | 2025-12-27 | Current |
+| MIGRATION_CUTOVER_PROCEDURE.md | 1.0 | 2025-12-27 | Superseded by v2.0 cutover method |
 | POST_MIGRATION_CLEANUP.md | 1.0 | 2025-12-27 | Current |
 | CUTOVER_CLEANUP_COMPLETE.md | 1.0 | 2025-12-27 | Current |
 

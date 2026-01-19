@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.6.18
+# Version: 1.7.3
 # Release Date: 2025-12-28
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
@@ -34,7 +34,6 @@ export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:$PATH
 #   OCF_RESKEY_replication_failure_threshold - Number of consecutive monitor cycles with
 #                                               failed replication before triggering recovery (default: 5)
 #   OCF_RESKEY_vip              - Virtual IP address (used to discover promoted node)
-#   OCF_RESKEY_pg_bindir        - Directory containing PostgreSQL binaries (default: /usr/bin, bare-metal mode only)
 #   OCF_RESKEY_container_mode   - Enable container mode (true/false)
 #   OCF_RESKEY_container_name   - Container name for PostgreSQL instance
 #   OCF_RESKEY_container_image  - Container image to use (default: registry.opensuse.org/devel/bci/tumbleweed/containerfile/opensuse/postgres:17.6-158.5)
@@ -91,7 +90,6 @@ OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
 OCF_RESKEY_vip_default=""
-OCF_RESKEY_pg_bindir_default="/usr/bin"
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
 OCF_RESKEY_container_name_default="postgres-ha"
@@ -113,13 +111,14 @@ OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/c
 : ${OCF_RESKEY_pgpassfile=${OCF_RESKEY_pgpassfile_default}}
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
-: ${OCF_RESKEY_pg_bindir=${OCF_RESKEY_pg_bindir_default}}
 : ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
 : ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
 : ${OCF_RESKEY_container_name=${OCF_RESKEY_container_name_default}}
 : ${OCF_RESKEY_container_image=${OCF_RESKEY_container_image_default}}
 
 PGDATA="${OCF_RESKEY_pgdata}"
+# PostgreSQL binaries - use pg_bindir parameter with fallback to /usr/bin
+: ${OCF_RESKEY_pg_bindir:="/usr/bin"}
 PGCTL="${OCF_RESKEY_pg_bindir}/pg_ctl"
 PSQL="${OCF_RESKEY_pg_bindir}/psql"
 PG_REWIND="${OCF_RESKEY_pg_bindir}/pg_rewind"
@@ -328,27 +327,6 @@ If not specified, falls back to using node_list for promoted node discovery.
 <content type="string" default="${OCF_RESKEY_vip_default}" />
 </parameter>
 
-<parameter name="pg_bindir" unique="0">
-<longdesc lang="en">
-Directory containing PostgreSQL binaries (pg_ctl, psql, pg_rewind, pg_basebackup, postgres).
-This allows running multiple PostgreSQL versions on the same nodes by specifying different
-binary directories for each cluster.
-
-Examples:
-  /usr/bin                      = Default (system PostgreSQL)
-  /usr/lib/postgresql/17/bin    = PostgreSQL 17 (Debian/Ubuntu)
-  /usr/pgsql-17/bin             = PostgreSQL 17 (RHEL/CentOS)
-  /opt/postgresql/17/bin        = Custom installation
-
-Note: Only applies in bare-metal mode. Container mode ignores this parameter as
-binaries are provided by the container image.
-
-Default: /usr/bin
-</longdesc>
-<shortdesc lang="en">PostgreSQL binary directory</shortdesc>
-<content type="string" default="${OCF_RESKEY_pg_bindir_default}" />
-</parameter>
-
 <parameter name="container_mode" unique="0">
 <longdesc lang="en">
 Enable container mode for PostgreSQL. When true, PostgreSQL runs in a Podman container
@@ -546,7 +524,7 @@ get_safe_synchronous_standby_names() {
 
     if [ -z "$connected_standbys" ]; then
         ocf_log warn "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-        ocf_log warn "┃ WARNING: No standbys currently connected to PostgreSQL     ┃"
+        ocf_log warn "┃ WARNING: No standbys currently connected to PostgreSQL      ┃"
         ocf_log warn "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         ocf_log warn "Expected standbys from cluster: $expected_standbys"
         ocf_log warn "Using synchronous_standby_names='*' to allow connections"
@@ -560,25 +538,30 @@ get_safe_synchronous_standby_names() {
     local pending_standbys=""
 
     for expected in $expected_standbys; do
+        # Strip domain from expected (FQDN -> hostname) for comparison
+        # Example: "psql1.example.com" -> "psql1"
+        local expected_short="${expected%%.*}"
+
         # Check if this expected standby is actually connected and streaming
-        if echo "$connected_standbys" | grep -q "^${expected}$"; then
+        # Compare using short hostname since PostgreSQL application_name uses hostname not FQDN
+        if echo "$connected_standbys" | grep -q "^${expected_short}$"; then
             if [ -z "$safe_standbys" ]; then
-                safe_standbys="$expected"
+                safe_standbys="$expected_short"
             else
-                safe_standbys="${safe_standbys}, ${expected}"
+                safe_standbys="${safe_standbys}, ${expected_short}"
             fi
         else
             if [ -z "$pending_standbys" ]; then
-                pending_standbys="$expected"
+                pending_standbys="$expected_short"
             else
-                pending_standbys="$pending_standbys, $expected"
+                pending_standbys="$pending_standbys, $expected_short"
             fi
         fi
     done
 
     if [ -z "$safe_standbys" ]; then
         ocf_log warn "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-        ocf_log warn "┃ WARNING: Cluster has Unpromoted nodes but none connected   ┃"
+        ocf_log warn "┃ WARNING: Cluster has Unpromoted nodes but none connected    ┃"
         ocf_log warn "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
         ocf_log warn "Expected from cluster: $expected_standbys"
         ocf_log warn "Connected to PostgreSQL: $connected_standbys"
@@ -896,8 +879,11 @@ parse_pgpass() {
         # This prevents cross-cluster replication when multiple PostgreSQL clusters run on same nodes
         if [ -n "${OCF_RESKEY_node_list}" ]; then
             local in_node_list=false
+            # Strip domain for comparison (handles FQDN vs hostname mismatch)
+            local entry_host_short="${entry_host%%.*}"
             for node in ${OCF_RESKEY_node_list}; do
-                if [ "$entry_host" = "$node" ]; then
+                local node_short="${node%%.*}"
+                if [ "$entry_host_short" = "$node_short" ]; then
                     in_node_list=true
                     break
                 fi
@@ -1511,6 +1497,30 @@ resolve_cluster_node_to_hostname() {
     return 1
 }
 
+get_pg_config_value() {
+    # Get PostgreSQL configuration value using postgres -C
+    # This works with any config file structure (postgresql.conf, includes, custom files, etc.)
+    # Usage: get_pg_config_value <parameter_name>
+    # Returns: configuration value (empty string if not set or on error)
+
+    local param_name="$1"
+    local config_value=""
+
+    # Use postgres -C to query configuration (works in both bare-metal and container mode)
+    if [ "${OCF_RESKEY_container_mode}" = "true" ] || [ "${OCF_RESKEY_container_mode}" = "yes" ]; then
+        # Container mode: run postgres -C inside container
+        config_value=$(container_exec_as_postgres "$POSTGRES" -C "$param_name" -D "${PGDATA}" 2>/dev/null)
+    else
+        # Bare-metal mode: run postgres -C directly
+        config_value=$(run_as_pguser "$POSTGRES" -C "$param_name" -D "${PGDATA}" 2>/dev/null)
+    fi
+
+    # Clean up the value (trim whitespace, remove quotes)
+    config_value=$(echo "$config_value" | tr -d "' \"" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+    echo "$config_value"
+}
+
 discover_promoted_node() {
     # Discover which node is currently promoted (primary)
     # Try multiple methods in order of reliability
@@ -1948,7 +1958,17 @@ validate_pg_version() {
             else
                 ocf_log info "Container library not available (container mode is experimental)"
                 # Fallback: try to get version from binary directly
-                local version_output=$("${POSTGRES}" --version 2>/dev/null)
+                local pg_binary="${OCF_RESKEY_pg_bindir}/postgres"
+                if [ ! -x "$pg_binary" ]; then
+                    # Try fallback locations
+                    for fallback in /usr/bin/postgres /usr/pgsql-*/bin/postgres; do
+                        if [ -x "$fallback" ]; then
+                            pg_binary="$fallback"
+                            break
+                        fi
+                    done
+                fi
+                local version_output=$($pg_binary --version 2>/dev/null)
                 expected_version=$(echo "$version_output" | grep -oP '\d+' | head -n 1)
             fi
         fi
@@ -2233,6 +2253,53 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
         fi
     else
         ocf_log info "Starting PostgreSQL as primary"
+
+        # Single-node startup safety check (v1.6.14+)
+        # Detect if we're starting alone with sync replication configured
+        # This indicates a potential double-failure scenario where wrong node may be promoting
+        if command -v crm_node >/dev/null 2>&1; then
+            local node_count=$(crm_node -l 2>/dev/null | grep -c member)
+
+            if [ "$node_count" -eq 1 ]; then
+                # We're the only node in cluster - check sync configuration
+                # Use postgres -C to query config (works with any config file structure)
+                local sync_standby=$(get_pg_config_value "synchronous_standby_names")
+
+                if [ -n "$sync_standby" ]; then
+                    # Sync replication is configured but we're alone - DANGER!
+                    ocf_log err "⚠️  SINGLE-NODE STARTUP WITH SYNC REPLICATION CONFIGURED ⚠️"
+                    ocf_log err "⚠️  synchronous_standby_names='${sync_standby}'"
+                    ocf_log err ""
+                    ocf_log err "This configuration suggests one of these scenarios:"
+                    ocf_log err "  1. Both nodes crashed (double failure)"
+                    ocf_log err "  2. This node crashed first (other node may have newer data)"
+                    ocf_log err "  3. This node is stale (other node was promoted and disabled sync)"
+                    ocf_log err ""
+                    ocf_log err "If this node was the primary when other node failed, pgtwin notify support"
+                    ocf_log err "would have automatically disabled sync replication. Since sync is still"
+                    ocf_log err "enabled, this node was likely NOT handling the failure."
+                    ocf_log err ""
+                    ocf_log err "REFUSING to start as primary - other node may have newer data!"
+                    ocf_log err ""
+                    ocf_log err "Recovery options:"
+                    ocf_log err "  1. WAIT for other node to join cluster (RECOMMENDED)"
+                    ocf_log err "  2. Check timelines on both nodes:"
+                    ocf_log err "     pg_controldata ${PGDATA} | grep timeline"
+                    ocf_log err "  3. If confirmed this node has latest timeline, manually override:"
+                    ocf_log err "     - Stop cluster: crm configure property maintenance-mode=true"
+                    ocf_log err "     - Start PostgreSQL manually, then: ALTER SYSTEM SET synchronous_standby_names = '';"
+                    ocf_log err "     - Reload config: pg_ctl reload"
+                    ocf_log err "     - Restart cluster: crm configure property maintenance-mode=false"
+                    ocf_log err ""
+                    return $OCF_ERR_CONFIGURED
+                else
+                    # Sync disabled (async mode) - SAFE to promote
+                    ocf_log info "✓ Single-node startup with async replication (sync disabled)"
+                    ocf_log info "✓ This is expected after standby failure (pgtwin notify support)"
+                    ocf_log info "✓ Safe to start as primary"
+                fi
+            fi
+        fi
     fi
 
     # Start PostgreSQL
@@ -2366,6 +2433,46 @@ check_promotion_safety() {
     # If already primary, always safe
     if pgsql_is_promoted; then
         return 0
+    fi
+
+    # SAFETY CHECK v1.6.14: Single-node promotion guard
+    # If we're alone in the cluster with sync replication configured,
+    # this indicates a double-failure scenario where we should NOT promote
+    if command -v crm_node >/dev/null 2>&1; then
+        local node_count=$(crm_node -l 2>/dev/null | grep -c member)
+
+        if [ "$node_count" -eq 1 ]; then
+            # We're alone - check if sync replication is configured
+            # Use postgres -C to query config (works with any config file structure)
+            local sync_standby=$(get_pg_config_value "synchronous_standby_names")
+
+            if [ -n "$sync_standby" ]; then
+                # Sync replication configured but we're alone - likely double failure
+                ocf_log err "⚠️  REFUSING PROMOTION: Single node with sync replication ⚠️"
+                ocf_log err "synchronous_standby_names='${sync_standby}'"
+                ocf_log err ""
+                ocf_log err "This suggests a double-failure scenario where:"
+                ocf_log err "  - Both nodes crashed"
+                ocf_log err "  - This node (former standby) booted first"
+                ocf_log err "  - Other node (former primary) may have newer data"
+                ocf_log err ""
+                ocf_log err "If this node was the primary when standby failed, pgtwin"
+                ocf_log err "would have disabled sync replication. Since sync is still"
+                ocf_log err "enabled, this was likely the STANDBY node."
+                ocf_log err ""
+                ocf_log err "REFUSING promotion to prevent data loss!"
+                ocf_log err ""
+                ocf_log err "Recovery options:"
+                ocf_log err "  1. WAIT for other node (former primary) to join (RECOMMENDED)"
+                ocf_log err "  2. Check timelines on both nodes to confirm which has latest data"
+                ocf_log err "  3. Only if confirmed this node has latest data:"
+                ocf_log err "     - Stop cluster: crm configure property maintenance-mode=true"
+                ocf_log err "     - Remove: rm ${PGDATA}/standby.signal"
+                ocf_log err "     - Disable sync and restart cluster"
+                ocf_log err ""
+                return 1
+            fi
+        fi
     fi
 
     # Check if we're in sync mode
@@ -3080,39 +3187,62 @@ EOF
         node_name=$(hostname)
     fi
 
-    # Start pg_basebackup in background
+    # Get UID/GID for background process (run_as_pguser function won't be available in subshell)
+    local pguid=$(id -u "${OCF_RESKEY_pguser}")
+    local pggid=$(id -g "${OCF_RESKEY_pguser}")
+
+    # Detect if tracing is enabled in parent shell
+    local trace_enabled="false"
+    case "$-" in
+        *x*) trace_enabled="true" ;;
+    esac
+
+    # Start pg_basebackup in background with nohup for SIGHUP protection
     # Note: PGPASSFILE env var doesn't work with runuser, but psql/pg_basebackup automatically use ~/.pgpass
-    (
-        run_as_pguser env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress > "${log_file}" 2>&1
-        local basebackup_rc=$?
-        echo ${basebackup_rc} > "${rc_file}"
+    # All output (including shell trace) goes to single log file
+    nohup sh -c "
+        # Enable tracing if parent agent had it enabled
+        if [ '${trace_enabled}' = 'true' ]; then
+            set -x
+            echo '=========================================='
+            echo 'DEBUG: Background process tracing enabled'
+            echo 'DEBUG: Process PID: \$\$'
+            echo '=========================================='
+        fi
+
+        setpriv --reuid=${pguid} --regid=${pggid} --clear-groups env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress
+        basebackup_rc=\$?
+        echo \${basebackup_rc} > '${rc_file}'
 
         # NEW v1.6.8: Trigger automatic cleanup after basebackup completion
         # This eliminates the 5 minute failure-timeout wait for small databases
         # If cleanup fails, the existing failure-timeout mechanism still applies
-        if [ ${basebackup_rc} -eq 0 ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Basebackup completed successfully, triggering resource cleanup" >> "${log_file}"
+        if [ \${basebackup_rc} -eq 0 ]; then
+            echo \"\$(date '+%Y-%m-%d %H:%M:%S') Basebackup completed successfully, triggering resource cleanup\"
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Basebackup failed with exit code ${basebackup_rc}, triggering resource cleanup" >> "${log_file}"
+            echo \"\$(date '+%Y-%m-%d %H:%M:%S') Basebackup failed with exit code \${basebackup_rc}, triggering resource cleanup\"
         fi
 
         # Trigger cleanup to allow immediate restart (instead of waiting 5 minutes)
         # Use full path to ensure command is found, and suppress errors if cleanup fails
-        /usr/sbin/crm_resource --resource "${OCF_RESOURCE_INSTANCE}" --node "${node_name}" --cleanup >> "${log_file}" 2>&1
-        local cleanup_rc=$?
+        /usr/sbin/crm_resource --resource '${OCF_RESOURCE_INSTANCE}' --node '${node_name}' --cleanup
+        cleanup_rc=\$?
 
-        if [ ${cleanup_rc} -eq 0 ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup triggered successfully" >> "${log_file}"
+        if [ \${cleanup_rc} -eq 0 ]; then
+            echo \"\$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup triggered successfully\"
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup failed (rc=${cleanup_rc}), relying on failure-timeout" >> "${log_file}"
+            echo \"\$(date '+%Y-%m-%d %H:%M:%S') Resource cleanup failed (rc=\${cleanup_rc}), relying on failure-timeout\"
         fi
-    ) &
+    " >> "${log_file}" 2>&1 &
 
     local bg_pid=$!
     echo "pid=${bg_pid}" >> "${pid_file}"
 
-    ocf_log info "pg_basebackup started in background with PID ${bg_pid}, log: ${log_file}"
+    ocf_log info "pg_basebackup started in background with PID ${bg_pid} (SIGHUP protected via nohup)"
     ocf_log info "Automatic cleanup will be triggered when basebackup completes (new in v1.6.8)"
+    if [ "${trace_enabled}" = "true" ]; then
+        ocf_log info "Background process tracing enabled - see ${log_file} for detailed execution"
+    fi
 
     # Return success for now, monitor will check progress
     return $OCF_SUCCESS

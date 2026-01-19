@@ -1,0 +1,1389 @@
+#!/bin/bash
+#
+# pgtwin-migrate-setup - Interactive setup wizard for pgtwin-migrate
+# Version: 1.0.0
+# Release Date: 2026-01-08
+#
+# This script helps administrators interactively configure pgtwin-migrate
+# by collecting all necessary parameters and generating:
+#   1. A configuration file (sourceable shell script)
+#   2. A Pacemaker CRM configuration snippet
+#
+# Usage:
+#   ./pgtwin-migrate-setup [--config FILE]
+#
+# Options:
+#   --config FILE    Load default values from configuration file
+#
+# Author: pgtwin project
+# License: GPL-2.0-or-later
+
+set -e
+set -u
+
+#######################################################################
+# Configuration
+#######################################################################
+
+SCRIPT_NAME="pgtwin-migrate-setup"
+VERSION="1.0.0"
+CONFIG_FILE=""
+OUTPUT_CONFIG=""
+OUTPUT_CRM=""
+CONFIG_FILE_LOADED="false"
+
+#######################################################################
+# Color Output (if supported)
+#######################################################################
+
+if [ -t 1 ]; then
+    BOLD="\033[1m"
+    RED="\033[31m"
+    GREEN="\033[32m"
+    YELLOW="\033[33m"
+    BLUE="\033[34m"
+    CYAN="\033[36m"
+    RESET="\033[0m"
+else
+    BOLD=""
+    RED=""
+    GREEN=""
+    YELLOW=""
+    BLUE=""
+    CYAN=""
+    RESET=""
+fi
+
+#######################################################################
+# Default Values
+#######################################################################
+
+# Required parameters (auto-discovered if running on cluster node)
+SOURCE_CLUSTER=${SOURCE_CLUSTER:-postgres-clone}
+TARGET_CLUSTER=${TARGET_CLUSTER:-postgres-clone-18}
+SOURCE_REPLICATION_VIP=""
+TARGET_REPLICATION_VIP=""
+
+# VIP resources (optional but recommended, auto-discovered)
+PRODUCTION_VIP_RESOURCE="postgres-vip"
+TARGET_VIP_RESOURCE="postgres-vip-18"
+ORIGINAL_PRODUCTION_VIP_IP=""  # Original IP of production VIP (for rollback)
+ORIGINAL_TARGET_VIP_IP=""  # Original IP of target VIP (for rollback)
+
+# Database configuration (databases auto-discovered from source cluster)
+DATABASES=""  # Comma-separated list (new parameter)
+PGDATABASE="postgres"  # Legacy single database parameter
+PGPORT="5432"
+MIGRATION_DBUSER="pgmigrate"
+
+# Logical replication settings (optional - use defaults if empty)
+PUBLICATION_NAME=""
+SUBSCRIPTION_NAME=""
+REPLICATION_SLOT_NAME=""
+REVERSE_PUBLICATION_NAME=""
+REVERSE_SUBSCRIPTION_NAME=""
+REVERSE_REPLICATION_SLOT_NAME=""
+
+# Monitoring settings
+LAG_THRESHOLD="1024"  # 1KB in bytes
+
+# PostgreSQL environment (optional - auto-discovered)
+SOURCE_PGHOME=""
+TARGET_PGHOME=""
+SOURCE_PGPASSFILE=""
+TARGET_PGPASSFILE=""
+
+# Advanced settings
+SOURCE_NODE_ROLE="Promoted"
+CUTOVER_READY="false"
+CUTOVER_DEBUG="false"
+
+# Output file defaults
+RESOURCE_NAME="migration-forward"
+
+#######################################################################
+# Helper Functions
+#######################################################################
+
+print_banner() {
+    echo -e "${BOLD}${BLUE}"
+    echo "╔════════════════════════════════════════════════════════════════════════╗"
+    echo "║                                                                        ║"
+    echo "║              pgtwin-migrate Interactive Setup Wizard                   ║"
+    echo "║                         Version ${VERSION}                                  ║"
+    echo "║                                                                        ║"
+    echo "╚════════════════════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+print_section() {
+    local title="$1"
+    echo ""
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+    echo -e "${BOLD}${CYAN}  ${title}${RESET}"
+    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
+}
+
+print_info() {
+    echo -e "${BLUE}ℹ${RESET}  $*"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${RESET}  $*"
+}
+
+print_warning() {
+    echo -e "${YELLOW}⚠${RESET}  $*"
+}
+
+print_error() {
+    echo -e "${RED}✗${RESET}  $*"
+}
+
+prompt_input() {
+    local prompt="$1"
+    local default="$2"
+    local value=""
+
+    if [ -n "$default" ]; then
+        echo -ne "${BOLD}${prompt}${RESET} [${GREEN}${default}${RESET}]: " >&2
+    else
+        echo -ne "${BOLD}${prompt}${RESET}: " >&2
+    fi
+
+    read -r value
+
+    if [ -z "$value" ]; then
+        echo "$default"
+    else
+        echo "$value"
+    fi
+}
+
+prompt_yesno() {
+    local prompt="$1"
+    local default="$2"
+    local value=""
+
+    if [ "$default" = "y" ]; then
+        echo -ne "${BOLD}${prompt}${RESET} [${GREEN}Y${RESET}/n]: " >&2
+    else
+        echo -ne "${BOLD}${prompt}${RESET} [y/${GREEN}N${RESET}]: " >&2
+    fi
+
+    read -r value
+
+    # Convert to lowercase
+    value=$(echo "$value" | tr '[:upper:]' '[:lower:]')
+
+    if [ -z "$value" ]; then
+        echo "$default"
+    elif [ "$value" = "y" ] || [ "$value" = "yes" ]; then
+        echo "y"
+    else
+        echo "n"
+    fi
+}
+
+explain() {
+    echo -e "${CYAN}└─${RESET} $*"
+}
+
+#######################################################################
+# Helper Function - Run Commands as postgres User
+#######################################################################
+
+run_as_postgres_user() {
+    # Run command as postgres Unix system user with proper environment
+    # Usage: run_as_postgres_user psql -h host ...
+    # Note: Always runs as 'postgres' Unix system user
+
+    local pgpass_file="$1"
+    shift  # Remove pgpass_file from arguments
+
+    # Always use 'postgres' system user
+    local system_user="postgres"
+    local pguid=$(id -u "$system_user" 2>/dev/null) || {
+        print_error "Cannot determine UID for system user: $system_user"
+        return 1
+    }
+    local pggid=$(id -g "$system_user" 2>/dev/null) || {
+        print_error "Cannot determine GID for system user: $system_user"
+        return 1
+    }
+
+    # Determine HOME directory for postgres user
+    local pghome=$(getent passwd "$system_user" | cut -d: -f6)
+    if [ -z "$pghome" ]; then
+        pghome="/var/lib/pgsql"
+    fi
+
+    # Set HOME and PGPASSFILE environment variables
+    # Use env to set variables within setpriv context
+    setpriv --reuid="$pguid" --regid="$pggid" --clear-groups \
+        env HOME="$pghome" PGPASSFILE="$pgpass_file" "$@"
+}
+
+#######################################################################
+# Cluster Discovery Functions
+#######################################################################
+
+get_pgtwin_resources() {
+    # Get list of pgtwin clone resources from Pacemaker using XML
+    # This is more robust than grep/awk parsing
+    crm configure show xml 2>/dev/null | \
+        xmllint --xpath '//clone[primitive/@type="pgtwin"]/@id' - 2>/dev/null | \
+        sed 's/id="\([^"]*\)"/\1\n/g' | \
+        grep -v "^$" | xargs || true
+}
+
+get_vip_resources() {
+    # Get list of IPaddr2 VIP resources from Pacemaker using XML
+    crm configure show xml 2>/dev/null | \
+        xmllint --xpath '//primitive[@type="IPaddr2"]/@id' - 2>/dev/null | \
+        sed 's/id="\([^"]*\)"/\1\n/g' | \
+        grep -v "^$" | xargs || true
+}
+
+get_vip_address() {
+    # Get the IP address assigned to a VIP resource
+    # Usage: get_vip_address "postgres-vip"
+    local vip_resource="$1"
+
+    if [ -z "$vip_resource" ]; then
+        return 1
+    fi
+
+    # Query the IP parameter from the VIP resource configuration
+    crm configure show "$vip_resource" 2>/dev/null | \
+        grep -E "^\s*params.*ip=" | \
+        sed -E 's/.*ip=([0-9.]+).*/\1/' | \
+        head -1
+}
+
+get_vip_resource_by_ip() {
+    # Find which VIP resource has the given IP address
+    # Usage: get_vip_resource_by_ip "192.168.60.104"
+    local target_ip="$1"
+
+    if [ -z "$target_ip" ]; then
+        return 1
+    fi
+
+    # Get all VIP resources and check their IP addresses
+    local vip_resources=($(get_vip_resources))
+    for vip in "${vip_resources[@]}"; do
+        local vip_ip=$(get_vip_address "$vip")
+        if [ "$vip_ip" = "$target_ip" ]; then
+            echo "$vip"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+detect_pgpass_file() {
+    # Detect .pgpass file location
+    # Check in order: PGPASSFILE env var, ~/.pgpass, /var/lib/pgsql/.pgpass
+    if [ -n "${PGPASSFILE:-}" ] && [ -f "$PGPASSFILE" ]; then
+        echo "$PGPASSFILE"
+        return 0
+    fi
+
+    if [ -f "$HOME/.pgpass" ]; then
+        echo "$HOME/.pgpass"
+        return 0
+    fi
+
+    if [ -f "/var/lib/pgsql/.pgpass" ]; then
+        echo "/var/lib/pgsql/.pgpass"
+        return 0
+    fi
+
+    return 1
+}
+
+get_databases_from_cluster() {
+    local vip="$1"
+    local port="$2"
+    local user="$3"
+    local pgpass_file="$4"
+
+    # Query PostgreSQL for user databases (exclude system databases)
+    # Uses .pgpass for authentication (no password prompt)
+    # Run as postgres user with proper environment
+    if [ -n "$pgpass_file" ]; then
+        run_as_postgres_user "$pgpass_file" psql -h "$vip" -p "$port" -U "$user" -d postgres -Atc "
+            SELECT datname FROM pg_database
+            WHERE NOT datistemplate
+            AND datname NOT IN ('template0', 'template1')
+            ORDER BY datname
+        " 2>/dev/null || true
+    else
+        # No .pgpass file, will fail but that's expected
+        return 1
+    fi
+}
+
+get_pg_version() {
+    local vip="$1"
+    local port="$2"
+    local user="$3"
+    local pgpass_file="$4"
+
+    # Get PostgreSQL major version
+    # Run as postgres user with proper environment
+    if [ -n "$pgpass_file" ]; then
+        run_as_postgres_user "$pgpass_file" psql -h "$vip" -p "$port" -U "$user" -d postgres -Atc "SHOW server_version" 2>/dev/null | \
+            grep -oE '^[0-9]+' || true
+    else
+        # No .pgpass file, will fail but that's expected
+        return 1
+    fi
+}
+
+check_cluster_health() {
+    local cluster="$1"
+    local label="$2"
+
+    print_info "Checking $label health..."
+
+    # Get cluster status
+    local status
+    status=$(crm resource status "$cluster" 2>&1)
+    local rc=$?
+
+    if [ $rc -ne 0 ] || [ -z "$status" ]; then
+        print_error "Cluster resource '$cluster' not found or not accessible"
+        print_warning "Make sure the cluster is running and resource exists"
+        return 1
+    fi
+
+    # Check if promoted and running
+    if echo "$status" | grep -qE "(Promoted|Master|Started)"; then
+        print_success "$label is healthy (resource running)"
+        return 0
+    else
+        print_error "$label is not healthy"
+        echo "  Status: $status" >&2
+        return 1
+    fi
+}
+
+prompt_from_list() {
+    local prompt="$1"
+    local default="$2"
+    shift 2
+    local items=("$@")
+
+    if [ ${#items[@]} -eq 0 ]; then
+        # No items found, fallback to manual input
+        prompt_input "$prompt" "$default"
+        return
+    fi
+
+    # Display numbered list
+    echo "" >&2
+    echo -e "${CYAN}Available options:${RESET}" >&2
+    for i in "${!items[@]}"; do
+        local num=$((i + 1))
+        if [ "${items[$i]}" = "$default" ]; then
+            echo -e "  ${GREEN}$num)${RESET} ${items[$i]} ${CYAN}(current default)${RESET}" >&2
+        else
+            echo "  $num) ${items[$i]}" >&2
+        fi
+    done
+    echo "" >&2
+
+    # Prompt for selection
+    local selection
+    if [ -n "$default" ]; then
+        echo -ne "${BOLD}${prompt}${RESET} [${GREEN}${default}${RESET}] (number or name): " >&2
+    else
+        echo -ne "${BOLD}${prompt}${RESET} (number or name): " >&2
+    fi
+
+    read -r selection
+
+    # If empty, use default
+    if [ -z "$selection" ]; then
+        echo "$default"
+        return
+    fi
+
+    # Check if it's a number
+    if [[ "$selection" =~ ^[0-9]+$ ]]; then
+        local idx=$((selection - 1))
+        if [ $idx -ge 0 ] && [ $idx -lt ${#items[@]} ]; then
+            echo "${items[$idx]}"
+            return
+        else
+            print_error "Invalid selection: $selection" >&2
+            echo "$default"
+            return
+        fi
+    fi
+
+    # Otherwise, use as literal value
+    echo "$selection"
+}
+
+load_config_file() {
+    local file="$1"
+
+    if [ ! -f "$file" ]; then
+        print_warning "Configuration file not found: $file"
+        print_info "Continuing with interactive setup (using defaults)..."
+        return 0  # Don't exit, continue with defaults
+    fi
+
+    print_info "Loading configuration from: $file"
+
+    # Source the file to load variables
+    # shellcheck disable=SC1090
+    source "$file"
+
+    print_success "Configuration loaded successfully"
+
+    # Set flag to indicate config was loaded
+    CONFIG_FILE_LOADED="true"
+}
+
+validate_ip() {
+    local ip="$1"
+
+    # Basic IPv4 validation
+    if [[ $ip =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+validate_port() {
+    local port="$1"
+
+    if [[ $port =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
+validate_number() {
+    local num="$1"
+
+    if [[ $num =~ ^[0-9]+$ ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+#######################################################################
+# Interactive Prompts
+#######################################################################
+
+prompt_required_parameters() {
+    print_section "Required Parameters"
+
+    # Source cluster
+    echo ""
+    print_info "Source Cluster Configuration"
+    explain "The source cluster is your current PostgreSQL cluster (e.g., PG17)"
+    explain "This is the Pacemaker clone resource name"
+
+    # Discover pgtwin resources
+    local pgtwin_resources=($(get_pgtwin_resources))
+    if [ ${#pgtwin_resources[@]} -gt 0 ]; then
+        print_info "Discovered ${#pgtwin_resources[@]} pgtwin resource(s) in cluster"
+        SOURCE_CLUSTER=$(prompt_from_list "Source cluster name" "$SOURCE_CLUSTER" "${pgtwin_resources[@]}")
+    else
+        print_warning "No pgtwin resources found in cluster (using manual input)"
+        SOURCE_CLUSTER=$(prompt_input "Source cluster name" "$SOURCE_CLUSTER")
+    fi
+
+    echo ""
+    explain "VIP for replication connectivity to source cluster"
+    explain "This VIP is used to connect to the source for data replication"
+    explain "Example: 192.168.60.104"
+    SOURCE_REPLICATION_VIP=$(prompt_input "Source replication VIP address" "$SOURCE_REPLICATION_VIP")
+    while [ -n "$SOURCE_REPLICATION_VIP" ] && ! validate_ip "$SOURCE_REPLICATION_VIP"; do
+        print_error "Invalid IP address format"
+        SOURCE_REPLICATION_VIP=$(prompt_input "Source replication VIP address" "")
+    done
+
+    # Target cluster
+    echo ""
+    print_info "Target Cluster Configuration"
+    explain "The target cluster is your new PostgreSQL cluster (e.g., PG18)"
+    explain "This is the Pacemaker clone resource name"
+
+    # Use same discovery for target
+    if [ ${#pgtwin_resources[@]} -gt 0 ]; then
+        TARGET_CLUSTER=$(prompt_from_list "Target cluster name" "$TARGET_CLUSTER" "${pgtwin_resources[@]}")
+    else
+        TARGET_CLUSTER=$(prompt_input "Target cluster name" "$TARGET_CLUSTER")
+    fi
+
+    echo ""
+    explain "VIP for replication connectivity to target cluster"
+    explain "This VIP is used for reverse replication back to source"
+    explain "Example: 192.168.60.105"
+    TARGET_REPLICATION_VIP=$(prompt_input "Target replication VIP address" "$TARGET_REPLICATION_VIP")
+    while [ -n "$TARGET_REPLICATION_VIP" ] && ! validate_ip "$TARGET_REPLICATION_VIP"; do
+        print_error "Invalid IP address format"
+        TARGET_REPLICATION_VIP=$(prompt_input "Target replication VIP address" "")
+    done
+}
+
+prompt_vip_resources() {
+    print_section "VIP Resource Configuration"
+
+    # Discover VIP resources
+    local vip_resources=($(get_vip_resources))
+
+    echo ""
+    print_info "Production VIP Resource"
+    explain "The production VIP that serves client connections"
+    explain "This VIP will be migrated from source to target during cutover"
+    explain "Leave empty if you'll migrate VIP manually"
+
+    if [ ${#vip_resources[@]} -gt 0 ]; then
+        print_info "Discovered ${#vip_resources[@]} VIP resource(s) in cluster"
+        PRODUCTION_VIP_RESOURCE=$(prompt_from_list "Production VIP resource name" "$PRODUCTION_VIP_RESOURCE" "${vip_resources[@]}")
+    else
+        PRODUCTION_VIP_RESOURCE=$(prompt_input "Production VIP resource name" "$PRODUCTION_VIP_RESOURCE")
+    fi
+
+    echo ""
+    print_info "Target VIP Resource"
+    explain "The VIP resource for the target cluster"
+    explain "Leave empty if you'll manage VIP manually"
+
+    if [ ${#vip_resources[@]} -gt 0 ]; then
+        TARGET_VIP_RESOURCE=$(prompt_from_list "Target VIP resource name" "$TARGET_VIP_RESOURCE" "${vip_resources[@]}")
+    else
+        TARGET_VIP_RESOURCE=$(prompt_input "Target VIP resource name" "$TARGET_VIP_RESOURCE")
+    fi
+
+    # Prompt for original VIP IPs (required for safe rollback)
+    echo ""
+    print_info "Original VIP IP Addresses (for rollback safety)"
+    explain "These are the original IP addresses of the VIP resources BEFORE migration"
+    explain "If cutover fails, these IPs will be used to restore the original state"
+    explain "IMPORTANT: Enter the CURRENT/ORIGINAL IPs, not the swapped IPs"
+
+    # Auto-discover current IPs from VIP resources if available
+    local auto_prod_ip=""
+    local auto_target_ip=""
+    if [ -n "$PRODUCTION_VIP_RESOURCE" ]; then
+        auto_prod_ip=$(get_vip_address "$PRODUCTION_VIP_RESOURCE")
+        if [ -n "$auto_prod_ip" ]; then
+            print_success "Auto-discovered: ${PRODUCTION_VIP_RESOURCE} = ${auto_prod_ip}"
+            ORIGINAL_PRODUCTION_VIP_IP="$auto_prod_ip"
+        fi
+    fi
+    if [ -n "$TARGET_VIP_RESOURCE" ]; then
+        auto_target_ip=$(get_vip_address "$TARGET_VIP_RESOURCE")
+        if [ -n "$auto_target_ip" ]; then
+            print_success "Auto-discovered: ${TARGET_VIP_RESOURCE} = ${auto_target_ip}"
+            ORIGINAL_TARGET_VIP_IP="$auto_target_ip"
+        fi
+    fi
+
+    echo ""
+    ORIGINAL_PRODUCTION_VIP_IP=$(prompt_input "Original production VIP IP" "$ORIGINAL_PRODUCTION_VIP_IP")
+    while [ -n "$ORIGINAL_PRODUCTION_VIP_IP" ] && ! validate_ip "$ORIGINAL_PRODUCTION_VIP_IP"; do
+        print_error "Invalid IP address format"
+        ORIGINAL_PRODUCTION_VIP_IP=$(prompt_input "Original production VIP IP" "")
+    done
+
+    ORIGINAL_TARGET_VIP_IP=$(prompt_input "Original target VIP IP" "$ORIGINAL_TARGET_VIP_IP")
+    while [ -n "$ORIGINAL_TARGET_VIP_IP" ] && ! validate_ip "$ORIGINAL_TARGET_VIP_IP"; do
+        print_error "Invalid IP address format"
+        ORIGINAL_TARGET_VIP_IP=$(prompt_input "Original target VIP IP" "")
+    done
+
+    if [ -z "$ORIGINAL_PRODUCTION_VIP_IP" ] || [ -z "$ORIGINAL_TARGET_VIP_IP" ]; then
+        print_warning "Original VIP IPs not set - rollback will use toggle swap (less reliable)"
+    fi
+}
+
+prompt_database_configuration() {
+    print_section "Database Configuration"
+
+    # Detect .pgpass file early
+    local pgpass_file
+    pgpass_file=$(detect_pgpass_file)
+    if [ -n "$pgpass_file" ]; then
+        print_success "Detected .pgpass file: $pgpass_file"
+        if [ -z "$SOURCE_PGPASSFILE" ]; then
+            SOURCE_PGPASSFILE="$pgpass_file"
+        fi
+        if [ -z "$TARGET_PGPASSFILE" ]; then
+            TARGET_PGPASSFILE="$pgpass_file"
+        fi
+    else
+        print_warning "No .pgpass file found"
+        explain "Database discovery and migration require .pgpass for authentication"
+        explain "Expected locations: \$PGPASSFILE, ~/.pgpass, /var/lib/pgsql/.pgpass"
+    fi
+
+    # First get port and user (needed for database discovery)
+    echo ""
+    PGPORT=$(prompt_input "PostgreSQL port" "$PGPORT")
+    while ! validate_port "$PGPORT"; do
+        print_error "Invalid port number (must be 1-65535)"
+        PGPORT=$(prompt_input "PostgreSQL port" "5432")
+    done
+
+    echo ""
+    print_info "Migration Database User"
+    explain "PostgreSQL superuser for logical replication setup"
+    explain "Must exist on both clusters with REPLICATION privilege"
+    explain "Authenticated via .pgpass file (no password prompt)"
+    MIGRATION_DBUSER=$(prompt_input "Migration user" "$MIGRATION_DBUSER")
+
+    # Try to discover databases from source cluster
+    local discovered_dbs=()
+    if [ -n "$SOURCE_REPLICATION_VIP" ] && [ -n "$pgpass_file" ]; then
+        print_info "Discovering databases from source cluster..."
+        discovered_dbs=($(get_databases_from_cluster "$SOURCE_REPLICATION_VIP" "$PGPORT" "$MIGRATION_DBUSER" "$pgpass_file"))
+
+        if [ ${#discovered_dbs[@]} -gt 0 ]; then
+            echo "" >&2
+            print_success "Found ${#discovered_dbs[@]} database(s) on source cluster:" >&2
+            for i in "${!discovered_dbs[@]}"; do
+                echo "  $((i + 1))) ${discovered_dbs[$i]}" >&2
+            done
+            echo "" >&2
+        fi
+        # Note: Don't show warning if discovery fails - might be normal (cluster not accessible yet)
+    elif [ -z "$pgpass_file" ]; then
+        print_warning "Skipping database discovery (.pgpass not found)"
+    fi
+
+    echo ""
+    print_info "Database Selection"
+    explain "NOTE: Include all user databases (including 'postgres' if used)"
+    explain "      Only template0 and template1 are automatically excluded"
+    echo ""
+
+    # Show what was discovered
+    if [ ${#discovered_dbs[@]} -gt 0 ]; then
+        print_success "Detected databases on source cluster:" >&2
+        for db in "${discovered_dbs[@]}"; do
+            echo "  - $db" >&2
+        done
+        echo "" >&2
+    fi
+
+    # Detect if configuration was loaded from file
+    local default_choice="1"
+    local config_loaded=false
+    local show_config_option=false
+
+    if [ "$CONFIG_FILE_LOADED" = "true" ]; then
+        if [ -n "$DATABASES" ]; then
+            # Multi-database mode already configured
+            config_loaded=true
+            print_info "Configuration loaded: Multi-database mode with ${DATABASES}"
+
+            # Check if configured databases differ from detected databases
+            if [ ${#discovered_dbs[@]} -gt 0 ]; then
+                local all_dbs=$(IFS=,; echo "${discovered_dbs[*]}")
+                if [ "$DATABASES" != "$all_dbs" ]; then
+                    show_config_option=true
+                    default_choice="3"
+                else
+                    default_choice="2"
+                fi
+            else
+                show_config_option=true
+                default_choice="3"
+            fi
+        elif [ -n "$PGDATABASE" ]; then
+            # Single database mode already configured
+            config_loaded=true
+            default_choice="1"
+            print_info "Configuration loaded: Single database mode with ${PGDATABASE}"
+        fi
+    fi
+
+    # Present numbered options
+    echo -e "${CYAN}Database Migration Options:${RESET}" >&2
+    echo "  1) Single database (postgres)" >&2
+    if [ ${#discovered_dbs[@]} -gt 0 ]; then
+        # Build comma-separated list of all databases
+        local all_dbs=$(IFS=,; echo "${discovered_dbs[*]}")
+        echo "  2) All detected databases ($all_dbs)" >&2
+    else
+        echo "  2) All detected databases (none detected - manual entry)" >&2
+    fi
+
+    # Show configured databases as separate option if different from detected
+    if [ "$show_config_option" = "true" ]; then
+        echo "  3) Use configured databases ($DATABASES)" >&2
+        echo "  4) Manual entry (specify custom database list)" >&2
+    else
+        echo "  3) Manual entry (specify custom database list)" >&2
+    fi
+    echo "" >&2
+
+    local db_choice
+    echo -ne "${BOLD}Select option${RESET} [${GREEN}${default_choice}${RESET}]: " >&2
+    read -r db_choice
+
+    # Use detected default if no input provided
+    if [ -z "$db_choice" ]; then
+        db_choice="$default_choice"
+    fi
+
+    case "$db_choice" in
+        1)
+            # Single database mode
+            PGDATABASE="postgres"
+            DATABASES=""
+            print_info "Selected: Single database (postgres)"
+            ;;
+        2)
+            # All detected databases
+            if [ ${#discovered_dbs[@]} -gt 0 ]; then
+                # Use discovered databases
+                local all_dbs=$(IFS=,; echo "${discovered_dbs[*]}")
+                DATABASES="$all_dbs"
+                PGDATABASE=""
+                print_info "Selected: All detected databases ($all_dbs)"
+            else
+                # No databases detected, fallback to manual
+                print_warning "No databases detected - please enter manually"
+                DATABASES=$(prompt_input "Databases to migrate (comma-separated)" "$DATABASES")
+                PGDATABASE=""
+                explain "Example: postgres,app1,app2,analytics"
+            fi
+            ;;
+        3)
+            # Option 3: Either configured databases OR manual entry
+            if [ "$show_config_option" = "true" ]; then
+                # Use configured databases from loaded config
+                PGDATABASE=""
+                print_info "Selected: Use configured databases ($DATABASES)"
+            else
+                # Manual entry
+                print_info "Enter database(s) manually"
+                local manual_mode=$(prompt_yesno "Migrate multiple databases?" "n")
+                if [ "$manual_mode" = "y" ]; then
+                    DATABASES=$(prompt_input "Databases to migrate (comma-separated)" "$DATABASES")
+                    PGDATABASE=""
+                    explain "Example: postgres,app1,app2,analytics"
+                else
+                    PGDATABASE=$(prompt_input "Database name" "${PGDATABASE:-postgres}")
+                    DATABASES=""
+                fi
+            fi
+            ;;
+        4|*)
+            # Manual entry (when show_config_option is true, this is option 4)
+            print_info "Enter database(s) manually"
+            local manual_mode=$(prompt_yesno "Migrate multiple databases?" "n")
+            if [ "$manual_mode" = "y" ]; then
+                DATABASES=$(prompt_input "Databases to migrate (comma-separated)" "$DATABASES")
+                PGDATABASE=""
+                explain "Example: postgres,app1,app2,analytics"
+            else
+                PGDATABASE=$(prompt_input "Database name" "${PGDATABASE:-postgres}")
+                DATABASES=""
+            fi
+            ;;
+    esac
+
+}
+
+prompt_replication_settings() {
+    print_section "Logical Replication Settings (Optional)"
+
+    echo ""
+    print_info "Publication/Subscription/Slot Names"
+    explain "Leave empty to use defaults"
+    explain "Only customize if you have specific naming requirements"
+
+    local customize=$(prompt_yesno "Customize replication object names?" "n")
+
+    if [ "$customize" = "y" ]; then
+        echo ""
+        print_info "Forward Replication Objects (Source → Target)"
+        PUBLICATION_NAME=$(prompt_input "Publication name" "pgtwin_migrate_forward_pub")
+        SUBSCRIPTION_NAME=$(prompt_input "Subscription name" "pgtwin_migrate_forward_sub")
+        REPLICATION_SLOT_NAME=$(prompt_input "Replication slot name" "pgtwin_migrate_forward_slot")
+
+        echo ""
+        print_info "Reverse Replication Objects (Target → Source)"
+        REVERSE_PUBLICATION_NAME=$(prompt_input "Reverse publication name" "pgtwin_migrate_reverse_pub")
+        REVERSE_SUBSCRIPTION_NAME=$(prompt_input "Reverse subscription name" "pgtwin_migrate_reverse_sub")
+        REVERSE_REPLICATION_SLOT_NAME=$(prompt_input "Reverse slot name" "pgtwin_migrate_reverse_slot")
+    else
+        # Clear to use defaults
+        PUBLICATION_NAME=""
+        SUBSCRIPTION_NAME=""
+        REPLICATION_SLOT_NAME=""
+        REVERSE_PUBLICATION_NAME=""
+        REVERSE_SUBSCRIPTION_NAME=""
+        REVERSE_REPLICATION_SLOT_NAME=""
+    fi
+}
+
+prompt_monitoring_settings() {
+    print_section "Monitoring Settings"
+
+    echo ""
+    print_info "Replication Lag Threshold"
+    explain "Migration proceeds when lag falls below this threshold"
+    explain "Value in bytes (1024 = 1KB, 10485760 = 10MB)"
+    LAG_THRESHOLD=$(prompt_input "Lag threshold (bytes)" "$LAG_THRESHOLD")
+    while ! validate_number "$LAG_THRESHOLD"; do
+        print_error "Invalid number"
+        LAG_THRESHOLD=$(prompt_input "Lag threshold (bytes)" "1024")
+    done
+}
+
+prompt_postgresql_environment() {
+    print_section "PostgreSQL Environment (Optional)"
+
+    echo ""
+    print_info "PostgreSQL Home Directories"
+    explain "Leave empty to auto-discover from cluster configuration"
+    explain "Only specify if auto-discovery fails"
+
+    local customize=$(prompt_yesno "Specify PostgreSQL home directories?" "n")
+
+    if [ "$customize" = "y" ]; then
+        SOURCE_PGHOME=$(prompt_input "Source PGHOME" "$SOURCE_PGHOME")
+        TARGET_PGHOME=$(prompt_input "Target PGHOME" "$TARGET_PGHOME")
+    else
+        SOURCE_PGHOME=""
+        TARGET_PGHOME=""
+    fi
+
+    # Only prompt for .pgpass if not already detected
+    if [ -z "$SOURCE_PGPASSFILE" ] && [ -z "$TARGET_PGPASSFILE" ]; then
+        echo ""
+        print_info ".pgpass File Locations"
+        explain "Leave empty to auto-discover from cluster configuration"
+
+        customize=$(prompt_yesno "Specify .pgpass file locations?" "n")
+
+        if [ "$customize" = "y" ]; then
+            SOURCE_PGPASSFILE=$(prompt_input "Source .pgpass" "$SOURCE_PGPASSFILE")
+            TARGET_PGPASSFILE=$(prompt_input "Target .pgpass" "$TARGET_PGPASSFILE")
+        fi
+    else
+        print_info ".pgpass file locations already configured (detected earlier)"
+        explain "Source: ${SOURCE_PGPASSFILE:-<auto-discover>}"
+        explain "Target: ${TARGET_PGPASSFILE:-<auto-discover>}"
+    fi
+}
+
+prompt_advanced_settings() {
+    print_section "Advanced Settings"
+
+    echo ""
+    print_info "Source Node Role"
+    explain "Which node role on source cluster should publish data"
+    explain "  Promoted:   Primary node (safest, always works)"
+    explain "  Unpromoted: Standby node (PG16+ only, experimental)"
+    explain "              More predictable load impact (read-only workload)"
+    explain "              Recommended when primary has heavy write load"
+
+    local role=$(prompt_input "Source node role [Promoted/Unpromoted]" "$SOURCE_NODE_ROLE")
+    if [ "$role" = "Unpromoted" ] || [ "$role" = "unpromoted" ]; then
+        # Validate PostgreSQL version for Unpromoted mode
+        # Detect .pgpass for version check
+        local pgpass_for_version
+        pgpass_for_version=$(detect_pgpass_file || echo "")
+
+        if [ -n "$SOURCE_REPLICATION_VIP" ] && [ -n "$PGPORT" ] && [ -n "$MIGRATION_DBUSER" ] && [ -n "$pgpass_for_version" ]; then
+            print_info "Validating PostgreSQL version for Unpromoted mode..."
+            local pg_version
+            pg_version=$(get_pg_version "$SOURCE_REPLICATION_VIP" "$PGPORT" "$MIGRATION_DBUSER" "$pgpass_for_version")
+
+            if [ -n "$pg_version" ]; then
+                if [ "$pg_version" -lt 16 ]; then
+                    print_error "Unpromoted mode requires PostgreSQL 16 or higher"
+                    print_error "Source cluster is running PostgreSQL $pg_version"
+                    echo ""
+                    print_info "Options:"
+                    explain "1. Use Promoted mode (primary node) instead"
+                    explain "2. Upgrade source cluster to PostgreSQL 16+"
+                    echo ""
+                    exit 1
+                else
+                    print_success "PostgreSQL version $pg_version supports Unpromoted mode"
+                fi
+            else
+                print_warning "Could not verify PostgreSQL version"
+                print_warning "Ensure source cluster is PostgreSQL 16+ for Unpromoted mode"
+            fi
+        elif [ -z "$pgpass_for_version" ]; then
+            print_warning "Could not verify PostgreSQL version (.pgpass not found)"
+            print_warning "Ensure source cluster is PostgreSQL 16+ for Unpromoted mode"
+        fi
+
+        SOURCE_NODE_ROLE="Unpromoted"
+        print_warning "Unpromoted publishing requires wal_level=logical on standby"
+    else
+        SOURCE_NODE_ROLE="Promoted"
+    fi
+
+    echo ""
+    print_info "Debug Settings"
+    explain "Enable bash tracing for async cutover process (set -x)"
+    local debug=$(prompt_yesno "Enable cutover debug mode?" "n")
+    if [ "$debug" = "y" ]; then
+        CUTOVER_DEBUG="true"
+    else
+        CUTOVER_DEBUG="false"
+    fi
+}
+
+prompt_output_files() {
+    print_section "Output Configuration"
+
+    echo ""
+    print_info "Resource Name"
+    explain "Name for the pgtwin-migrate Pacemaker resource"
+    RESOURCE_NAME=$(prompt_input "Resource name" "$RESOURCE_NAME")
+
+    echo ""
+    print_info "Output Files"
+    explain "Configuration will be saved to these files"
+
+    local default_config="${RESOURCE_NAME}.conf"
+    local default_crm="${RESOURCE_NAME}.crm"
+
+    OUTPUT_CONFIG=$(prompt_input "Configuration file" "$default_config")
+    OUTPUT_CRM=$(prompt_input "CRM configuration file" "$default_crm")
+}
+
+#######################################################################
+# Configuration Summary
+#######################################################################
+
+print_summary() {
+    print_section "Configuration Summary"
+
+    echo ""
+    echo -e "${BOLD}Source Cluster:${RESET}"
+    echo "  Cluster:        $SOURCE_CLUSTER"
+    if [ -n "$SOURCE_REPLICATION_VIP" ]; then
+        local source_rep_vip_resource=$(get_vip_resource_by_ip "$SOURCE_REPLICATION_VIP")
+        if [ -n "$source_rep_vip_resource" ]; then
+            echo "  Replication VIP: $SOURCE_REPLICATION_VIP ($source_rep_vip_resource)"
+        else
+            echo "  Replication VIP: $SOURCE_REPLICATION_VIP"
+        fi
+    fi
+    [ -n "$SOURCE_PGHOME" ] && echo "  PGHOME:         $SOURCE_PGHOME"
+    [ -n "$SOURCE_PGPASSFILE" ] && echo "  .pgpass:        $SOURCE_PGPASSFILE"
+
+    echo ""
+    echo -e "${BOLD}Target Cluster:${RESET}"
+    echo "  Cluster:        $TARGET_CLUSTER"
+    if [ -n "$TARGET_REPLICATION_VIP" ]; then
+        local target_rep_vip_resource=$(get_vip_resource_by_ip "$TARGET_REPLICATION_VIP")
+        if [ -n "$target_rep_vip_resource" ]; then
+            echo "  Replication VIP: $TARGET_REPLICATION_VIP ($target_rep_vip_resource)"
+        else
+            echo "  Replication VIP: $TARGET_REPLICATION_VIP"
+        fi
+    fi
+    [ -n "$TARGET_PGHOME" ] && echo "  PGHOME:         $TARGET_PGHOME"
+    [ -n "$TARGET_PGPASSFILE" ] && echo "  .pgpass:        $TARGET_PGPASSFILE"
+
+    echo ""
+    echo -e "${BOLD}VIP Resources:${RESET}"
+    if [ -n "$PRODUCTION_VIP_RESOURCE" ]; then
+        local prod_ip=$(get_vip_address "$PRODUCTION_VIP_RESOURCE")
+        if [ -n "$prod_ip" ]; then
+            echo "  Production VIP: ${PRODUCTION_VIP_RESOURCE} (${prod_ip})"
+        else
+            echo "  Production VIP: ${PRODUCTION_VIP_RESOURCE}"
+        fi
+    else
+        echo "  Production VIP: <not set>"
+    fi
+
+    if [ -n "$TARGET_VIP_RESOURCE" ]; then
+        local target_ip=$(get_vip_address "$TARGET_VIP_RESOURCE")
+        if [ -n "$target_ip" ]; then
+            echo "  Target VIP:     ${TARGET_VIP_RESOURCE} (${target_ip})"
+        else
+            echo "  Target VIP:     ${TARGET_VIP_RESOURCE}"
+        fi
+    else
+        echo "  Target VIP:     <not set>"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Database Configuration:${RESET}"
+    if [ -n "$DATABASES" ]; then
+        echo "  Databases:      $DATABASES (multi-database mode)"
+    else
+        echo "  Database:       $PGDATABASE (single database mode)"
+    fi
+    echo "  Port:           $PGPORT"
+    echo "  Migration User: $MIGRATION_DBUSER"
+
+    echo ""
+    echo -e "${BOLD}Monitoring:${RESET}"
+    echo "  Lag Threshold:  $LAG_THRESHOLD bytes"
+
+    if [ -n "$PUBLICATION_NAME" ]; then
+        echo ""
+        echo -e "${BOLD}Custom Replication Objects:${RESET}"
+        echo "  Publication:    $PUBLICATION_NAME"
+        echo "  Subscription:   $SUBSCRIPTION_NAME"
+        echo "  Slot:           $REPLICATION_SLOT_NAME"
+        echo "  Rev Publication: $REVERSE_PUBLICATION_NAME"
+        echo "  Rev Subscription: $REVERSE_SUBSCRIPTION_NAME"
+        echo "  Rev Slot:       $REVERSE_REPLICATION_SLOT_NAME"
+    fi
+
+    echo ""
+    echo -e "${BOLD}Advanced:${RESET}"
+    echo "  Source Node Role: $SOURCE_NODE_ROLE"
+    echo "  Cutover Debug:    $CUTOVER_DEBUG"
+
+    echo ""
+    echo -e "${BOLD}Output Files:${RESET}"
+    echo "  Config file:    $OUTPUT_CONFIG"
+    echo "  CRM file:       $OUTPUT_CRM"
+}
+
+#######################################################################
+# Generate Configuration Files
+#######################################################################
+
+generate_config_file() {
+    local file="$1"
+
+    cat > "$file" <<EOF
+# pgtwin-migrate configuration file
+# Generated by $SCRIPT_NAME v$VERSION
+# Date: $(date '+%Y-%m-%d %H:%M:%S')
+#
+# This file can be sourced by shell scripts to access configuration variables
+# Example: source $file
+
+# Resource name
+RESOURCE_NAME="$RESOURCE_NAME"
+
+# Source cluster configuration
+SOURCE_CLUSTER="$SOURCE_CLUSTER"
+SOURCE_REPLICATION_VIP="$SOURCE_REPLICATION_VIP"
+SOURCE_PGHOME="$SOURCE_PGHOME"
+SOURCE_PGPASSFILE="$SOURCE_PGPASSFILE"
+SOURCE_NODE_ROLE="$SOURCE_NODE_ROLE"
+
+# Target cluster configuration
+TARGET_CLUSTER="$TARGET_CLUSTER"
+TARGET_REPLICATION_VIP="$TARGET_REPLICATION_VIP"
+TARGET_PGHOME="$TARGET_PGHOME"
+TARGET_PGPASSFILE="$TARGET_PGPASSFILE"
+
+# VIP resources
+PRODUCTION_VIP_RESOURCE="$PRODUCTION_VIP_RESOURCE"
+TARGET_VIP_RESOURCE="$TARGET_VIP_RESOURCE"
+ORIGINAL_PRODUCTION_VIP_IP="$ORIGINAL_PRODUCTION_VIP_IP"
+ORIGINAL_TARGET_VIP_IP="$ORIGINAL_TARGET_VIP_IP"
+
+# Database configuration
+DATABASES="$DATABASES"
+PGDATABASE="$PGDATABASE"
+PGPORT="$PGPORT"
+MIGRATION_DBUSER="$MIGRATION_DBUSER"
+
+# Logical replication settings
+PUBLICATION_NAME="$PUBLICATION_NAME"
+SUBSCRIPTION_NAME="$SUBSCRIPTION_NAME"
+REPLICATION_SLOT_NAME="$REPLICATION_SLOT_NAME"
+REVERSE_PUBLICATION_NAME="$REVERSE_PUBLICATION_NAME"
+REVERSE_SUBSCRIPTION_NAME="$REVERSE_SUBSCRIPTION_NAME"
+REVERSE_REPLICATION_SLOT_NAME="$REVERSE_REPLICATION_SLOT_NAME"
+
+# Monitoring settings
+LAG_THRESHOLD="$LAG_THRESHOLD"
+
+# Advanced settings
+CUTOVER_READY="$CUTOVER_READY"
+CUTOVER_DEBUG="$CUTOVER_DEBUG"
+EOF
+
+    chmod 600 "$file"
+    print_success "Configuration file written: $file"
+}
+
+generate_crm_file() {
+    local file="$1"
+
+    cat > "$file" <<EOF
+# Pacemaker CRM configuration for pgtwin-migrate
+# Generated by $SCRIPT_NAME v$VERSION
+# Date: $(date '+%Y-%m-%d %H:%M:%S')
+#
+# To apply this configuration:
+#   crm configure load update $file
+#
+# WARNING: Review and customize before applying to production!
+
+primitive $RESOURCE_NAME pgtwin-migrate \\
+    params \\
+        source_cluster="$SOURCE_CLUSTER" \\
+        target_cluster="$TARGET_CLUSTER" \\
+        source_replication_vip="$SOURCE_REPLICATION_VIP" \\
+        target_replication_vip="$TARGET_REPLICATION_VIP" \\
+EOF
+
+    # Add optional VIP resources if specified
+    if [ -n "$PRODUCTION_VIP_RESOURCE" ]; then
+        echo "        production_vip_resource=\"$PRODUCTION_VIP_RESOURCE\" \\" >> "$file"
+    fi
+
+    if [ -n "$TARGET_VIP_RESOURCE" ]; then
+        echo "        target_vip_resource=\"$TARGET_VIP_RESOURCE\" \\" >> "$file"
+    fi
+
+    # Add original VIP IPs for safe rollback
+    if [ -n "$ORIGINAL_PRODUCTION_VIP_IP" ]; then
+        echo "        original_production_vip_ip=\"$ORIGINAL_PRODUCTION_VIP_IP\" \\" >> "$file"
+    fi
+
+    if [ -n "$ORIGINAL_TARGET_VIP_IP" ]; then
+        echo "        original_target_vip_ip=\"$ORIGINAL_TARGET_VIP_IP\" \\" >> "$file"
+    fi
+
+    # Add database configuration
+    if [ -n "$DATABASES" ]; then
+        echo "        databases=\"$DATABASES\" \\" >> "$file"
+    else
+        echo "        databases=\"$PGDATABASE\" \\" >> "$file"
+    fi
+
+    cat >> "$file" <<EOF
+        pgport="$PGPORT" \\
+        migration_dbuser="$MIGRATION_DBUSER" \\
+EOF
+
+    # Add custom replication object names if specified
+    if [ -n "$PUBLICATION_NAME" ]; then
+        cat >> "$file" <<EOF
+        publication_name="$PUBLICATION_NAME" \\
+        subscription_name="$SUBSCRIPTION_NAME" \\
+        replication_slot_name="$REPLICATION_SLOT_NAME" \\
+EOF
+    fi
+
+    # Add monitoring settings
+    cat >> "$file" <<EOF
+        lag_threshold="$LAG_THRESHOLD" \\
+EOF
+
+    # Add optional PostgreSQL environment settings
+    if [ -n "$SOURCE_PGHOME" ]; then
+        echo "        source_pghome=\"$SOURCE_PGHOME\" \\" >> "$file"
+    fi
+
+    if [ -n "$TARGET_PGHOME" ]; then
+        echo "        target_pghome=\"$TARGET_PGHOME\" \\" >> "$file"
+    fi
+
+    if [ -n "$SOURCE_PGPASSFILE" ]; then
+        echo "        source_pgpassfile=\"$SOURCE_PGPASSFILE\" \\" >> "$file"
+    fi
+
+    if [ -n "$TARGET_PGPASSFILE" ]; then
+        echo "        target_pgpassfile=\"$TARGET_PGPASSFILE\" \\" >> "$file"
+    fi
+
+    # Add advanced settings
+    cat >> "$file" <<EOF
+        source_node_role="$SOURCE_NODE_ROLE" \\
+        cutover_ready="false" \\
+        cutover_debug="$CUTOVER_DEBUG" \\
+    op start timeout="300s" \\
+    op stop timeout="60s" \\
+    op monitor interval="30s" timeout="60s"
+EOF
+
+    print_success "CRM configuration file written: $file"
+    echo ""
+    print_info "Next steps:"
+    echo "  1. Review the CRM configuration: cat $file"
+    echo "  2. Verify cluster is ready: crm status"
+    echo "  3. Apply configuration: crm configure load update $file"
+    echo "  4. Start migration: crm resource start $RESOURCE_NAME"
+    echo "  5. When ready to fail over the migration:"
+    echo "     crm resource update $RESOURCE_NAME cutover_ready=true"
+}
+
+#######################################################################
+# Main Program
+#######################################################################
+
+main() {
+    # Parse command-line arguments
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --config)
+                CONFIG_FILE="$2"
+                shift 2
+                ;;
+            --help|-h)
+                cat <<EOF
+Usage: $SCRIPT_NAME [OPTIONS]
+
+Interactive setup wizard for pgtwin-migrate
+
+OPTIONS:
+    --config FILE    Load default values from configuration file
+    --help, -h       Show this help message
+
+EXAMPLES:
+    # First-time setup
+    $SCRIPT_NAME
+
+    # Load existing configuration and modify
+    $SCRIPT_NAME --config migration-forward.conf
+
+OUTPUT:
+    The script generates two files:
+    1. Configuration file (.conf) - Sourceable shell script with variables
+    2. CRM configuration (.crm)   - Pacemaker configuration snippet
+
+DOCUMENTATION:
+    See README-pgtwin-migrate.md for detailed migration guide
+
+EOF
+                exit 0
+                ;;
+            *)
+                echo "Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+
+    # Print banner
+    print_banner
+
+    # Load configuration file if specified
+    if [ -n "$CONFIG_FILE" ]; then
+        load_config_file "$CONFIG_FILE"
+
+        # Map config file variables to internal script variables
+        if [ -n "${SOURCE_REP+x}" ]; then
+            SOURCE_REPLICATION_VIP="$SOURCE_REP"
+        fi
+        if [ -n "${TARGET_REP+x}" ]; then
+            TARGET_REPLICATION_VIP="$TARGET_REP"
+        fi
+        if [ -n "${PGUSER+x}" ]; then
+            MIGRATION_DBUSER="$PGUSER"
+        fi
+        if [ -n "${SOURCE_PORT+x}" ]; then
+            PGPORT="$SOURCE_PORT"
+        fi
+        if [ -n "${PGPASS_FILE+x}" ]; then
+            export PGPASSFILE="$PGPASS_FILE"
+        fi
+    fi
+
+    # Interactive prompts
+    prompt_required_parameters
+
+    # Check cluster health after cluster names are selected
+    echo ""
+    print_section "Cluster Health Check"
+    echo ""
+
+    local source_healthy=false
+    local target_healthy=false
+
+    if check_cluster_health "$SOURCE_CLUSTER" "Source cluster ($SOURCE_CLUSTER)"; then
+        source_healthy=true
+    fi
+
+    echo ""
+
+    if check_cluster_health "$TARGET_CLUSTER" "Target cluster ($TARGET_CLUSTER)"; then
+        target_healthy=true
+    fi
+
+    echo ""
+
+    if [ "$source_healthy" = false ] || [ "$target_healthy" = false ]; then
+        print_error "One or both clusters are not healthy"
+        print_warning "Please fix cluster issues before proceeding with migration setup"
+        echo ""
+        print_info "Troubleshooting steps:"
+        explain "1. Check cluster status: crm status"
+        explain "2. Check PostgreSQL logs on cluster nodes"
+        explain "3. Verify Pacemaker configuration"
+        explain "4. See pgtwin documentation for common issues"
+        echo ""
+        local proceed=$(prompt_yesno "Continue anyway (not recommended)?" "n")
+        if [ "$proceed" != "y" ]; then
+            print_info "Setup cancelled - fix cluster issues and try again"
+            exit 1
+        fi
+    else
+        print_success "Both clusters are healthy - proceeding with setup"
+    fi
+
+    prompt_vip_resources
+    prompt_database_configuration
+    prompt_replication_settings
+    prompt_monitoring_settings
+    prompt_postgresql_environment
+    prompt_advanced_settings
+    prompt_output_files
+
+    # Show summary
+    print_summary
+
+    # Confirm before generating files
+    echo ""
+    local confirm=$(prompt_yesno "Generate configuration files?" "y")
+
+    if [ "$confirm" != "y" ]; then
+        print_info "Configuration cancelled"
+        exit 0
+    fi
+
+    # Generate files
+    echo ""
+    print_section "Generating Configuration Files"
+    echo ""
+
+    generate_config_file "$OUTPUT_CONFIG"
+    generate_crm_file "$OUTPUT_CRM"
+
+    echo ""
+    print_success "Setup complete!"
+    echo ""
+    print_info "Configuration saved to:"
+    echo "  - $OUTPUT_CONFIG (reusable config)"
+    echo "  - $OUTPUT_CRM (Pacemaker CRM)"
+    echo ""
+    print_warning "IMPORTANT:"
+    echo "  1. Review both files before applying"
+    echo "  2. Ensure .pgpass files are configured on all nodes"
+    echo "  3. Verify wal_level=logical on both clusters"
+    echo "  4. Test in non-production first!"
+    echo ""
+}
+
+# Run main program
+main "$@"

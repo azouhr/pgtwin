@@ -1,8 +1,9 @@
 #!/bin/bash
 #
 # pgtwin-migrate - OCF Resource Agent for PostgreSQL Migration/Upgrade
-# Version: 1.0.8
-# Release Date: 2026-01-05
+# Version: 2.0.0
+# Release Date: 2026-01-19
+# Status: EXPERIMENTAL - Not for production use without thorough testing
 #
 # A Pacemaker OCF agent that orchestrates PostgreSQL cluster migrations via
 # logical replication (major version upgrades, vendor migrations, hosting
@@ -57,6 +58,8 @@ OCF_RESKEY_source_replication_vip_default=""
 OCF_RESKEY_target_replication_vip_default=""
 OCF_RESKEY_production_vip_resource_default="postgres-vip"
 OCF_RESKEY_target_vip_resource_default="postgres-vip-18"
+OCF_RESKEY_original_production_vip_ip_default=""  # Original IP of production VIP (for rollback)
+OCF_RESKEY_original_target_vip_ip_default=""  # Original IP of target VIP (for rollback)
 OCF_RESKEY_publication_name_default="pgtwin_migrate_forward_pub"
 OCF_RESKEY_subscription_name_default="pgtwin_migrate_forward_sub"
 OCF_RESKEY_replication_slot_name_default="pgtwin_migrate_forward_slot"
@@ -64,7 +67,6 @@ OCF_RESKEY_reverse_publication_name_default="pgtwin_migrate_reverse_pub"
 OCF_RESKEY_reverse_subscription_name_default="pgtwin_migrate_reverse_sub"
 OCF_RESKEY_reverse_replication_slot_name_default="pgtwin_migrate_reverse_slot"
 OCF_RESKEY_lag_threshold_default="1024"  # 1KB
-OCF_RESKEY_monitor_interval_default="10"
 OCF_RESKEY_pgport_default="5432"
 OCF_RESKEY_migration_dbuser_default="pgmigrate"  # Database superuser for migration replication
 OCF_RESKEY_pgdatabase_default="postgres"  # PostgreSQL database name (legacy, use databases instead)
@@ -74,8 +76,10 @@ OCF_RESKEY_target_pghome_default=""  # Will be discovered from target postgres p
 OCF_RESKEY_source_pgpassfile_default=""  # Will be discovered from source postgres primitive
 OCF_RESKEY_target_pgpassfile_default=""  # Will be discovered from target postgres primitive
 OCF_RESKEY_source_node_role_default="Promoted"  # Promoted or Unpromoted (PostgreSQL 16+ supports Unpromoted for publishing)
-OCF_RESKEY_cutover_ready_default="false"  # Trigger cutover preparation when set to true
+OCF_RESKEY_production_cluster_default=""  # Which cluster is production (empty=source_cluster). Change this to trigger cutover.
+OCF_RESKEY_finalize_replication_default="false"  # When true, stop action cleans up all replication infrastructure
 OCF_RESKEY_cutover_debug_default="false"  # Enable bash tracing (set -x) in async cutover for debugging
+OCF_RESKEY_stability_timeout_default="300"  # Max seconds to wait for cluster stability before cutover
 
 : ${OCF_RESKEY_source_cluster=${OCF_RESKEY_source_cluster_default}}
 : ${OCF_RESKEY_target_cluster=${OCF_RESKEY_target_cluster_default}}
@@ -83,6 +87,8 @@ OCF_RESKEY_cutover_debug_default="false"  # Enable bash tracing (set -x) in asyn
 : ${OCF_RESKEY_target_replication_vip=${OCF_RESKEY_target_replication_vip_default}}
 : ${OCF_RESKEY_production_vip_resource=${OCF_RESKEY_production_vip_resource_default}}
 : ${OCF_RESKEY_target_vip_resource=${OCF_RESKEY_target_vip_resource_default}}
+: ${OCF_RESKEY_original_production_vip_ip=${OCF_RESKEY_original_production_vip_ip_default}}
+: ${OCF_RESKEY_original_target_vip_ip=${OCF_RESKEY_original_target_vip_ip_default}}
 : ${OCF_RESKEY_publication_name=${OCF_RESKEY_publication_name_default}}
 : ${OCF_RESKEY_subscription_name=${OCF_RESKEY_subscription_name_default}}
 : ${OCF_RESKEY_replication_slot_name=${OCF_RESKEY_replication_slot_name_default}}
@@ -90,7 +96,6 @@ OCF_RESKEY_cutover_debug_default="false"  # Enable bash tracing (set -x) in asyn
 : ${OCF_RESKEY_reverse_subscription_name=${OCF_RESKEY_reverse_subscription_name_default}}
 : ${OCF_RESKEY_reverse_replication_slot_name=${OCF_RESKEY_reverse_replication_slot_name_default}}
 : ${OCF_RESKEY_lag_threshold=${OCF_RESKEY_lag_threshold_default}}
-: ${OCF_RESKEY_monitor_interval=${OCF_RESKEY_monitor_interval_default}}
 : ${OCF_RESKEY_pgport=${OCF_RESKEY_pgport_default}}
 : ${OCF_RESKEY_migration_dbuser=${OCF_RESKEY_migration_dbuser_default}}
 : ${OCF_RESKEY_pgdatabase=${OCF_RESKEY_pgdatabase_default}}
@@ -100,23 +105,40 @@ OCF_RESKEY_cutover_debug_default="false"  # Enable bash tracing (set -x) in asyn
 : ${OCF_RESKEY_source_pgpassfile=${OCF_RESKEY_source_pgpassfile_default}}
 : ${OCF_RESKEY_target_pgpassfile=${OCF_RESKEY_target_pgpassfile_default}}
 : ${OCF_RESKEY_source_node_role=${OCF_RESKEY_source_node_role_default}}
-: ${OCF_RESKEY_cutover_ready=${OCF_RESKEY_cutover_ready_default}}
+: ${OCF_RESKEY_production_cluster=${OCF_RESKEY_production_cluster_default}}
+: ${OCF_RESKEY_finalize_replication=${OCF_RESKEY_finalize_replication_default}}
 : ${OCF_RESKEY_cutover_debug=${OCF_RESKEY_cutover_debug_default}}
+: ${OCF_RESKEY_stability_timeout=${OCF_RESKEY_stability_timeout_default}}
+
+# Set default production_cluster to source_cluster if not specified
+if [ -z "$OCF_RESKEY_production_cluster" ]; then
+    OCF_RESKEY_production_cluster="$OCF_RESKEY_source_cluster"
+fi
 
 #######################################################################
-# Database List Initialization (Backward Compatibility)
+# Database List Initialization
 #
-# Support both legacy 'pgdatabase' (single DB) and new 'databases' (multiple DBs)
-# Priority: databases > pgdatabase (if both set, databases wins)
+# v2.0: If databases parameter is empty, databases are discovered dynamically
+# at runtime from the production cluster. This enables automatic tracking
+# of new databases without CRM configuration changes.
+#
+# Priority: databases > pgdatabase > auto-discovery
 
+# Note: DB_LIST and DB_COUNT are set dynamically by get_database_list()
+# These variables are initialized here for backward compatibility but
+# should be refreshed before each operation using get_database_list()
 if [ -n "$OCF_RESKEY_databases" ]; then
-    # New parameter: comma-separated list
+    # Explicit parameter: comma-separated list
     DB_LIST=$(echo "$OCF_RESKEY_databases" | tr ',' ' ')
     DB_COUNT=$(echo "$DB_LIST" | wc -w)
-else
-    # Backward compatibility: use legacy pgdatabase parameter
+elif [ -n "$OCF_RESKEY_pgdatabase" ] && [ "$OCF_RESKEY_pgdatabase" != "postgres" ]; then
+    # Legacy parameter (backward compatibility)
     DB_LIST="$OCF_RESKEY_pgdatabase"
     DB_COUNT=1
+else
+    # Will be discovered dynamically - set empty placeholder
+    DB_LIST=""
+    DB_COUNT=0
 fi
 
 #######################################################################
@@ -250,6 +272,40 @@ If not set, defaults to "postgres-vip-18".
 <content type="string" default="${OCF_RESKEY_target_vip_resource_default}" />
 </parameter>
 
+<parameter name="original_production_vip_ip" required="0" unique="0">
+<longdesc lang="en">
+Original IP address of the production VIP resource before migration.
+
+This IP is used during rollback to restore the production VIP to its
+original state. Without this parameter, rollback cannot reliably restore
+VIP configuration after a failed cutover.
+
+REQUIRED for safe rollback. If not set, rollback will attempt to toggle
+the VIP swap which may not restore the correct state.
+
+Example: "192.168.60.100"
+</longdesc>
+<shortdesc lang="en">Original production VIP IP address</shortdesc>
+<content type="string" default="" />
+</parameter>
+
+<parameter name="original_target_vip_ip" required="0" unique="0">
+<longdesc lang="en">
+Original IP address of the target VIP resource before migration.
+
+This IP is used during rollback to restore the target VIP to its
+original state. Without this parameter, rollback cannot reliably restore
+VIP configuration after a failed cutover.
+
+REQUIRED for safe rollback. If not set, rollback will attempt to toggle
+the VIP swap which may not restore the correct state.
+
+Example: "192.168.60.101"
+</longdesc>
+<shortdesc lang="en">Original target VIP IP address</shortdesc>
+<content type="string" default="" />
+</parameter>
+
 <parameter name="publication_name" required="0" unique="0">
 <longdesc lang="en">
 Logical replication publication name.
@@ -285,16 +341,6 @@ Default: 1024 bytes (1KB)
 </longdesc>
 <shortdesc lang="en">Lag threshold (bytes)</shortdesc>
 <content type="integer" default="${OCF_RESKEY_lag_threshold_default}" />
-</parameter>
-
-<parameter name="monitor_interval" required="0" unique="0">
-<longdesc lang="en">
-Monitor interval in seconds.
-How frequently to check replication status and lag.
-Default: 10 seconds
-</longdesc>
-<shortdesc lang="en">Monitor interval (seconds)</shortdesc>
-<content type="integer" default="${OCF_RESKEY_monitor_interval_default}" />
 </parameter>
 
 <parameter name="pgport" required="0" unique="0">
@@ -524,6 +570,86 @@ resource tracing is active (crm resource trace migration).
 <content type="boolean" default="${OCF_RESKEY_cutover_debug_default}" />
 </parameter>
 
+<parameter name="production_cluster" required="0" unique="0">
+<longdesc lang="en">
+v2.0 PARAMETER: Which cluster should be the production cluster.
+
+Values:
+- "" (empty, default): Use source_cluster as production
+- "source_cluster_name": Source cluster is production (forward replication active)
+- "target_cluster_name": Target cluster is production (reverse replication active)
+
+BIDIRECTIONAL CUTOVER:
+Changing this parameter triggers a cutover. The agent will:
+1. Set old production cluster to READ-ONLY mode
+2. Wait for replication to sync (lag = 0)
+3. DELETE old direction replication (publications, subscriptions, slots, triggers)
+4. CREATE new direction replication (fresh setup with copy_data=true)
+5. Swap VIP addresses between clusters
+6. Set old production cluster back to READ-WRITE mode
+7. Update CIB state to reflect new production cluster
+
+FAILBACK CAPABILITY:
+To failback, simply change production_cluster back to the original value.
+The agent will execute the cutover in the opposite direction.
+
+Example:
+- Initial: production_cluster="" (source is production, forward replication)
+- Cutover: production_cluster="postgres-clone-18" (target is production, reverse replication)
+- Failback: production_cluster="postgres-clone" (source is production again, forward replication)
+
+NOTE: This parameter replaces the deprecated cutover_ready boolean.
+</longdesc>
+<shortdesc lang="en">Which cluster is production</shortdesc>
+<content type="string" default="${OCF_RESKEY_production_cluster_default}" />
+</parameter>
+
+<parameter name="finalize_replication" required="0" unique="0">
+<longdesc lang="en">
+v2.0 PARAMETER: Clean up all replication infrastructure on stop.
+
+Values:
+- "false" (default): Preserve replication infrastructure on stop
+  - Use this when migrating the resource between nodes
+  - Resource can be restarted without losing replication state
+
+- "true": Delete all replication infrastructure on stop
+  - Drop all publications, subscriptions, replication slots, and DDL triggers
+  - Use this when migration is complete and you want to finalize
+  - Cannot be undone - all replication state will be removed
+
+WORKFLOW:
+1. Complete migration with cutover (production_cluster changed)
+2. Verify everything working on new production cluster
+3. When ready to finalize: crm resource update migration-forward finalize_replication=true
+4. Stop the resource: crm resource stop migration-forward
+5. Delete the resource: crm configure delete migration-forward
+
+The finalize_replication parameter is checked during stop operation.
+If true, all replication infrastructure is cleaned up before stopping.
+</longdesc>
+<shortdesc lang="en">Clean up replication on stop</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_finalize_replication_default}" />
+</parameter>
+
+<parameter name="stability_timeout" required="0" unique="0">
+<longdesc lang="en">
+v2.0 PARAMETER: Maximum seconds to wait for cluster stability before cutover.
+
+Before executing a cutover, the agent validates that the target cluster is stable:
+- Target cluster has a promoted (primary) node
+- PostgreSQL on target is accepting connections
+- Replication lag is within acceptable threshold
+
+If the target cluster is not stable within this timeout, the cutover fails
+with a clear error message.
+
+Default: 300 seconds (5 minutes)
+</longdesc>
+<shortdesc lang="en">Cluster stability timeout</shortdesc>
+<content type="integer" default="${OCF_RESKEY_stability_timeout_default}" />
+</parameter>
+
 </parameters>
 
 <actions>
@@ -544,6 +670,494 @@ usage: $0 {start|stop|monitor|validate-all|meta-data}
 Expects to have a fully populated OCF RA-compliant environment set.
 END
 }
+
+#######################################################################
+# v2.0 Functions: Dynamic Database Discovery and Bidirectional Cutover
+#######################################################################
+
+get_current_databases() {
+    # Query databases from the specified cluster
+    # Usage: get_current_databases "source"|"target"
+    # Returns: space-separated list of database names
+    #
+    # This function enables dynamic database discovery - databases are
+    # queried at runtime instead of requiring static configuration.
+
+    local cluster="$1"
+    local host passfile
+
+    if [ "$cluster" = "source" ]; then
+        host="$OCF_RESKEY_source_replication_vip"
+        passfile="$OCF_RESKEY_source_pgpassfile"
+    else
+        host="$OCF_RESKEY_target_replication_vip"
+        passfile="$OCF_RESKEY_target_pgpassfile"
+    fi
+
+    if [ -z "$host" ] || [ -z "$passfile" ]; then
+        ocf_log warn "Cannot discover databases: missing host or passfile for $cluster"
+        return 1
+    fi
+
+    # Query all user databases (exclude templates)
+    local databases=$(PGPASSFILE="$passfile" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d postgres -t -A \
+        -c "SELECT datname FROM pg_database WHERE datistemplate = false ORDER BY datname" 2>/dev/null)
+
+    if [ -z "$databases" ]; then
+        ocf_log warn "No databases found or query failed for $cluster cluster"
+        return 1
+    fi
+
+    # Convert newlines to spaces
+    echo "$databases" | tr '\n' ' ' | sed 's/ $//'
+}
+
+get_database_list() {
+    # Get database list - either from parameter or by discovery
+    # Usage: get_database_list ["source"|"target"]
+    #   cluster: which cluster to query for auto-discovery (default: based on production_cluster)
+    # Returns: space-separated list of database names
+    # Sets: DB_LIST and DB_COUNT global variables
+
+    local cluster="${1:-}"
+
+    # If explicit list provided, use it
+    if [ -n "$OCF_RESKEY_databases" ]; then
+        DB_LIST=$(echo "$OCF_RESKEY_databases" | tr ',' ' ')
+        DB_COUNT=$(echo "$DB_LIST" | wc -w)
+        return 0
+    fi
+
+    # Legacy parameter
+    if [ -n "$OCF_RESKEY_pgdatabase" ] && [ "$OCF_RESKEY_pgdatabase" != "postgres" ]; then
+        DB_LIST="$OCF_RESKEY_pgdatabase"
+        DB_COUNT=1
+        return 0
+    fi
+
+    # Auto-discover from cluster
+    if [ -z "$cluster" ]; then
+        # Determine which cluster is production
+        if [ "$OCF_RESKEY_production_cluster" = "$OCF_RESKEY_target_cluster" ]; then
+            cluster="target"
+        else
+            cluster="source"
+        fi
+    fi
+
+    local discovered=$(get_current_databases "$cluster")
+    if [ $? -eq 0 ] && [ -n "$discovered" ]; then
+        DB_LIST="$discovered"
+        DB_COUNT=$(echo "$DB_LIST" | wc -w)
+        ocf_log info "Auto-discovered $DB_COUNT database(s): $DB_LIST"
+        return 0
+    else
+        ocf_log err "Failed to discover databases from $cluster cluster"
+        return 1
+    fi
+}
+
+get_current_production_cluster() {
+    # Get the current production cluster from CIB or default to source
+    # Returns: cluster resource name (e.g., "postgres-clone" or "postgres-clone-18")
+    #
+    # IMPORTANT: When CIB is empty (first start), default to source_cluster
+    # This ensures the initial state is "source is production" regardless of
+    # the production_cluster parameter. Cutover detection compares this CIB
+    # value to the production_cluster parameter to detect changes.
+
+    local cib_production=$(crm_attribute -q -n migration-production-cluster 2>/dev/null)
+    if [ -n "$cib_production" ]; then
+        echo "$cib_production"
+    else
+        # Default to source_cluster for initial state (forward replication)
+        echo "$OCF_RESKEY_source_cluster"
+    fi
+}
+
+validate_cluster_stability() {
+    # Validate target cluster is stable before cutover
+    # Usage: validate_cluster_stability "cluster_resource_name"
+    # Returns: 0 if stable, 1 if timeout
+
+    local target_cluster="$1"
+    local max_wait="${OCF_RESKEY_stability_timeout:-300}"
+    local wait_interval=10
+    local elapsed=0
+
+    ocf_log info "Validating cluster stability for $target_cluster (max wait: ${max_wait}s)"
+
+    # Determine which VIP/passfile to use
+    local host passfile
+    if [ "$target_cluster" = "$OCF_RESKEY_source_cluster" ]; then
+        host="$OCF_RESKEY_source_replication_vip"
+        passfile="$OCF_RESKEY_source_pgpassfile"
+    else
+        host="$OCF_RESKEY_target_replication_vip"
+        passfile="$OCF_RESKEY_target_pgpassfile"
+    fi
+
+    while [ $elapsed -lt $max_wait ]; do
+        local all_checks_pass=true
+
+        # Check 1: Promoted node exists
+        local promoted=$(discover_cluster_node "$target_cluster" "Promoted")
+        if [ -z "$promoted" ]; then
+            ocf_log info "Waiting: $target_cluster has no promoted node (${elapsed}s/${max_wait}s)"
+            all_checks_pass=false
+        fi
+
+        # Check 2: PostgreSQL accepting connections (if promoted exists)
+        if [ -n "$promoted" ] && [ "$all_checks_pass" = "true" ]; then
+            if ! PGPASSFILE="$passfile" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+                -U "$OCF_RESKEY_migration_dbuser" -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+                ocf_log info "Waiting: PostgreSQL on $promoted not accepting connections (${elapsed}s/${max_wait}s)"
+                all_checks_pass=false
+            fi
+        fi
+
+        # Check 3: Replication lag within threshold (get lag to this cluster)
+        if [ "$all_checks_pass" = "true" ]; then
+            # Get lag from current production to target
+            local lag=$(get_replication_lag_to_cluster "$target_cluster")
+            if [ -n "$lag" ] && [ "$lag" -gt "$OCF_RESKEY_lag_threshold" ]; then
+                ocf_log info "Waiting: Replication lag ${lag}KB > threshold ${OCF_RESKEY_lag_threshold}KB (${elapsed}s/${max_wait}s)"
+                all_checks_pass=false
+            fi
+        fi
+
+        # All checks passed
+        if [ "$all_checks_pass" = "true" ]; then
+            # Warning check: Both nodes online?
+            local unpromoted=$(discover_cluster_node "$target_cluster" "Unpromoted")
+            if [ -z "$unpromoted" ]; then
+                ocf_log warn "Target cluster has no unpromoted node - proceeding with single-node cluster"
+            fi
+
+            ocf_log info "✓ Cluster $target_cluster passed stability validation"
+            return 0
+        fi
+
+        sleep $wait_interval
+        elapsed=$((elapsed + wait_interval))
+    done
+
+    ocf_log err "Cluster stability validation timed out after ${max_wait}s"
+    return 1
+}
+
+get_replication_lag_to_cluster() {
+    # Get replication lag to the specified cluster
+    # Usage: get_replication_lag_to_cluster "cluster_resource_name"
+    # Returns: lag in KB (or empty if cannot determine)
+
+    local target_cluster="$1"
+    local max_lag=0
+
+    # Determine direction based on which cluster we're measuring lag to
+    local sub_host sub_passfile direction
+    if [ "$target_cluster" = "$OCF_RESKEY_target_cluster" ]; then
+        # Forward replication lag (source -> target)
+        direction="forward"
+        sub_host="$OCF_RESKEY_target_replication_vip"
+        sub_passfile="$OCF_RESKEY_target_pgpassfile"
+    else
+        # Reverse replication lag (target -> source)
+        direction="reverse"
+        sub_host="$OCF_RESKEY_source_replication_vip"
+        sub_passfile="$OCF_RESKEY_source_pgpassfile"
+    fi
+
+    # Get database list
+    get_database_list >/dev/null 2>&1
+
+    for db in $DB_LIST; do
+        local sub_name="pgtwin_migrate_${direction}_sub_${db}"
+        local lag_bytes=$(PGPASSFILE="$sub_passfile" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$db" -t -A \
+            -c "SELECT COALESCE(pg_wal_lsn_diff(latest_end_lsn, confirmed_flush_lsn), 0)
+                FROM pg_stat_subscription WHERE subname = '${sub_name}';" 2>/dev/null)
+
+        if [ -n "$lag_bytes" ] && [ "$lag_bytes" -gt "$max_lag" ]; then
+            max_lag=$lag_bytes
+        fi
+    done
+
+    # Convert to KB
+    echo $((max_lag / 1024))
+}
+
+delete_replication_direction() {
+    # Delete all replication infrastructure for a given direction
+    # Usage: delete_replication_direction "forward"|"reverse"
+    # This is the core function for cutover - we DELETE the old direction
+    # completely rather than just disabling it (avoids stale subscription issues)
+
+    local direction="$1"
+
+    ocf_log info "Deleting $direction replication infrastructure for $DB_COUNT database(s)"
+
+    # Determine which cluster has publications vs subscriptions
+    local pub_host pub_passfile sub_host sub_passfile
+    if [ "$direction" = "forward" ]; then
+        # Forward: publications on source, subscriptions on target
+        pub_host="$OCF_RESKEY_source_replication_vip"
+        pub_passfile="$OCF_RESKEY_source_pgpassfile"
+        sub_host="$OCF_RESKEY_target_replication_vip"
+        sub_passfile="$OCF_RESKEY_target_pgpassfile"
+    else
+        # Reverse: publications on target, subscriptions on source
+        pub_host="$OCF_RESKEY_target_replication_vip"
+        pub_passfile="$OCF_RESKEY_target_pgpassfile"
+        sub_host="$OCF_RESKEY_source_replication_vip"
+        sub_passfile="$OCF_RESKEY_source_pgpassfile"
+    fi
+
+    # Get database list
+    get_database_list >/dev/null 2>&1
+
+    for db in $DB_LIST; do
+        local pub_name="pgtwin_migrate_${direction}_pub_${db}"
+        local sub_name="pgtwin_migrate_${direction}_sub_${db}"
+
+        # Drop subscription first (this also drops the replication slot)
+        ocf_log debug "Dropping subscription $sub_name on $sub_host (database: $db)"
+        PGPASSFILE="$sub_passfile" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$db" \
+            -c "DROP SUBSCRIPTION IF EXISTS ${sub_name};" >/dev/null 2>&1
+
+        # Drop publication
+        ocf_log debug "Dropping publication $pub_name on $pub_host (database: $db)"
+        PGPASSFILE="$pub_passfile" psql -h "$pub_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$db" \
+            -c "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
+
+        # Drop DDL trigger
+        local trigger_name
+        if [ "$direction" = "forward" ]; then
+            trigger_name="replicate_ddl_to_target_trigger_${db}"
+        else
+            trigger_name="replicate_ddl_to_source_trigger_${db}"
+        fi
+        PGPASSFILE="$pub_passfile" psql -h "$pub_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$db" \
+            -c "DROP EVENT TRIGGER IF EXISTS ${trigger_name};" >/dev/null 2>&1
+
+        ocf_log info "  ✓ Deleted $direction replication for database: $db"
+    done
+
+    ocf_log info "✓ Deleted $direction replication infrastructure"
+    return 0
+}
+
+create_replication_direction() {
+    # Create all replication infrastructure for a given direction
+    # Usage: create_replication_direction "forward"|"reverse"
+    # Returns: 0 on success, 1 on failure
+
+    local direction="$1"
+
+    ocf_log info "Creating $direction replication infrastructure for $DB_COUNT database(s)"
+
+    # Determine clusters and hosts based on direction
+    local pub_cluster sub_cluster pub_node sub_node
+    if [ "$direction" = "forward" ]; then
+        pub_cluster="source"
+        sub_cluster="target"
+        # Get nodes
+        pub_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+        sub_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+    else
+        pub_cluster="target"
+        sub_cluster="source"
+        # Get nodes
+        pub_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+        sub_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+    fi
+
+    if [ -z "$pub_node" ] || [ -z "$sub_node" ]; then
+        ocf_log err "Cannot create $direction replication: missing nodes (pub=$pub_node, sub=$sub_node)"
+        return 1
+    fi
+
+    # Get database list
+    get_database_list >/dev/null 2>&1
+
+    local failed=false
+    for db in $DB_LIST; do
+        # Use existing setup function
+        if ! setup_database_replication "$db" "$direction" "$pub_node" "$sub_node" "false" "false"; then
+            ocf_log err "Failed to setup $direction replication for database: $db"
+            failed=true
+            break
+        fi
+
+        # Setup DDL trigger
+        local target_for_ddl
+        if [ "$direction" = "forward" ]; then
+            target_for_ddl="target"
+            setup_ddl_trigger "source" "$pub_node" "$sub_node" "target" "false" "$db"
+        else
+            target_for_ddl="source"
+            setup_ddl_trigger "target" "$pub_node" "$sub_node" "source" "false" "$db"
+        fi
+
+        ocf_log info "  ✓ Created $direction replication for database: $db"
+    done
+
+    if [ "$failed" = "true" ]; then
+        return 1
+    fi
+
+    ocf_log info "✓ Created $direction replication infrastructure"
+    return 0
+}
+
+check_and_trigger_cutover() {
+    # Check if production_cluster parameter changed and trigger cutover
+    # Called from notify and monitor functions
+    # Returns: 0 if no action needed or cutover successful, 1 if cutover failed
+
+    local current_production=$(get_current_production_cluster)
+    local desired_production="$OCF_RESKEY_production_cluster"
+
+    # Skip if no change
+    if [ "$desired_production" = "$current_production" ]; then
+        return 0
+    fi
+
+    ocf_log info "=========================================="
+    ocf_log info "CUTOVER REQUESTED"
+    ocf_log info "=========================================="
+    ocf_log info "Current production: $current_production"
+    ocf_log info "Desired production: $desired_production"
+    ocf_log info "=========================================="
+
+    # Determine direction of cutover
+    local old_direction new_direction
+    if [ "$current_production" = "$OCF_RESKEY_source_cluster" ]; then
+        old_direction="forward"
+        new_direction="reverse"
+    else
+        old_direction="reverse"
+        new_direction="forward"
+    fi
+
+    # Validate target cluster stability
+    if ! validate_cluster_stability "$desired_production"; then
+        ocf_log err "Cutover blocked - target cluster validation failed"
+        ocf_log err "Resource will continue with current production: $current_production"
+        return 1
+    fi
+
+    # Execute cutover asynchronously to avoid monitor timeout
+    start_async_cutover_v2 "$current_production" "$desired_production" "$old_direction" "$new_direction"
+    return $?
+}
+
+finalize_all_replication() {
+    # Clean up all replication infrastructure - called when finalize_replication=true
+    # This deletes whichever direction is currently active
+
+    ocf_log info "=========================================="
+    ocf_log info "FINALIZING MIGRATION"
+    ocf_log info "=========================================="
+    ocf_log info "Deleting all replication infrastructure"
+
+    local current_production=$(get_current_production_cluster)
+
+    # Determine which direction is active
+    if [ "$current_production" = "$OCF_RESKEY_source_cluster" ]; then
+        # Forward replication is active (source is production)
+        delete_replication_direction "forward"
+    else
+        # Reverse replication is active (target is production)
+        delete_replication_direction "reverse"
+    fi
+
+    # Clear CIB state
+    ocf_log info "Clearing CIB migration state attributes"
+    crm_attribute -D -n migration-production-cluster 2>/dev/null || true
+    crm_attribute -D -n migration-state 2>/dev/null || true
+    crm_attribute -D -n migration-last-cutover 2>/dev/null || true
+
+    ocf_log info "=========================================="
+    ocf_log info "✓ MIGRATION FINALIZED"
+    ocf_log info "=========================================="
+    ocf_log info "All replication infrastructure removed"
+    ocf_log info "Resource can be safely deleted"
+    ocf_log info "=========================================="
+
+    return 0
+}
+
+check_replication_slot_availability_v2() {
+    # Check if sufficient replication slots are available
+    # Usage: check_replication_slot_availability_v2 "source"|"target" db_count
+    # Returns: 0 if OK, OCF_ERR_CONFIGURED if insufficient
+
+    local cluster="$1"
+    local db_count="$2"
+    local slots_needed="$db_count"
+
+    local host passfile
+    if [ "$cluster" = "source" ]; then
+        host="$OCF_RESKEY_source_replication_vip"
+        passfile="$OCF_RESKEY_source_pgpassfile"
+    else
+        host="$OCF_RESKEY_target_replication_vip"
+        passfile="$OCF_RESKEY_target_pgpassfile"
+    fi
+
+    # Query current slot usage
+    local max_slots=$(PGPASSFILE="$passfile" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d postgres -t -A \
+        -c "SHOW max_replication_slots" 2>/dev/null)
+
+    local migration_slots=$(PGPASSFILE="$passfile" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d postgres -t -A \
+        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgtwin_migrate_%'" 2>/dev/null)
+
+    local other_slots=$(PGPASSFILE="$passfile" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d postgres -t -A \
+        -c "SELECT count(*) FROM pg_replication_slots WHERE slot_name NOT LIKE 'pgtwin_migrate_%'" 2>/dev/null)
+
+    # Handle empty values
+    max_slots=${max_slots:-10}
+    migration_slots=${migration_slots:-0}
+    other_slots=${other_slots:-0}
+
+    # Calculate available slots (excluding our existing migration slots which will be reused)
+    local available=$((max_slots - other_slots))
+
+    if [ "$slots_needed" -gt "$available" ]; then
+        ocf_log err "============================================"
+        ocf_log err "INSUFFICIENT REPLICATION SLOTS ON $cluster"
+        ocf_log err "============================================"
+        ocf_log err "Databases to replicate: $db_count"
+        ocf_log err "Slots needed on $cluster: $slots_needed"
+        ocf_log err "Slots available: $available"
+        ocf_log err "  max_replication_slots: $max_slots"
+        ocf_log err "  Used by other applications: $other_slots"
+        ocf_log err "  Used by pgtwin-migrate: $migration_slots"
+        ocf_log err "--------------------------------------------"
+        ocf_log err "RESOLUTION:"
+        ocf_log err "  1. Increase max_replication_slots in postgresql.conf"
+        ocf_log err "     Recommended: max_replication_slots = $((slots_needed + other_slots + 5))"
+        ocf_log err "  2. Restart PostgreSQL or use ALTER SYSTEM + pg_reload_conf()"
+        ocf_log err "  3. Cleanup resource: crm resource cleanup ${OCF_RESOURCE_INSTANCE}"
+        ocf_log err "============================================"
+        return $OCF_ERR_CONFIGURED
+    fi
+
+    ocf_log info "Replication slots OK on $cluster: need $slots_needed, have $available available"
+    return 0
+}
+
+#######################################################################
+# End of v2.0 Functions
+#######################################################################
 
 pgtwin_migrate_validate() {
     ocf_log info "Validating pgtwin-migrate configuration"
@@ -748,6 +1362,8 @@ discover_promoted_node() {
     # Discover the promoted (primary) node for a given clone resource
     # Usage: discover_promoted_node "postgres-clone"
     # Returns: node hostname or empty string
+    #
+    # FIXED v1.6.16: Added hostname resolution after node discovery
 
     local clone_resource="$1"
     local promoted_node=""
@@ -757,41 +1373,42 @@ discover_promoted_node() {
         return 1
     fi
 
-    # Extract base resource name from clone (e.g., postgres-clone → postgres-db)
-    # Try to find the primitive resource within the clone
-    local primitive_resource=$(crm_resource --list 2>/dev/null | grep -E "^\s*${clone_resource}:" | head -1 | awk -F: '{print $1}' | tr -d ' ')
+    # Use discover_cluster_node with Promoted role
+    # This function already includes hostname resolution
+    promoted_node=$(discover_cluster_node "$clone_resource" "Promoted")
 
-    if [ -z "$primitive_resource" ]; then
-        # Fallback: try to extract from configuration
-        primitive_resource=$(crm configure show "$clone_resource" 2>/dev/null | grep "^clone" | awk '{print $3}')
-    fi
-
-    if [ -z "$primitive_resource" ]; then
-        ocf_log warn "Could not determine primitive resource for clone: $clone_resource"
-        return 1
-    fi
-
-    ocf_log debug "Primitive resource for ${clone_resource}: ${primitive_resource}"
-
-    # Find promoted node using crm_mon
-    promoted_node=$(crm_mon -r -1 2>/dev/null | awk -v res="$primitive_resource" '
-        /Clone Set:/ { in_our_clone=0 }
-        $0 ~ "Clone Set:.*\\[" res "\\]" { in_our_clone=1 }
-        in_our_clone && /Promoted:/ {
-            gsub(/[\[\]]/,"")
-            print $NF
-            exit
-        }
-    ')
-
-    if [ -n "$promoted_node" ]; then
-        ocf_log info "Discovered promoted node for ${clone_resource}: ${promoted_node}"
+    if [ $? -eq 0 ] && [ -n "$promoted_node" ]; then
+        ocf_log info "Discovered Promoted node for ${clone_resource}: ${promoted_node}"
         echo "$promoted_node"
         return 0
     fi
 
-    ocf_log warn "Could not discover promoted node for: $clone_resource"
+    ocf_log warn "Could not discover Promoted node for: $clone_resource"
     return 1
+}
+
+resolve_cluster_node_to_hostname() {
+    # Resolve Pacemaker cluster node name to actual hostname/IP
+    # This is needed when cluster node names differ from system hostnames
+    local cluster_node="$1"
+
+    # Try to get the node's hostname from Pacemaker
+    if command -v crm_node >/dev/null 2>&1; then
+        # Query Pacemaker for node attributes
+        local node_hostname=$(crm_node -l 2>/dev/null | grep "^[0-9]* ${cluster_node} " | awk '{print $2}')
+
+        if [ -n "$node_hostname" ] && [ "$node_hostname" != "$cluster_node" ]; then
+            ocf_log debug "Resolved cluster node '${cluster_node}' to hostname '${node_hostname}'"
+            echo "$node_hostname"
+            return 0
+        fi
+    fi
+
+    # Last resort: return the cluster node name as-is (may not be resolvable)
+    # In most cases, the cluster node name IS the hostname
+    ocf_log debug "Using cluster node name as hostname: ${cluster_node}"
+    echo "$cluster_node"
+    return 0
 }
 
 discover_cluster_node() {
@@ -825,9 +1442,18 @@ discover_cluster_node() {
         "string(//clone[@id='${clone_resource}']/resource[@role='${role}']/node/@name)" - 2>/dev/null)
 
     if [ -n "$target_node" ]; then
-        ocf_log info "Discovered ${role} node for ${clone_resource}: ${target_node}"
-        echo "$target_node"
-        return 0
+        ocf_log info "Discovered ${role} cluster node for ${clone_resource}: ${target_node}"
+
+        # Resolve cluster node name to hostname/IP
+        target_node=$(resolve_cluster_node_to_hostname "$target_node")
+        if [ $? -eq 0 ]; then
+            ocf_log info "Resolved to connectable hostname: ${target_node}"
+            echo "$target_node"
+            return 0
+        else
+            ocf_log warn "Could not resolve cluster node to hostname"
+            return 1
+        fi
     fi
 
     ocf_log warn "Could not discover ${role} node for: $clone_resource"
@@ -836,9 +1462,12 @@ discover_cluster_node() {
 
 get_replication_user() {
     # Get replication user from .pgpass file
+    # Usage: get_replication_user [cluster_type]
     # Looks for entries with database=replication or database=postgres
 
-    local pgpass_file="/var/lib/pgsql/.pgpass"
+    local cluster_type="${1:-source}"  # Default to source cluster
+    local pghome=$(get_cluster_pghome "$cluster_type")
+    local pgpass_file="${pghome}/.pgpass"
 
     if [ ! -f "$pgpass_file" ]; then
         ocf_log warn ".pgpass file not found at $pgpass_file"
@@ -892,7 +1521,7 @@ check_subscription_exists() {
     local database="$4"
 
     local result=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc \
-        "SELECT count(*) FROM pg_subscription WHERE subname='${sub_name}';" 2>/dev/null)
+        "SELECT count(*) FROM pg_subscription WHERE subname='${sub_name}' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());" 2>/dev/null)
 
     if [ "$result" = "1" ]; then
         return 0  # Subscription exists
@@ -901,21 +1530,184 @@ check_subscription_exists() {
     fi
 }
 
+check_replication_slot_availability() {
+    # Check if sufficient replication slots are available on source cluster
+    # Usage: check_replication_slot_availability "source_host" "db_count"
+    # Returns: 0 if sufficient slots available, 1 if not
+    #
+    # Migration requires slots for:
+    #   - Forward replication: 1 slot per database (source → target)
+    #   - Reverse replication: 1 slot per database (target → source) - created during cutover
+    # Plus existing slots (HA physical slots, etc.)
+
+    local source_host="$1"
+    local db_count="$2"
+
+    # Query max_replication_slots from source
+    local max_slots=$(run_as_postgres_user "source" psql -h "$source_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -Atc \
+        "SHOW max_replication_slots;" 2>/dev/null)
+
+    if [ -z "$max_slots" ] || ! [[ "$max_slots" =~ ^[0-9]+$ ]]; then
+        ocf_log warn "Could not query max_replication_slots from source, skipping check"
+        return 0
+    fi
+
+    # Query current slot count (excluding our migration slots that may already exist)
+    local current_slots=$(run_as_postgres_user "source" psql -h "$source_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -Atc \
+        "SELECT count(*) FROM pg_replication_slots WHERE slot_name NOT LIKE 'pgtwin_migrate_%';" 2>/dev/null)
+
+    if [ -z "$current_slots" ] || ! [[ "$current_slots" =~ ^[0-9]+$ ]]; then
+        ocf_log warn "Could not query current replication slots from source, skipping check"
+        return 0
+    fi
+
+    # Calculate slots needed for migration (forward only during start, reverse created during cutover)
+    # Forward: 1 slot per database
+    # We need to ensure there's room for reverse slots too (1 per database)
+    local forward_slots_needed=$db_count
+    local reverse_slots_needed=$db_count
+    local total_slots_needed=$((forward_slots_needed + reverse_slots_needed))
+    local available_slots=$((max_slots - current_slots))
+
+    ocf_log info "Replication slot check:"
+    ocf_log info "  max_replication_slots: ${max_slots}"
+    ocf_log info "  Current non-migration slots: ${current_slots}"
+    ocf_log info "  Available slots: ${available_slots}"
+    ocf_log info "  Slots needed for migration: ${total_slots_needed} (${forward_slots_needed} forward + ${reverse_slots_needed} reverse)"
+
+    if [ "$available_slots" -lt "$total_slots_needed" ]; then
+        ocf_log err "Insufficient replication slots available!"
+        ocf_log err "  Need ${total_slots_needed} slots but only ${available_slots} available"
+        ocf_log err "  Current slots on source:"
+        run_as_postgres_user "source" psql -h "$source_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -c \
+            "SELECT slot_name, slot_type, active FROM pg_replication_slots ORDER BY slot_name;" 2>/dev/null | while read line; do
+            ocf_log err "    $line"
+        done
+        ocf_log err ""
+        ocf_log err "Resolution options:"
+        ocf_log err "  1. Increase max_replication_slots on source cluster (requires restart):"
+        ocf_log err "     ALTER SYSTEM SET max_replication_slots = $((current_slots + total_slots_needed + 2));"
+        ocf_log err "  2. Drop unused replication slots:"
+        ocf_log err "     SELECT pg_drop_replication_slot('slot_name');"
+        return 1
+    fi
+
+    ocf_log info "✓ Sufficient replication slots available"
+    return 0
+}
+
+ensure_replication_slots() {
+    # Ensure replication slots exist for all subscriptions in the given direction
+    # This recovers from situations where slots were lost (failover, restart, pg_rewind)
+    #
+    # Usage: ensure_replication_slots "direction" "slot_host" "subscription_host"
+    #   direction: "forward" or "reverse"
+    #   slot_host: host where slots should exist (source for forward, target for reverse)
+    #   subscription_host: host where subscriptions exist (target for forward, source for reverse)
+    #
+    # Forward replication: slots on source, subscriptions on target
+    # Reverse replication: slots on target, subscriptions on source
+    #
+    # Returns: 0 if all slots OK, 1 if recovery failed
+
+    local direction="$1"
+    local slot_host="$2"
+    local subscription_host="$3"
+    local recovered=0
+    local failed=0
+
+    # Determine which passfile to use based on direction
+    local slot_passfile subscription_passfile
+    if [ "$direction" = "forward" ]; then
+        slot_passfile="$OCF_RESKEY_source_pgpassfile"
+        subscription_passfile="$OCF_RESKEY_target_pgpassfile"
+    else
+        slot_passfile="$OCF_RESKEY_target_pgpassfile"
+        subscription_passfile="$OCF_RESKEY_source_pgpassfile"
+    fi
+
+    ocf_log debug "Checking ${direction} replication slots on: ${slot_host}"
+
+    for db in $DB_LIST; do
+        local slot_name="pgtwin_migrate_${direction}_slot_${db}"
+        local sub_name="pgtwin_migrate_${direction}_sub_${db}"
+
+        # Check if subscription exists on subscription_host
+        local sub_exists=$(PGPASSFILE="$subscription_passfile" psql -h "$subscription_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+            "SELECT count(*) FROM pg_subscription WHERE subname = '${sub_name}';" 2>/dev/null)
+
+        if [ "$sub_exists" != "1" ]; then
+            ocf_log debug "Subscription ${sub_name} does not exist, skipping slot check"
+            continue
+        fi
+
+        # Check if slot exists on slot_host
+        local slot_exists=$(PGPASSFILE="$slot_passfile" psql -h "$slot_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -Atc \
+            "SELECT count(*) FROM pg_replication_slots WHERE slot_name = '${slot_name}';" 2>/dev/null)
+
+        if [ "$slot_exists" = "0" ]; then
+            ocf_log warn "${direction^} replication slot missing: ${slot_name} - attempting recovery"
+
+            # Create the missing slot
+            local result=$(PGPASSFILE="$slot_passfile" psql -h "$slot_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "SELECT pg_create_logical_replication_slot('${slot_name}', 'pgoutput');" 2>&1)
+
+            if echo "$result" | grep -q "$slot_name"; then
+                ocf_log info "✓ Recovered ${direction} replication slot: ${slot_name}"
+                recovered=$((recovered + 1))
+
+                # Refresh the subscription to reconnect with new slot
+                PGPASSFILE="$subscription_passfile" psql -h "$subscription_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -c \
+                    "ALTER SUBSCRIPTION ${sub_name} DISABLE; ALTER SUBSCRIPTION ${sub_name} ENABLE;" >/dev/null 2>&1
+            else
+                ocf_log err "Failed to recover ${direction} replication slot: ${slot_name}"
+                ocf_log err "Error: ${result}"
+                failed=$((failed + 1))
+            fi
+        fi
+    done
+
+    if [ $recovered -gt 0 ]; then
+        ocf_log info "${direction^} slot recovery complete: ${recovered} slot(s) recovered, ${failed} failed"
+    fi
+
+    if [ $failed -gt 0 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# Wrapper functions for backward compatibility and clearer call sites
+ensure_forward_replication_slots() {
+    # Forward: slots on source, subscriptions on target
+    local source_host="$1"
+    local target_host="$2"
+    ensure_replication_slots "forward" "$source_host" "$target_host"
+}
+
+ensure_reverse_replication_slots() {
+    # Reverse: slots on target, subscriptions on source
+    local source_host="$1"  # Has reverse subscriptions
+    local target_host="$2"  # Has reverse slots
+    ensure_replication_slots "reverse" "$target_host" "$source_host"
+}
+
 get_subscription_state() {
     # Get subscription state and lag
-    # Usage: get_subscription_state "cluster_type" "hostname" "subscription_name"
+    # Usage: get_subscription_state "cluster_type" "hostname" "subscription_name" "database"
     # Returns: "subname|state|lag_bytes" or empty if not found
     # State values: streaming (worker running), startup (enabled but no worker yet), disabled
 
     local cluster_type="$1"
     local host="$2"
     local sub_name="$3"
+    local database="${4:-$OCF_RESKEY_pgdatabase}"  # Use provided database or fall back to parameter
 
     # PostgreSQL 17/18: Check if worker is running via pid column
     # If pid exists, worker is active (state='streaming')
     # If no pid but subenabled=true, worker is starting (state='startup')
     # If subenabled=false, subscription is disabled (state='disabled')
-    local state_info=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc "
+    local state_info=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc "
         SELECT
             s.subname,
             CASE
@@ -932,7 +1724,7 @@ get_subscription_state() {
             ) as lag_bytes
         FROM pg_subscription s
         LEFT JOIN pg_stat_subscription sr ON s.oid = sr.subid
-        WHERE s.subname = '${sub_name}'
+        WHERE s.subname = '${sub_name}' AND s.subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())
         GROUP BY s.subname, s.subenabled;
     " 2>/dev/null)
 
@@ -947,12 +1739,27 @@ get_subscription_state() {
 get_replication_lag() {
     # Get replication lag from subscription
     # Usage: get_replication_lag "cluster_type" "hostname" "subscription_name" "database"
-    # Returns: lag in bytes, or -1 if cannot determine
+    # Returns: lag in bytes, 0 if synced or empty database, -1 if cannot determine
 
     local cluster_type="$1"  # "source" or "target"
     local host="$2"
     local sub_name="$3"
     local database="$4"
+
+    # First check if subscription has any tables to replicate
+    # Empty databases (no tables) should be considered synced (lag = 0)
+    local table_count=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc "
+        SELECT COUNT(*) FROM pg_subscription_rel sr
+        JOIN pg_subscription s ON s.oid = sr.srsubid
+        WHERE s.subname = '${sub_name}';
+    " 2>/dev/null)
+
+    if [ "$table_count" = "0" ] || [ -z "$table_count" ]; then
+        # No tables to replicate - consider synced
+        ocf_log debug "Subscription ${sub_name} has no tables - treating as synced"
+        echo "0"
+        return 0
+    fi
 
     local lag=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc "
         SELECT COALESCE(
@@ -1062,7 +1869,7 @@ setup_subscription() {
         local tmpfile=$(mktemp)
         cat > "$tmpfile" <<EOF
 SET default_transaction_read_only = off;
-CREATE SUBSCRIPTION ${sub_name} CONNECTION '${conn_str}' PUBLICATION ${pub_name} WITH (create_slot = true, slot_name = '${slot_name}', copy_data = false);
+CREATE SUBSCRIPTION ${sub_name} CONNECTION '${conn_str}' PUBLICATION ${pub_name} WITH (create_slot = true, slot_name = '${slot_name}', copy_data = true);
 EOF
         run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -f "$tmpfile" >/dev/null 2>&1
         local rc=$?
@@ -1072,50 +1879,277 @@ EOF
             return 1
         fi
     else
-        run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -c \
+        local sub_output=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -c \
             "CREATE SUBSCRIPTION ${sub_name}
              CONNECTION '${conn_str}'
              PUBLICATION ${pub_name}
-             WITH (create_slot = true, slot_name = '${slot_name}', copy_data = false);" >/dev/null 2>&1
-        if [ $? -ne 0 ]; then
+             WITH (create_slot = true, slot_name = '${slot_name}', copy_data = true);" 2>&1)
+        local sub_rc=$?
+        if [ $sub_rc -ne 0 ]; then
             ocf_log err "Failed to create subscription: ${sub_name} on database: ${database}"
+            ocf_log err "Error output: $sub_output"
             return 1
         fi
     fi
 
     ocf_log info "✓ Subscription created: ${sub_name} on database: ${database}"
-
-    # Immediately refresh to copy table structures (don't wait for monitor)
-    ocf_log info "   Synchronizing table structures immediately (copy_data=true)"
-
-    local refresh_rc=0
-    if [ "$read_only_override" = "true" ]; then
-        # Create temporary SQL file (safer than HEREDOC in async background process)
-        local tmpfile=$(mktemp)
-        cat > "$tmpfile" <<EOF
-SET default_transaction_read_only = off;
-ALTER SUBSCRIPTION ${sub_name} REFRESH PUBLICATION WITH (copy_data = true);
-EOF
-        run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -f "$tmpfile" >/dev/null 2>&1
-        refresh_rc=$?
-        rm -f "$tmpfile"
-    else
-        run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -c \
-            "ALTER SUBSCRIPTION ${sub_name} REFRESH PUBLICATION WITH (copy_data = true);" >/dev/null 2>&1
-        refresh_rc=$?
-    fi
-
-    if [ $refresh_rc -eq 0 ]; then
-        ocf_log info "✓ Table structures synchronized"
-    else
-        ocf_log warn "Table sync will be handled by monitor auto-sync"
-    fi
+    ocf_log info "   Initial table sync started (copy_data=true)"
 
     return 0
 }
 
+#######################################################################
+# Unified database-level replication setup (handles both forward and reverse)
+#######################################################################
+
+setup_database_replication() {
+    # Set up complete replication for ONE database (forward or reverse direction)
+    # This is a self-contained function - only knows about this database
+    #
+    # Usage: setup_database_replication "db_name" "direction" "source_node" "target_node" ["skip_schema_copy"] ["create_disabled"] ["read_only_override"]
+    #
+    # Arguments:
+    #   db                  - Database name
+    #   direction           - "forward" or "reverse"
+    #   source_node         - Source node hostname (for logging)
+    #   target_node         - Target node hostname (for logging)
+    #   skip_schema_copy    - Optional: "true" to skip schema copy, defaults to "false"
+    #   create_disabled     - Optional: "true" to create disabled subscription, defaults to "false"
+    #   read_only_override  - Optional: "true" to override read_only for subscription creation, defaults to "false"
+    #
+    # Returns: 0 on success, 1 on failure
+
+    local db="$1"
+    local direction="$2"
+    local source_node="$3"
+    local target_node="$4"
+    local skip_schema_copy="${5:-false}"
+    local create_disabled="${6:-false}"
+    local read_only_override="${7:-false}"
+
+    # Validate direction
+    if [ "$direction" != "forward" ] && [ "$direction" != "reverse" ]; then
+        ocf_log err "Invalid direction: $direction (must be 'forward' or 'reverse')"
+        return 1
+    fi
+
+    # Determine source and target based on direction
+    local pub_cluster_type=""
+    local pub_host=""
+    local sub_cluster_type=""
+    local sub_host=""
+    local pub_name=""
+    local sub_name=""
+    local slot_name=""
+
+    if [ "$direction" = "forward" ]; then
+        # Forward: source -> target
+        pub_cluster_type="source"
+        pub_host="$OCF_RESKEY_source_replication_vip"
+        sub_cluster_type="target"
+        sub_host="$OCF_RESKEY_target_replication_vip"
+        pub_name="pgtwin_migrate_forward_pub_${db}"
+        sub_name="pgtwin_migrate_forward_sub_${db}"
+        slot_name="pgtwin_migrate_forward_slot_${db}"
+    else
+        # Reverse: target -> source
+        pub_cluster_type="target"
+        pub_host="$OCF_RESKEY_target_replication_vip"
+        sub_cluster_type="source"
+        sub_host="$OCF_RESKEY_source_replication_vip"
+        pub_name="pgtwin_migrate_reverse_pub_${db}"
+        sub_name="pgtwin_migrate_reverse_sub_${db}"
+        slot_name="pgtwin_migrate_reverse_slot_${db}"
+    fi
+
+    ocf_log info "=========================================="
+    ocf_log info "Setting up ${direction} replication for database: ${db}"
+    ocf_log info "  Publication: ${pub_cluster_type} ($pub_host)"
+    ocf_log info "  Subscription: ${sub_cluster_type} ($sub_host)"
+    ocf_log info "  Schema copy: $([ "$skip_schema_copy" = "true" ] && echo "SKIPPED" || echo "ENABLED")"
+    ocf_log info "  Create disabled: $([ "$create_disabled" = "true" ] && echo "YES" || echo "NO")"
+    ocf_log info "=========================================="
+
+    # Step 1: Create publication on source
+    ocf_log info "[${db}] Step 1: Creating publication on ${pub_cluster_type}"
+    if ! setup_publication "$pub_cluster_type" "$pub_host" "$pub_name" "$db" "false"; then
+        ocf_log err "[${db}] Failed to create publication"
+        return 1
+    fi
+    ocf_log info "[${db}] ✓ Publication created on ${pub_cluster_type}"
+
+    # Step 2a: Ensure database exists on target
+    ocf_log info "[${db}] Step 2a: Ensuring database exists on ${sub_cluster_type}"
+    local db_exists=$(run_as_postgres_user "$sub_cluster_type" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -Atc \
+        "SELECT 1 FROM pg_database WHERE datname = '$db';" 2>/dev/null)
+
+    if [ "$db_exists" != "1" ]; then
+        ocf_log info "[${db}] Creating database on ${sub_cluster_type} cluster"
+        local create_output=$(run_as_postgres_user "$sub_cluster_type" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d postgres -c \
+            "CREATE DATABASE \"$db\";" 2>&1)
+        local create_rc=$?
+        if [ $create_rc -ne 0 ]; then
+            ocf_log err "[${db}] Failed to create database on ${sub_cluster_type} cluster"
+            ocf_log err "[${db}] Error output: $create_output"
+            # Cleanup publication since we failed
+            ocf_log err "[${db}] Cleaning up publication"
+            run_as_postgres_user "$pub_cluster_type" psql -h "$pub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
+            return 1
+        fi
+        ocf_log info "[${db}] ✓ Database created on ${sub_cluster_type}"
+    else
+        ocf_log info "[${db}] ✓ Database already exists on ${sub_cluster_type}"
+    fi
+
+    # Step 2b: Copy schema from source to target (unless skipped)
+    if [ "$skip_schema_copy" = "true" ]; then
+        ocf_log info "[${db}] Step 2b: Schema copy SKIPPED (skip_schema_copy=true)"
+    else
+        ocf_log info "[${db}] Step 2b: Copying schema from ${pub_cluster_type} to ${sub_cluster_type}"
+
+        # Use custom format dump with selective TOC restoration
+        # This approach avoids copying problematic objects (functions, event triggers, publications)
+        # while ensuring correct dependency order (sequences before tables, etc.)
+
+        # Create temporary files for dump and TOC (in postgres-writable directory)
+        local tmp_dir=$(get_cluster_pghome "$pub_cluster_type")
+        local dump_file="${tmp_dir}/tmp_pgtwin_migrate_schema_${direction}_${db}_$$.dump"
+        local toc_file="${tmp_dir}/tmp_pgtwin_migrate_toc_${direction}_${db}_$$.list"
+        local filtered_toc="${tmp_dir}/tmp_pgtwin_migrate_filtered_${direction}_${db}_$$.list"
+
+        # Step 1: Create custom format dump
+        ocf_log debug "[${db}] Creating dump: $dump_file"
+        run_as_postgres_user "$pub_cluster_type" pg_dump -Fc --schema-only --no-owner --no-privileges \
+            -h "$pub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" \
+            -d "$db" -f "$dump_file" 2>/dev/null
+        local dump_rc=$?
+        ocf_log debug "[${db}] pg_dump exit code: $dump_rc"
+
+        if [ $dump_rc -ne 0 ]; then
+            ocf_log info "[${db}] No tables to copy (empty database or pg_dump failed)"
+            rm -f "$dump_file" "$toc_file" "$filtered_toc"
+        else
+            # Check if dump file was created
+            if [ ! -f "$dump_file" ]; then
+                ocf_log err "[${db}] Dump file not created: $dump_file"
+                return 1
+            fi
+            ocf_log debug "[${db}] Dump file created: $(ls -lh $dump_file 2>&1)"
+
+            # Step 2: Extract TOC from dump (using bash to avoid shell redirection issues)
+            ocf_log debug "[${db}] Extracting TOC to: $toc_file"
+            run_as_postgres_user "$pub_cluster_type" bash -c "pg_restore --list '$dump_file' > '$toc_file' 2>/dev/null"
+
+            # Check if TOC file was created
+            if [ ! -f "$toc_file" ]; then
+                ocf_log err "[${db}] TOC file not created: $toc_file"
+                rm -f "$dump_file"
+                return 1
+            fi
+            ocf_log debug "[${db}] TOC entries: $(wc -l < $toc_file 2>&1)"
+
+            # Step 3: Filter TOC to include only table-related objects
+            # Include: TABLE, SEQUENCE, DEFAULT, CONSTRAINT, FK CONSTRAINT
+            # Exclude: FUNCTION, EVENT TRIGGER, PUBLICATION (these cause problems)
+            # IMPORTANT: Run as postgres user to ensure correct file permissions
+            ocf_log debug "[${db}] Filtering TOC to: $filtered_toc"
+            run_as_postgres_user "$pub_cluster_type" bash -c "grep -E ' (TABLE|SEQUENCE|DEFAULT|CONSTRAINT|FK) ' '$toc_file' | grep -v 'FUNCTION\|EVENT TRIGGER\|PUBLICATION' > '$filtered_toc' 2>/dev/null"
+
+            # Check if filtered TOC has content
+            if [ ! -f "$filtered_toc" ] || [ ! -s "$filtered_toc" ]; then
+                ocf_log warn "[${db}] No table objects found in schema dump"
+                rm -f "$dump_file" "$toc_file" "$filtered_toc"
+                # Continue - not fatal, might be empty database
+            else
+                ocf_log debug "[${db}] Filtered TOC entries: $(wc -l < $filtered_toc 2>&1)"
+
+                # Step 4: Restore using filtered TOC
+                ocf_log debug "[${db}] Restoring schema to ${sub_cluster_type}"
+                local restore_output=$(run_as_postgres_user "$sub_cluster_type" pg_restore --use-list="$filtered_toc" \
+                    --no-owner --no-privileges \
+                    -h "$sub_host" -p "$OCF_RESKEY_pgport" \
+                    -U "$OCF_RESKEY_migration_dbuser" -d "$db" "$dump_file" 2>&1)
+                local restore_rc=$?
+                ocf_log debug "[${db}] pg_restore exit code: $restore_rc, output: $restore_output"
+
+                # Clean up temporary files
+                rm -f "$dump_file" "$toc_file" "$filtered_toc"
+
+                if [ $restore_rc -eq 0 ]; then
+                    ocf_log info "[${db}] ✓ Schema copied to ${sub_cluster_type} (custom format with TOC filtering)"
+                else
+                    ocf_log warn "[${db}] Schema copy had warnings (exit code: $restore_rc)"
+                    ocf_log warn "[${db}] Output: $restore_output"
+                    # Don't fail - this may be OK if tables already exist
+                fi
+            fi
+        fi
+    fi
+
+    # Step 3: Create subscription on target
+    if [ "$create_disabled" = "true" ]; then
+        ocf_log info "[${db}] Step 3: Creating DISABLED subscription on ${sub_cluster_type}"
+        local conn_str="host=${pub_host} port=${OCF_RESKEY_pgport} dbname=${db} user=${OCF_RESKEY_migration_dbuser}"
+
+        if ! setup_subscription_disabled "$sub_cluster_type" "$sub_host" "$sub_name" \
+            "$pub_name" "$slot_name" "$pub_host" "$db" "$read_only_override"; then
+            ocf_log err "[${db}] Failed to create disabled subscription"
+            # Cleanup publication
+            ocf_log err "[${db}] Cleaning up publication"
+            run_as_postgres_user "$pub_cluster_type" psql -h "$pub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
+            return 1
+        fi
+        ocf_log info "[${db}] ✓ DISABLED subscription created on ${sub_cluster_type}"
+    else
+        ocf_log info "[${db}] Step 3: Creating ENABLED subscription on ${sub_cluster_type}"
+        local conn_str="host=${pub_host} port=${OCF_RESKEY_pgport} dbname=${db} user=${OCF_RESKEY_migration_dbuser}"
+
+        if ! setup_subscription "$sub_cluster_type" "$sub_host" "$sub_name" "$conn_str" "$pub_name" "$slot_name" "$db" "false"; then
+            ocf_log err "[${db}] Failed to create subscription"
+            # Cleanup publication
+            ocf_log err "[${db}] Cleaning up publication"
+            run_as_postgres_user "$pub_cluster_type" psql -h "$pub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
+            return 1
+        fi
+        ocf_log info "[${db}] ✓ ENABLED subscription created on ${sub_cluster_type}"
+    fi
+
+    # Debug: Verify subscription is in the correct database
+    local verify_sub=$(run_as_postgres_user "$sub_cluster_type" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+        "SELECT subname FROM pg_subscription WHERE subname = '${sub_name}' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());" 2>/dev/null)
+    if [ "$verify_sub" = "$sub_name" ]; then
+        ocf_log info "[${db}] ✓ Subscription verified in correct database"
+    else
+        ocf_log warn "[${db}] Subscription verification failed (non-fatal)"
+    fi
+
+    ocf_log info "[${db}] ✓ ${direction} replication setup complete"
+    return 0
+}
+
+#######################################################################
+# Database-level forward replication setup (legacy wrapper)
+#######################################################################
+
+setup_database_forward_replication() {
+    # Legacy wrapper for setup_database_replication() - maintains backward compatibility
+    # Usage: setup_database_forward_replication "db_name" "source_node" "target_node"
+    # Returns: 0 on success, 1 on failure
+
+    local db="$1"
+    local source_node="$2"
+    local target_node="$3"
+
+    # Call unified function with forward direction, schema copy enabled, subscription enabled
+    setup_database_replication "$db" "forward" "$source_node" "$target_node" "false" "false"
+    return $?
+}
+
 # Create subscription with enabled=false (for reverse replication preparation)
-# Args: cluster_type, host, sub_name, pub_name, slot_name, source_host, database
+# Args: cluster_type, host, sub_name, pub_name, slot_name, source_host, database, [read_only_override]
 setup_subscription_disabled() {
     local cluster_type=$1
     local host=$2
@@ -1124,11 +2158,12 @@ setup_subscription_disabled() {
     local slot_name=$5
     local source_host=$6
     local database=$7
+    local read_only_override="${8:-false}"  # Optional, defaults to false
 
     # Check if subscription already exists
     local exists=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
         -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc \
-        "SELECT EXISTS(SELECT 1 FROM pg_subscription WHERE subname = '${sub_name}');" 2>/dev/null)
+        "SELECT EXISTS(SELECT 1 FROM pg_subscription WHERE subname = '${sub_name}' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database()));" 2>/dev/null)
 
     if [ "$exists" = "t" ]; then
         ocf_log info "Subscription ${sub_name} already exists on ${host} (database: ${database})"
@@ -1136,7 +2171,7 @@ setup_subscription_disabled() {
         # Check if it's enabled
         local is_enabled=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
             -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc \
-            "SELECT subenabled FROM pg_subscription WHERE subname = '${sub_name}';" 2>/dev/null)
+            "SELECT subenabled FROM pg_subscription WHERE subname = '${sub_name}' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());" 2>/dev/null)
 
         if [ "$is_enabled" = "t" ]; then
             ocf_log warn "Subscription ${sub_name} is ENABLED (expected disabled for preparation)"
@@ -1152,21 +2187,47 @@ setup_subscription_disabled() {
     ocf_log info "Creating DISABLED subscription: ${sub_name} on ${host} (database: ${database})"
     ocf_log info "   This creates replication slot on ${source_host} but doesn't start replication"
 
-    run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
-        -U "$OCF_RESKEY_migration_dbuser" -d "$database" -c \
-        "CREATE SUBSCRIPTION ${sub_name}
-         CONNECTION '${conn_str}'
-         PUBLICATION ${pub_name}
-         WITH (
-           enabled = false,
-           create_slot = true,
-           slot_name = '${slot_name}',
-           copy_data = false
-         );" >/dev/null 2>&1
+    if [ "$read_only_override" = "true" ]; then
+        # Create temporary SQL file with read_only override (for cutover when source is read-only)
+        local tmpfile=$(mktemp)
+        cat > "$tmpfile" <<EOF
+SET default_transaction_read_only = off;
+CREATE SUBSCRIPTION ${sub_name}
+CONNECTION '${conn_str}'
+PUBLICATION ${pub_name}
+WITH (
+  enabled = false,
+  create_slot = true,
+  slot_name = '${slot_name}',
+  copy_data = false
+);
+EOF
+        run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$database" -f "$tmpfile" >/dev/null 2>&1
+        local rc=$?
+        rm -f "$tmpfile"
+        if [ $rc -ne 0 ]; then
+            ocf_log err "Failed to create disabled subscription: ${sub_name}"
+            return 1
+        fi
+    else
+        # Normal mode (no read_only override needed)
+        run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$database" -c \
+            "CREATE SUBSCRIPTION ${sub_name}
+             CONNECTION '${conn_str}'
+             PUBLICATION ${pub_name}
+             WITH (
+               enabled = false,
+               create_slot = true,
+               slot_name = '${slot_name}',
+               copy_data = false
+             );" >/dev/null 2>&1
 
-    if [ $? -ne 0 ]; then
-        ocf_log err "Failed to create disabled subscription: ${sub_name}"
-        return 1
+        if [ $? -ne 0 ]; then
+            ocf_log err "Failed to create disabled subscription: ${sub_name}"
+            return 1
+        fi
     fi
 
     ocf_log info "✓ Disabled subscription created: ${sub_name}"
@@ -1209,19 +2270,18 @@ set_cluster_read_only() {
         return 1
     fi
 
-    # Verify the setting
+    # Verify the setting using pg_file_settings (immune to role-level overrides)
+    # Note: pgmigrate user has default_transaction_read_only=off role override
+    # so SHOW would always return 'off'. We check the file setting instead.
     local current_value=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
         -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc \
-        "SHOW default_transaction_read_only;" 2>/dev/null)
+        "SELECT setting FROM pg_file_settings WHERE name = 'default_transaction_read_only' AND sourcefile LIKE '%postgresql.auto.conf' ORDER BY seqno DESC LIMIT 1;" 2>/dev/null)
 
     # Normalize PostgreSQL boolean values for comparison
-    # PostgreSQL accepts true/false but SHOW returns on/off
     local expected_value="$read_only"
-    [ "$expected_value" = "true" ] && expected_value="on"
-    [ "$expected_value" = "false" ] && expected_value="off"
 
     if [ "$current_value" = "$expected_value" ]; then
-        ocf_log info "✓ Cluster is now in ${read_only} mode (verified: ${current_value})"
+        ocf_log info "✓ Cluster is now in ${read_only} mode (verified from postgresql.auto.conf: ${current_value})"
         return 0
     else
         ocf_log err "Failed to verify read-only mode: expected ${expected_value}, got ${current_value}"
@@ -1251,7 +2311,7 @@ enable_subscription() {
     # Verify it's enabled
     local is_enabled=$(run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" \
         -U "$OCF_RESKEY_migration_dbuser" -d "$database" -Atc \
-        "SELECT subenabled FROM pg_subscription WHERE subname = '${sub_name}';" 2>/dev/null)
+        "SELECT subenabled FROM pg_subscription WHERE subname = '${sub_name}' AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database());" 2>/dev/null)
 
     if [ "$is_enabled" = "t" ]; then
         ocf_log info "✓ Subscription enabled: ${sub_name} on database: ${database}"
@@ -1270,7 +2330,7 @@ init_database_migration() {
     # Initialize database migration state on first start
     # Creates baseline database list and per-database state files
 
-    local pghome=$(get_pghome "source")
+    local pghome=$(get_cluster_pghome "source")
     local baseline_file="${pghome}/.migration_databases_baseline"
 
     # Store baseline on first run
@@ -1302,7 +2362,7 @@ validate_database_list_before_cutover() {
     # Validate that database list hasn't changed since migration started
     # Returns 0 if valid, 1 if mismatch detected
 
-    local pghome=$(get_pghome "source")
+    local pghome=$(get_cluster_pghome "source")
     local baseline_file="${pghome}/.migration_databases_baseline"
 
     if [ ! -f "$baseline_file" ]; then
@@ -1382,7 +2442,7 @@ update_database_state() {
     local quiesced=$3
     local reverse_prepared=$4
 
-    local pghome=$(get_pghome "source")
+    local pghome=$(get_cluster_pghome "source")
     local state_file="${pghome}/.migration_state_${database}"
     local temp_file="${state_file}.tmp"
 
@@ -1404,7 +2464,7 @@ get_database_state() {
     local database=$1
     local field=$2
 
-    local pghome=$(get_pghome "source")
+    local pghome=$(get_cluster_pghome "source")
     local state_file="${pghome}/.migration_state_${database}"
 
     if [ ! -f "$state_file" ]; then
@@ -1449,6 +2509,54 @@ swap_vip_addresses() {
 
     ocf_log info "✓ VIP addresses swapped successfully"
     ocf_log info "   Applications now connect to target cluster via ${production_vip_ip}"
+    return 0
+}
+
+# Restore VIP IP addresses to original state (for rollback)
+restore_vip_addresses() {
+    # Restore VIPs to their original pre-migration IPs using configured parameters
+    # This is NOT a toggle - it sets VIPs to known original values
+    # Requires original_production_vip_ip and original_target_vip_ip parameters
+
+    if [ -z "$OCF_RESKEY_original_production_vip_ip" ] || [ -z "$OCF_RESKEY_original_target_vip_ip" ]; then
+        ocf_log warn "Original VIP IPs not configured - falling back to toggle swap"
+        ocf_log warn "For reliable rollback, configure original_production_vip_ip and original_target_vip_ip parameters"
+        swap_vip_addresses
+        return $?
+    fi
+
+    # Get current IPs
+    local current_production_vip_ip=$(crm configure show "$OCF_RESKEY_production_vip_resource" 2>/dev/null | grep -oP 'params ip=\K[0-9.]+' | head -1)
+    local current_target_vip_ip=$(crm configure show "$OCF_RESKEY_target_vip_resource" 2>/dev/null | grep -oP 'params ip=\K[0-9.]+' | head -1)
+
+    # Check if already at original state
+    if [ "$current_production_vip_ip" = "$OCF_RESKEY_original_production_vip_ip" ] && \
+       [ "$current_target_vip_ip" = "$OCF_RESKEY_original_target_vip_ip" ]; then
+        ocf_log info "VIPs already at original state - no restore needed"
+        return 0
+    fi
+
+    ocf_log info "Restoring VIP IPs to original state:"
+    ocf_log info "   ${OCF_RESKEY_production_vip_resource}: ${current_production_vip_ip} → ${OCF_RESKEY_original_production_vip_ip}"
+    ocf_log info "   ${OCF_RESKEY_target_vip_resource}: ${current_target_vip_ip} → ${OCF_RESKEY_original_target_vip_ip}"
+
+    # Restore production VIP to original IP
+    crm resource param "$OCF_RESKEY_production_vip_resource" set ip "$OCF_RESKEY_original_production_vip_ip" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        ocf_log err "Failed to restore production VIP to ${OCF_RESKEY_original_production_vip_ip}"
+        return 1
+    fi
+
+    # Restore target VIP to original IP
+    crm resource param "$OCF_RESKEY_target_vip_resource" set ip "$OCF_RESKEY_original_target_vip_ip" 2>/dev/null
+    if [ $? -ne 0 ]; then
+        ocf_log err "CRITICAL: Failed to restore target VIP (production VIP already restored!)"
+        ocf_log err "Manual recovery required:"
+        ocf_log err "   crm resource param $OCF_RESKEY_target_vip_resource set ip $OCF_RESKEY_original_target_vip_ip"
+        return 1
+    fi
+
+    ocf_log info "✓ VIP addresses restored to original state"
     return 0
 }
 
@@ -1612,10 +2720,11 @@ check_cluster_readwrite() {
         return 1
     fi
 
+    # Check pg_file_settings to see actual configured value (immune to role-level overrides)
     local readonly=$(run_as_postgres_user "$cluster_type" psql -h "$node_host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SHOW default_transaction_read_only;" 2>/dev/null)
+        "SELECT COALESCE((SELECT setting FROM pg_file_settings WHERE name = 'default_transaction_read_only' AND sourcefile LIKE '%postgresql.auto.conf' ORDER BY seqno DESC LIMIT 1), 'false');" 2>/dev/null)
 
-    if [ "$readonly" = "off" ]; then
+    if [ "$readonly" = "false" ] || [ "$readonly" = "off" ] || [ -z "$readonly" ]; then
         ocf_log err "  ✓ ${cluster_type^} is read-write"
         return 0
     else
@@ -1647,296 +2756,10 @@ EOSQL
     fi
 }
 
-check_forward_publication() {
-    # Check if forward publication exists on source
-    # Args: $1=source_node, $2=fix (true|false, default=false)
-    local source_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$source_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover source node"
-        return 1
-    fi
-
-    local pub_count=$(run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_publication WHERE pubname = 'pgtwin_migrate_forward_pub';" 2>/dev/null)
-
-    if [ "$pub_count" = "1" ]; then
-        ocf_log err "  ✓ Forward publication exists"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ Forward publication missing - attempting fix..."
-            run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-                "CREATE PUBLICATION pgtwin_migrate_forward_pub FOR ALL TABLES;" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: Forward publication created"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to create forward publication"
-                ocf_log err "    Manual recovery required: Run on source cluster:"
-                ocf_log err "      CREATE PUBLICATION pgtwin_migrate_forward_pub FOR ALL TABLES;"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: Forward publication missing"
-            ocf_log err "    Recovery: Run on source cluster:"
-            ocf_log err "      CREATE PUBLICATION pgtwin_migrate_forward_pub FOR ALL TABLES;"
-            return 1
-        fi
-    fi
-}
-
-check_forward_subscription() {
-    # Check if forward subscription exists on target
-    # Args: $1=target_node, $2=fix (true|false, default=false)
-    local target_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$target_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover target node"
-        return 1
-    fi
-
-    local sub_count=$(run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_subscription WHERE subname = 'pgtwin_migrate_forward_sub';" 2>/dev/null)
-
-    if [ "$sub_count" = "1" ]; then
-        ocf_log err "  ✓ Forward subscription exists"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ Forward subscription missing - attempting fix..."
-            local conn_str="host=${OCF_RESKEY_source_replication_vip} port=${OCF_RESKEY_pgport} user=${OCF_RESKEY_migration_dbuser} dbname=postgres"
-            run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" <<EOSQL >/dev/null 2>&1
-CREATE SUBSCRIPTION pgtwin_migrate_forward_sub
-CONNECTION '$conn_str'
-PUBLICATION pgtwin_migrate_forward_pub
-WITH (create_slot = true, slot_name = 'pgtwin_migrate_forward_slot');
-EOSQL
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: Forward subscription created"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to create forward subscription"
-                ocf_log err "    Manual recovery required: Run on target cluster:"
-                ocf_log err "      CREATE SUBSCRIPTION pgtwin_migrate_forward_sub"
-                ocf_log err "      CONNECTION 'host=${OCF_RESKEY_source_replication_vip} port=${OCF_RESKEY_pgport} user=${OCF_RESKEY_migration_dbuser} dbname=postgres'"
-                ocf_log err "      PUBLICATION pgtwin_migrate_forward_pub"
-                ocf_log err "      WITH (create_slot = true, slot_name = 'pgtwin_migrate_forward_slot');"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: Forward subscription missing"
-            ocf_log err "    Recovery: Run on target cluster:"
-            ocf_log err "      CREATE SUBSCRIPTION pgtwin_migrate_forward_sub"
-            ocf_log err "      CONNECTION 'host=${OCF_RESKEY_source_replication_vip} port=${OCF_RESKEY_pgport} user=${OCF_RESKEY_migration_dbuser} dbname=postgres'"
-            ocf_log err "      PUBLICATION pgtwin_migrate_forward_pub"
-            ocf_log err "      WITH (create_slot = true, slot_name = 'pgtwin_migrate_forward_slot');"
-            return 1
-        fi
-    fi
-}
-
-check_reverse_subscription_removed() {
-    # Check if reverse subscription has been removed from source
-    # Args: $1=source_node, $2=fix (true|false, default=false)
-    local source_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$source_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover source node"
-        return 1
-    fi
-
-    local sub_count=$(run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_subscription WHERE subname = 'pgtwin_migrate_reverse_sub';" 2>/dev/null)
-
-    if [ "$sub_count" = "0" ]; then
-        ocf_log err "  ✓ Reverse subscription removed from source"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ Reverse subscription still exists - attempting fix..."
-            run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" <<EOSQL >/dev/null 2>&1
-ALTER SUBSCRIPTION pgtwin_migrate_reverse_sub DISABLE;
-ALTER SUBSCRIPTION pgtwin_migrate_reverse_sub SET (slot_name = NONE);
-DROP SUBSCRIPTION IF EXISTS pgtwin_migrate_reverse_sub;
-EOSQL
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: Reverse subscription removed"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to remove reverse subscription"
-                ocf_log err "    Manual recovery required: Run on source cluster:"
-                ocf_log err "      ALTER SUBSCRIPTION pgtwin_migrate_reverse_sub DISABLE;"
-                ocf_log err "      ALTER SUBSCRIPTION pgtwin_migrate_reverse_sub SET (slot_name = NONE);"
-                ocf_log err "      DROP SUBSCRIPTION IF EXISTS pgtwin_migrate_reverse_sub;"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: Reverse subscription still exists on source"
-            ocf_log err "    Recovery: Run on source cluster:"
-            ocf_log err "      DROP SUBSCRIPTION IF EXISTS pgtwin_migrate_reverse_sub;"
-            return 1
-        fi
-    fi
-}
-
-check_reverse_publication_removed() {
-    # Check if reverse publication has been removed from target
-    # Args: $1=target_node, $2=fix (true|false, default=false)
-    local target_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$target_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover target node"
-        return 1
-    fi
-
-    local pub_count=$(run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_publication WHERE pubname = 'pgtwin_migrate_reverse_pub';" 2>/dev/null)
-
-    if [ "$pub_count" = "0" ]; then
-        ocf_log err "  ✓ Reverse publication removed from target"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ Reverse publication still exists - attempting fix..."
-            run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-                "DROP PUBLICATION IF EXISTS pgtwin_migrate_reverse_pub;" >/dev/null 2>&1
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: Reverse publication removed"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to remove reverse publication"
-                ocf_log err "    Manual recovery required: Run on target cluster:"
-                ocf_log err "      DROP PUBLICATION IF EXISTS pgtwin_migrate_reverse_pub;"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: Reverse publication still exists on target"
-            ocf_log err "    Recovery: Run on target cluster:"
-            ocf_log err "      DROP PUBLICATION IF EXISTS pgtwin_migrate_reverse_pub;"
-            return 1
-        fi
-    fi
-}
-
-check_forward_ddl_trigger_removed() {
-    # Check if forward DDL trigger has been removed from source
-    # Args: $1=source_node, $2=fix (true|false, default=false)
-    local source_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$source_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover source node"
-        return 1
-    fi
-
-    local trigger_count=$(run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_event_trigger WHERE evtname = 'replicate_ddl_to_target_trigger';" 2>/dev/null)
-
-    if [ "$trigger_count" = "0" ]; then
-        ocf_log err "  ✓ Forward DDL trigger removed from source"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ Forward DDL trigger still exists - attempting fix..."
-            run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" <<EOSQL >/dev/null 2>&1
-DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_target_trigger CASCADE;
-DROP FUNCTION IF EXISTS replicate_ddl_to_target() CASCADE;
-DROP FUNCTION IF EXISTS get_target_connection() CASCADE;
-EOSQL
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: Forward DDL trigger removed"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to remove forward DDL trigger"
-                ocf_log err "    Manual recovery required: Run on source cluster:"
-                ocf_log err "      DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_target_trigger CASCADE;"
-                ocf_log err "      DROP FUNCTION IF EXISTS replicate_ddl_to_target() CASCADE;"
-                ocf_log err "      DROP FUNCTION IF EXISTS get_target_connection() CASCADE;"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: Forward DDL trigger still exists on source"
-            ocf_log err "    Recovery: Run on source cluster:"
-            ocf_log err "      DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_target_trigger CASCADE;"
-            ocf_log err "      DROP FUNCTION IF EXISTS replicate_ddl_to_target() CASCADE;"
-            ocf_log err "      DROP FUNCTION IF EXISTS get_target_connection() CASCADE;"
-            return 1
-        fi
-    fi
-}
-
-check_ddl_trigger_removed() {
-    # Check if reverse DDL trigger has been removed from target
-    # Args: $1=target_node, $2=fix (true|false, default=false)
-    local target_node="$1"
-    local fix="${2:-false}"
-
-    if [ -z "$target_node" ]; then
-        ocf_log err "  ✗ FAILED: Cannot discover target node"
-        return 1
-    fi
-
-    local trigger_count=$(run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
-        "SELECT COUNT(*) FROM pg_event_trigger WHERE evtname = 'replicate_ddl_to_source_trigger';" 2>/dev/null)
-
-    if [ "$trigger_count" = "0" ]; then
-        ocf_log err "  ✓ DDL trigger removed from target"
-        return 0
-    else
-        # Issue found
-        if [ "$fix" = "true" ]; then
-            ocf_log err "  ⚠ DDL trigger still exists - attempting fix..."
-            run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" <<EOSQL >/dev/null 2>&1
-DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_source_trigger CASCADE;
-DROP FUNCTION IF EXISTS replicate_ddl_to_source() CASCADE;
-DROP FUNCTION IF EXISTS get_source_connection() CASCADE;
-EOSQL
-            if [ $? -eq 0 ]; then
-                ocf_log err "  🔧 FIXED: DDL trigger removed"
-                return 0
-            else
-                ocf_log err "  ✗ ERROR: Failed to remove DDL trigger"
-                ocf_log err "    Manual recovery required: Run on target cluster:"
-                ocf_log err "      DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_source_trigger CASCADE;"
-                ocf_log err "      DROP FUNCTION IF EXISTS replicate_ddl_to_source() CASCADE;"
-                ocf_log err "      DROP FUNCTION IF EXISTS get_source_connection() CASCADE;"
-                return 1
-            fi
-        else
-            # Check-only mode
-            ocf_log err "  ✗ FAILED: DDL trigger still exists on target"
-            ocf_log err "    Recovery: Run on target cluster:"
-            ocf_log err "      DROP EVENT TRIGGER IF EXISTS replicate_ddl_to_source_trigger CASCADE;"
-            ocf_log err "      DROP FUNCTION IF EXISTS replicate_ddl_to_source() CASCADE;"
-            ocf_log err "      DROP FUNCTION IF EXISTS get_source_connection() CASCADE;"
-            return 1
-        fi
-    fi
-}
-
-# ============================================================================
-# END OF SANITY CHECK FUNCTIONS
-# ============================================================================
-
 rollback_cutover() {
     # Rollback failed cutover to restore original state
     # Arguments: $1 = step where failure occurred, $2 = error message
-    # New clean rollback matching 7-step cutover sequence
+    # Updated for 9-step zero-risk cutover sequence
 
     local failed_step="$1"
     local error_msg="$2"
@@ -1961,6 +2784,10 @@ rollback_cutover() {
     local first_db="${DB_LIST%% *}"
 
     # Rollback logic based on where we failed
+    # Steps 1-2: Before reverse infrastructure creation
+    # Steps 3-4: After reverse infrastructure creation, before VIP swap
+    # Step 5: During VIP swap
+    # Steps 6-9: After VIP swap succeeded
     case $failed_step in
         1|2)
             # Failed during read-only or sync wait
@@ -1974,8 +2801,9 @@ rollback_cutover() {
             fi
             ;;
 
-        3)
-            # Failed during reverse infrastructure creation (quiesce-based)
+        3|4)
+            # Failed during reverse infrastructure creation (step 3) or verification (step 4)
+            # VIP has NOT been swapped yet - safe to cleanup and restore
             # Cleanup reverse infrastructure, then restore source to read-write
             ocf_log info "Rollback: Cleaning up reverse infrastructure (if partially created)"
             for db in $DB_LIST; do
@@ -2007,11 +2835,16 @@ EOSQL
 
             ocf_log info "Rollback: Restoring source cluster to read-write"
             set_cluster_read_only "source" "$source_primary" "false" "$first_db"
+            if [ $? -eq 0 ]; then
+                ocf_log info "✓ Source cluster restored to production (read-write)"
+            else
+                ocf_log err "✗ Failed to restore source to read-write (MANUAL FIX REQUIRED)"
+            fi
             ;;
 
-        4)
+        5)
             # Failed during VIP swap
-            # Cleanup reverse infrastructure, swap VIPs back, then restore read-write
+            # Cleanup reverse infrastructure, swap VIPs back (may be partial), restore read-write
             ocf_log info "Rollback: Cleaning up reverse infrastructure"
             for db in $DB_LIST; do
                 local reverse_pub_name="pgtwin_migrate_reverse_pub_${db}"
@@ -2036,8 +2869,8 @@ EOSQL
                 fi
             done
 
-            ocf_log info "Rollback: Swapping VIP IPs back to original state"
-            swap_vip_addresses  # Swap back (function is idempotent)
+            ocf_log info "Rollback: Restoring VIP IPs to original state"
+            restore_vip_addresses  # Restore to configured original IPs
             if [ $? -eq 0 ]; then
                 ocf_log info "✓ VIPs restored to original state"
             else
@@ -2049,10 +2882,15 @@ EOSQL
 
             ocf_log info "Rollback: Restoring source cluster to read-write"
             set_cluster_read_only "source" "$source_primary" "false" "$first_db"
+            if [ $? -eq 0 ]; then
+                ocf_log info "✓ Source cluster restored to production (read-write)"
+            else
+                ocf_log err "✗ Failed to restore source to read-write (MANUAL FIX REQUIRED)"
+            fi
             ;;
 
-        5|6|7|8)
-            # Failed after VIP swap (step 4 succeeded)
+        6|7|8|9)
+            # Failed after VIP swap (step 5 succeeded)
             # Recovery strategy:
             # 1. Disable reverse subscriptions (if enabled) - ALL DATABASES
             # 2. Re-enable forward subscriptions (restore original replication) - ALL DATABASES
@@ -2085,8 +2923,8 @@ EOSQL
                 fi
             done
 
-            ocf_log info "Rollback: Swapping VIP IPs back to original state"
-            swap_vip_addresses  # Swap back
+            ocf_log info "Rollback: Restoring VIP IPs to original state"
+            restore_vip_addresses  # Restore to configured original IPs
             if [ $? -eq 0 ]; then
                 ocf_log info "✓ VIPs restored to original state"
             else
@@ -2130,6 +2968,84 @@ EOSQL
     return 1
 }
 
+start_async_cutover_v2() {
+    # v2.0: Start cutover in background with direction awareness
+    # Usage: start_async_cutover_v2 "current_production" "desired_production" "old_direction" "new_direction"
+
+    local current_production="$1"
+    local desired_production="$2"
+    local old_direction="$3"
+    local new_direction="$4"
+
+    local pghome=$(get_cluster_pghome "target")
+    local cutover_state_file="${pghome}/.cutover_in_progress_${OCF_RESOURCE_INSTANCE}"
+    local cutover_timestamp=$(date '+%Y%m%d-%H%M%S')
+    local cutover_log="${pghome}/.cutover-${cutover_timestamp}.log"
+    local cutover_log_symlink="${pghome}/.cutover.log"
+
+    if [ -f "$cutover_state_file" ]; then
+        ocf_log info "Cutover already in progress"
+        return 0
+    fi
+
+    ocf_log info "Starting v2.0 asynchronous cutover"
+    ocf_log info "  From: $current_production ($old_direction replication)"
+    ocf_log info "  To: $desired_production ($new_direction replication)"
+    ocf_log info "  Log: $cutover_log"
+
+    # Create state file
+    cat > "$cutover_state_file" <<EOF
+status=running
+start_time=$(date +%s)
+step=0
+current_step='Initializing v2.0 cutover'
+error_message=''
+failed_step=''
+cutover_log='$cutover_log'
+v2_current_production='$current_production'
+v2_desired_production='$desired_production'
+v2_old_direction='$old_direction'
+v2_new_direction='$new_direction'
+EOF
+    chown postgres:postgres "$cutover_state_file"
+
+    touch "$cutover_log"
+    chown postgres:postgres "$cutover_log"
+    rm -f "$cutover_log_symlink"
+    ln -s "$(basename "$cutover_log")" "$cutover_log_symlink"
+
+    # Export all necessary variables for background process
+    ( export OCF_RESKEY_pgdata="$OCF_RESKEY_pgdata"
+      export OCF_RESKEY_pgport="$OCF_RESKEY_pgport"
+      export OCF_RESKEY_migration_dbuser="$OCF_RESKEY_migration_dbuser"
+      export OCF_RESKEY_databases="$OCF_RESKEY_databases"
+      export OCF_RESKEY_source_cluster="$OCF_RESKEY_source_cluster"
+      export OCF_RESKEY_target_cluster="$OCF_RESKEY_target_cluster"
+      export OCF_RESKEY_source_replication_vip="$OCF_RESKEY_source_replication_vip"
+      export OCF_RESKEY_target_replication_vip="$OCF_RESKEY_target_replication_vip"
+      export OCF_RESKEY_production_vip_resource="$OCF_RESKEY_production_vip_resource"
+      export OCF_RESKEY_target_vip_resource="$OCF_RESKEY_target_vip_resource"
+      export OCF_RESKEY_original_production_vip_ip="$OCF_RESKEY_original_production_vip_ip"
+      export OCF_RESKEY_original_target_vip_ip="$OCF_RESKEY_original_target_vip_ip"
+      export OCF_RESKEY_source_pgpassfile="$OCF_RESKEY_source_pgpassfile"
+      export OCF_RESKEY_target_pgpassfile="$OCF_RESKEY_target_pgpassfile"
+      export OCF_RESKEY_cutover_debug="$OCF_RESKEY_cutover_debug"
+      export OCF_RESKEY_lag_threshold="$OCF_RESKEY_lag_threshold"
+      export OCF_RESKEY_production_cluster="$OCF_RESKEY_production_cluster"
+      export PGTWIN_V2_CURRENT_PRODUCTION="$current_production"
+      export PGTWIN_V2_DESIRED_PRODUCTION="$desired_production"
+      export PGTWIN_V2_OLD_DIRECTION="$old_direction"
+      export PGTWIN_V2_NEW_DIRECTION="$new_direction"
+      nohup "$0" internal-cutover-v2 >> "$cutover_log" 2>&1 &
+      echo $! )
+    local cutover_pid=$!
+
+    echo "pid=$cutover_pid" >> "$cutover_state_file"
+
+    ocf_log info "v2.0 cutover started in background (PID: $cutover_pid)"
+    return 0
+}
+
 start_async_cutover() {
     # Start cutover preparation in background to avoid monitor timeout
     # Creates state file to track progress
@@ -2160,14 +3076,15 @@ start_async_cutover() {
     fi
 
     # Create state file with initial status
+    # Note: Values must be quoted for safe sourcing (shell special chars)
     cat > "$cutover_state_file" <<EOF
 status=running
 start_time=$(date +%s)
 step=0
-current_step=Initializing
-error_message=
-failed_step=
-cutover_log=$cutover_log
+current_step='Initializing'
+error_message=''
+failed_step=''
+cutover_log='$cutover_log'
 EOF
     chown postgres:postgres "$cutover_state_file"
 
@@ -2351,19 +3268,272 @@ check_cutover_progress() {
 }
 
 
+pgtwin_migrate_prepare_cutover_v2() {
+    # v2.0 BIDIRECTIONAL CUTOVER
+    # Key changes from v1:
+    #   - DELETES old direction replication (not just disable)
+    #   - CREATES new direction replication (fresh)
+    #   - Updates CIB with new production cluster
+    #   - Supports both forward→reverse and reverse→forward
+
+    log_ts() {
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+    }
+
+    # Get direction info from environment
+    local current_production="$PGTWIN_V2_CURRENT_PRODUCTION"
+    local desired_production="$PGTWIN_V2_DESIRED_PRODUCTION"
+    local old_direction="$PGTWIN_V2_OLD_DIRECTION"
+    local new_direction="$PGTWIN_V2_NEW_DIRECTION"
+
+    # Load OCF functions
+    : ${OCF_FUNCTIONS_DIR=${OCF_ROOT}/lib/heartbeat}
+    . ${OCF_FUNCTIONS_DIR}/ocf-shellfuncs
+
+    local pghome=$(get_cluster_pghome "target")
+    local cutover_state_file="${pghome}/.cutover_in_progress_${OCF_RESOURCE_INSTANCE}"
+
+    source "$cutover_state_file"
+    if [ -z "$cutover_log" ]; then
+        cutover_log="${pghome}/.cutover.log"
+    fi
+
+    log_ts "=========================================="
+    log_ts "v2.0 BIDIRECTIONAL CUTOVER STARTING"
+    log_ts "=========================================="
+    log_ts "Current production: $current_production"
+    log_ts "Desired production: $desired_production"
+    log_ts "Old direction: $old_direction (will be DELETED)"
+    log_ts "New direction: $new_direction (will be CREATED)"
+
+    # Get database list
+    get_database_list >/dev/null 2>&1
+    log_ts "Databases: $DB_LIST ($DB_COUNT total)"
+
+    # Determine old and new production nodes
+    local old_production_node new_production_node
+    if [ "$current_production" = "$OCF_RESKEY_source_cluster" ]; then
+        old_production_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+        new_production_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+    else
+        old_production_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+        new_production_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+    fi
+
+    if [ -z "$old_production_node" ] || [ -z "$new_production_node" ]; then
+        log_ts "ERROR: Cannot discover nodes (old=$old_production_node, new=$new_production_node)"
+        echo "status=failed" >> "$cutover_state_file"
+        echo "error_message='Cannot discover cluster nodes'" >> "$cutover_state_file"
+        return 1
+    fi
+
+    log_ts "Old production node: $old_production_node"
+    log_ts "New production node: $new_production_node"
+
+    # Determine passfiles and hosts
+    local old_passfile new_passfile old_host new_host
+    if [ "$current_production" = "$OCF_RESKEY_source_cluster" ]; then
+        old_passfile="$OCF_RESKEY_source_pgpassfile"
+        old_host="$OCF_RESKEY_source_replication_vip"
+        new_passfile="$OCF_RESKEY_target_pgpassfile"
+        new_host="$OCF_RESKEY_target_replication_vip"
+    else
+        old_passfile="$OCF_RESKEY_target_pgpassfile"
+        old_host="$OCF_RESKEY_target_replication_vip"
+        new_passfile="$OCF_RESKEY_source_pgpassfile"
+        new_host="$OCF_RESKEY_source_replication_vip"
+    fi
+
+    local first_db="${DB_LIST%% *}"
+
+    #------------------------------------------------------------------------
+    # STEP 1: Set old production to READ-ONLY
+    #------------------------------------------------------------------------
+    echo "step=1" >> "$cutover_state_file"
+    echo "current_step='Setting old production to read-only'" >> "$cutover_state_file"
+    log_ts "Step 1/8: Setting old production ($current_production) to read-only"
+
+    PGPASSFILE="$old_passfile" psql -h "$old_host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d "$first_db" \
+        -c "ALTER SYSTEM SET default_transaction_read_only = on; SELECT pg_reload_conf();" >/dev/null 2>&1
+
+    log_ts "✓ Old production is now read-only"
+
+    #------------------------------------------------------------------------
+    # STEP 2: Wait for replication sync (lag = 0)
+    #------------------------------------------------------------------------
+    echo "step=2" >> "$cutover_state_file"
+    echo "current_step='Waiting for replication sync'" >> "$cutover_state_file"
+    log_ts "Step 2/8: Waiting for $old_direction replication sync"
+
+    local max_wait=300
+    local waited=0
+    while [ $waited -lt $max_wait ]; do
+        local max_lag=0
+        for db in $DB_LIST; do
+            local sub_name="pgtwin_migrate_${old_direction}_sub_${db}"
+            local sub_host sub_passfile
+            if [ "$old_direction" = "forward" ]; then
+                sub_host="$OCF_RESKEY_target_replication_vip"
+                sub_passfile="$OCF_RESKEY_target_pgpassfile"
+            else
+                sub_host="$OCF_RESKEY_source_replication_vip"
+                sub_passfile="$OCF_RESKEY_source_pgpassfile"
+            fi
+
+            local lag=$(PGPASSFILE="$sub_passfile" psql -h "$sub_host" -p "$OCF_RESKEY_pgport" \
+                -U "$OCF_RESKEY_migration_dbuser" -d "$db" -t -A \
+                -c "SELECT COALESCE(pg_wal_lsn_diff(latest_end_lsn, confirmed_flush_lsn), 0)
+                    FROM pg_stat_subscription WHERE subname = '${sub_name}';" 2>/dev/null)
+            lag=${lag:-0}
+            if [ "$lag" -gt "$max_lag" ]; then
+                max_lag=$lag
+            fi
+        done
+
+        if [ "$max_lag" -eq 0 ]; then
+            log_ts "✓ Replication synchronized (lag = 0)"
+            break
+        fi
+
+        log_ts "Waiting for sync: lag = $max_lag bytes"
+        sleep 5
+        waited=$((waited + 5))
+    done
+
+    if [ $waited -ge $max_wait ]; then
+        log_ts "ERROR: Timeout waiting for replication sync"
+        # Restore read-write
+        PGPASSFILE="$old_passfile" psql -h "$old_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$first_db" \
+            -c "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" >/dev/null 2>&1
+        echo "status=failed" >> "$cutover_state_file"
+        echo "error_message='Timeout waiting for sync'" >> "$cutover_state_file"
+        return 1
+    fi
+
+    #------------------------------------------------------------------------
+    # STEP 3: DELETE old direction replication
+    #------------------------------------------------------------------------
+    echo "step=3" >> "$cutover_state_file"
+    echo "current_step='Deleting old replication direction'" >> "$cutover_state_file"
+    log_ts "Step 3/8: Deleting $old_direction replication"
+
+    delete_replication_direction "$old_direction"
+    log_ts "✓ Deleted $old_direction replication infrastructure"
+
+    #------------------------------------------------------------------------
+    # STEP 4: CREATE new direction replication
+    #------------------------------------------------------------------------
+    echo "step=4" >> "$cutover_state_file"
+    echo "current_step='Creating new replication direction'" >> "$cutover_state_file"
+    log_ts "Step 4/8: Creating $new_direction replication"
+
+    if ! create_replication_direction "$new_direction"; then
+        log_ts "ERROR: Failed to create $new_direction replication"
+        # Try to recreate old direction for rollback
+        create_replication_direction "$old_direction"
+        # Restore read-write
+        PGPASSFILE="$old_passfile" psql -h "$old_host" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$first_db" \
+            -c "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" >/dev/null 2>&1
+        echo "status=failed" >> "$cutover_state_file"
+        echo "error_message='Failed to create new replication'" >> "$cutover_state_file"
+        return 1
+    fi
+
+    log_ts "✓ Created $new_direction replication infrastructure"
+
+    #------------------------------------------------------------------------
+    # STEP 5: Swap VIP addresses
+    #------------------------------------------------------------------------
+    echo "step=5" >> "$cutover_state_file"
+    echo "current_step='Swapping VIP addresses'" >> "$cutover_state_file"
+    log_ts "Step 5/8: Swapping VIP addresses"
+
+    swap_vip_addresses
+    log_ts "✓ VIP addresses swapped"
+
+    #------------------------------------------------------------------------
+    # STEP 6: Set old production back to READ-WRITE
+    #------------------------------------------------------------------------
+    echo "step=6" >> "$cutover_state_file"
+    echo "current_step='Restoring old production to read-write'" >> "$cutover_state_file"
+    log_ts "Step 6/8: Setting old production back to read-write"
+
+    PGPASSFILE="$old_passfile" psql -h "$old_host" -p "$OCF_RESKEY_pgport" \
+        -U "$OCF_RESKEY_migration_dbuser" -d "$first_db" \
+        -c "ALTER SYSTEM SET default_transaction_read_only = off; SELECT pg_reload_conf();" >/dev/null 2>&1
+
+    log_ts "✓ Old production is now read-write (ready for reverse replication)"
+
+    #------------------------------------------------------------------------
+    # STEP 7: Update CIB with new production cluster
+    #------------------------------------------------------------------------
+    echo "step=7" >> "$cutover_state_file"
+    echo "current_step='Updating CIB state'" >> "$cutover_state_file"
+    log_ts "Step 7/8: Updating CIB with new production cluster"
+
+    crm_attribute -n migration-production-cluster -v "$desired_production" 2>/dev/null
+    crm_attribute -n migration-last-cutover -v "$(date -Iseconds)" 2>/dev/null
+
+    log_ts "✓ CIB updated: production_cluster = $desired_production"
+
+    #------------------------------------------------------------------------
+    # STEP 8: Complete
+    #------------------------------------------------------------------------
+    echo "step=8" >> "$cutover_state_file"
+    echo "current_step='Cutover complete'" >> "$cutover_state_file"
+    echo "status=complete" >> "$cutover_state_file"
+
+    log_ts "=========================================="
+    log_ts "✓ v2.0 CUTOVER COMPLETE"
+    log_ts "=========================================="
+    log_ts "New production cluster: $desired_production"
+    log_ts "Active replication: $new_direction"
+    log_ts ""
+    log_ts "To switch back, run:"
+    log_ts "  crm resource update ${OCF_RESOURCE_INSTANCE} production_cluster=$current_production"
+    log_ts ""
+    log_ts "To finalize migration (cleanup):"
+    log_ts "  crm resource update ${OCF_RESOURCE_INSTANCE} finalize_replication=true"
+    log_ts "  crm resource stop ${OCF_RESOURCE_INSTANCE}"
+    log_ts "=========================================="
+
+    # Clean up state file after brief delay
+    sleep 2
+    rm -f "$cutover_state_file"
+
+    return 0
+}
+
 pgtwin_migrate_prepare_cutover() {
-    # CLEAN 7-STEP AUTOMATED CUTOVER with ZERO DATA LOSS GUARANTEE
-    # Uses disabled subscription + replication slot for gap-free coverage
+    # ZERO-RISK CUTOVER with ZERO DATA LOSS GUARANTEE
+    # Creates and enables reverse replication BEFORE VIP swap
     # Called internally by async background process
     #
     # Steps:
-    #  1: Set source (PG17) to read-only mode
+    #  1: Set source (PG17) to read-only mode (apps blocked, pgmigrate unaffected)
     #  2: Wait for forward replication sync (lag=0)
-    #  3: Swap VIP IP addresses (PRODUCTION CUTOVER)
-    #  4: Set source (PG17) back to read-write
-    #  5: Enable reverse subscription (starts replication PG18→PG17)
-    #  6: Monitor reverse replication
-    #  7: Disable forward subscription (no longer needed)
+    #  3: Create and enable reverse replication infrastructure (ENABLED!)
+    #     - pgmigrate role bypasses read-only mode (role-level setting)
+    #     - Apply worker inherits pgmigrate's bypass
+    #  4: Verify reverse subscriptions are streaming (lag=0)
+    #  5: Swap VIP IP addresses (PRODUCTION CUTOVER)
+    #     - Apps start writing to target
+    #     - Reverse replication ALREADY ACTIVE (zero risk!)
+    #  6: Disable forward subscriptions (no longer needed)
+    #  7: Set source (PG17) back to read-write
+    #  8: Enable reverse DDL triggers
+    #  9: Monitor reverse replication
+    #
+    # KEY INSIGHT: Reverse replication is enabled BEFORE VIP swap.
+    # When apps start writing to target, changes are immediately
+    # replicated to source. NO RISK WINDOW.
+    #
+    # PREREQUISITE: pgmigrate role must have:
+    #   ALTER ROLE pgmigrate SET default_transaction_read_only = off;
+    # This allows pgmigrate (and apply workers) to write while DB is read-only.
     #
     # On any failure: Automatic rollback to restore PG17 production
     # This function runs in background, not in monitor context
@@ -2394,7 +3564,7 @@ pgtwin_migrate_prepare_cutover() {
     fi
 
     # Use PGHOME for state file (not PGDATA to avoid basebackup contamination)
-    local pghome="/var/lib/pgsql"
+    local pghome=$(get_cluster_pghome "source")
     # Include resource instance name to avoid confusion with other migration resources
     local cutover_state_file="${pghome}/.cutover_in_progress_${OCF_RESOURCE_INSTANCE}"
 
@@ -2426,7 +3596,7 @@ pgtwin_migrate_prepare_cutover() {
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=0" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 0 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
@@ -2447,7 +3617,7 @@ pgtwin_migrate_prepare_cutover() {
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=0" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 0 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
@@ -2459,7 +3629,7 @@ pgtwin_migrate_prepare_cutover() {
     # STEP 1: Set source cluster (PG17) to read-only mode
     #------------------------------------------------------------------------
     echo "step=1" >> "$cutover_state_file"
-    echo "current_step=Setting source cluster to read-only" >> "$cutover_state_file"
+    echo "current_step='Setting source cluster to read-only'" >> "$cutover_state_file"
 
     ocf_log info "Step 1/6: Setting source cluster to read-only"
     log_ts "Step 1/6: Setting source cluster to read-only"
@@ -2471,7 +3641,7 @@ pgtwin_migrate_prepare_cutover() {
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=1" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 1 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
@@ -2483,7 +3653,7 @@ pgtwin_migrate_prepare_cutover() {
     # STEP 2: Wait for forward replication sync (lag=0) - ALL DATABASES
     #------------------------------------------------------------------------
     echo "step=2" >> "$cutover_state_file"
-    echo "current_step=Waiting for forward replication sync (all databases)" >> "$cutover_state_file"
+    echo "current_step='Waiting for forward replication sync (all databases)'" >> "$cutover_state_file"
 
     ocf_log info "Step 2/6: Waiting for forward replication to sync (lag=0) for ALL databases"
     log_ts "Step 2/6: Waiting for forward replication to sync (${DB_COUNT} databases)"
@@ -2543,133 +3713,192 @@ pgtwin_migrate_prepare_cutover() {
         done
         echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=2" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 2 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
 
     #------------------------------------------------------------------------
-    # STEP 3: Create reverse replication infrastructure (QUIESCE-BASED) - ALL DATABASES
+    # STEP 3: Create and enable reverse replication infrastructure
+    # ZERO-RISK: Enable reverse replication BEFORE VIP swap
+    # pgmigrate role has read_only bypass, so apply worker can write to read-only source
     #------------------------------------------------------------------------
     echo "step=3" >> "$cutover_state_file"
-    echo "current_step=Creating reverse replication infrastructure (quiesce-based)" >> "$cutover_state_file"
+    echo "current_step='Creating reverse replication infrastructure (all databases)'" >> "$cutover_state_file"
 
-    ocf_log info "Step 3/8: Creating reverse replication infrastructure DURING quiesce (${DB_COUNT} databases)"
-    log_ts "Step 3/8: Creating reverse replication infrastructure (quiesce-based)"
-    log_ts "   OPTIMAL TIMING: Source quiesced, minimal WAL accumulation"
-    log_ts "   Eliminates race conditions from early slot creation"
+    ocf_log info "Step 3/9: Creating and enabling reverse replication infrastructure"
+    log_ts "Step 3/9: Creating reverse replication infrastructure (${DB_COUNT} databases)"
+    log_ts "   ZERO-RISK: pgmigrate role bypasses read-only mode"
+    log_ts "   Reverse replication will start BEFORE VIP swap"
 
-    local reverse_prep_failed=false
+    local reverse_setup_failed=false
     for db in $DB_LIST; do
         local reverse_pub_name="pgtwin_migrate_reverse_pub_${db}"
         local reverse_sub_name="pgtwin_migrate_reverse_sub_${db}"
         local reverse_slot_name="pgtwin_migrate_reverse_slot_${db}"
-        local trigger_name="replicate_ddl_to_source_trigger_${db}"
+        local conn_str="host=${target_primary} port=${OCF_RESKEY_pgport} dbname=${db} user=${OCF_RESKEY_migration_dbuser}"
 
-        ocf_log info "Creating reverse infrastructure for database: $db"
-        log_ts "  Database $db: creating reverse replication infrastructure..."
+        log_ts "  Database $db: creating reverse publication on target..."
 
-        # Step 3a: Create reverse publication on target
+        # Create reverse publication on target (publisher)
         if ! setup_publication "target" "$target_primary" "$reverse_pub_name" "$db" "false"; then
-            local error_msg="Failed to create reverse publication for database: $db"
-            ocf_log err "$error_msg"
-            log_ts "  Database $db: ✗ reverse publication failed"
-            reverse_prep_failed=true
+            ocf_log err "Failed to create reverse publication for database: $db"
+            log_ts "  Database $db: ✗ failed to create reverse publication"
+            reverse_setup_failed=true
             break
         fi
-        log_ts "  Database $db: ✓ reverse publication created"
+        log_ts "  Database $db: ✓ reverse publication created on target"
 
-        # Step 3b: Create reverse subscription (DISABLED) on source
-        # This creates the replication slot on target NOW (during quiesce)
-        # Minimal WAL accumulation from now until subscription enabled
-        if ! setup_subscription_disabled "source" "$source_primary" "$reverse_sub_name" \
-            "$reverse_pub_name" "$reverse_slot_name" \
-            "$OCF_RESKEY_target_replication_vip" "$db"; then
-            local error_msg="Failed to create disabled reverse subscription for database: $db"
-            ocf_log err "$error_msg"
-            log_ts "  Database $db: ✗ reverse subscription failed"
-            reverse_prep_failed=true
-            break
-        fi
-        log_ts "  Database $db: ✓ reverse subscription created (DISABLED)"
-        log_ts "  Database $db: ✓ replication slot created on target (preserving WAL)"
+        log_ts "  Database $db: creating ENABLED reverse subscription on source..."
 
-        # Step 3c: Create reverse DDL trigger (DISABLED) on target
-        if setup_ddl_trigger "target" "$target_primary" "$source_primary" "source" "false" "$db"; then
-            # Disable the trigger immediately (won't fire until cutover)
-            if run_as_postgres_user "target" psql -h "$target_primary" -p "$OCF_RESKEY_pgport" \
+        # Create ENABLED subscription on source (subscriber)
+        # - enabled=true: Start replicating immediately
+        # - copy_data=false: Don't copy existing data (source already has all data)
+        # - create_slot=true: Create replication slot on target
+        # NOTE: This works because pgmigrate has role-level bypass for read-only mode
+        #       The apply worker inherits this setting and can write to read-only source
+        run_as_postgres_user "source" psql -h "$source_primary" -p "$OCF_RESKEY_pgport" \
+            -U "$OCF_RESKEY_migration_dbuser" -d "$db" -c \
+            "CREATE SUBSCRIPTION ${reverse_sub_name}
+             CONNECTION '${conn_str}'
+             PUBLICATION ${reverse_pub_name}
+             WITH (
+               enabled = true,
+               create_slot = true,
+               slot_name = '${reverse_slot_name}',
+               copy_data = false
+             );" >/dev/null 2>&1
+
+        if [ $? -ne 0 ]; then
+            ocf_log err "Failed to create reverse subscription for database: $db"
+            log_ts "  Database $db: ✗ failed to create reverse subscription"
+            # Cleanup publication
+            run_as_postgres_user "target" psql -h "$target_primary" -p "$OCF_RESKEY_pgport" \
                 -U "$OCF_RESKEY_migration_dbuser" -d "$db" -c \
-                "ALTER EVENT TRIGGER ${trigger_name} DISABLE;" >/dev/null 2>&1; then
-                log_ts "  Database $db: ✓ reverse DDL trigger created (DISABLED)"
-            else
-                ocf_log warn "Failed to disable reverse DDL trigger for database: $db - will create during enable phase"
-                log_ts "  Database $db: ⚠ reverse DDL trigger disable failed (will recreate later)"
-                # Clean up partial state
-                run_as_postgres_user "target" psql -h "$target_primary" -p "$OCF_RESKEY_pgport" \
-                    -U "$OCF_RESKEY_migration_dbuser" -d "$db" <<EOSQL >/dev/null 2>&1
-DROP EVENT TRIGGER IF EXISTS ${trigger_name} CASCADE;
-DROP FUNCTION IF EXISTS replicate_ddl_to_source_${db}() CASCADE;
-DROP FUNCTION IF EXISTS get_source_connection_${db}() CASCADE;
-EOSQL
-            fi
-        else
-            ocf_log warn "Reverse DDL trigger creation failed for database: $db - will create during enable phase"
-            log_ts "  Database $db: ⚠ reverse DDL trigger creation failed (will create later)"
-            # Non-fatal: will create during enable phase as fallback
+                "DROP PUBLICATION IF EXISTS ${reverse_pub_name};" >/dev/null 2>&1
+            reverse_setup_failed=true
+            break
         fi
 
-        ocf_log info "✓ Reverse infrastructure prepared for database: $db"
+        ocf_log info "✓ Reverse replication created for database: $db (ENABLED)"
+        log_ts "  Database $db: ✓ reverse subscription created and ENABLED"
+        update_database_state "$db" "0" "true" "true"
     done
 
-    if [ "$reverse_prep_failed" = "true" ]; then
+    if [ "$reverse_setup_failed" = "true" ]; then
         local error_msg="Failed to create reverse replication infrastructure"
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=3" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 3 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
 
-    ocf_log info "✓ Reverse replication infrastructure created for ALL databases (quiesce-based)"
-    log_ts "✓ Reverse infrastructure complete - ready for VIP swap"
+    ocf_log info "✓ Reverse replication infrastructure created for ALL databases"
+    log_ts "✓ Reverse replication infrastructure created for ALL databases"
 
     #------------------------------------------------------------------------
-    # STEP 4: Swap VIP IP addresses (PRODUCTION CUTOVER)
+    # STEP 4: Verify reverse subscriptions are streaming
+    # Wait for subscriptions to connect and start streaming before VIP swap
     #------------------------------------------------------------------------
     echo "step=4" >> "$cutover_state_file"
-    echo "current_step=Swapping VIP IP addresses (PRODUCTION CUTOVER)" >> "$cutover_state_file"
+    echo "current_step='Verifying reverse subscriptions streaming'" >> "$cutover_state_file"
 
-    ocf_log info "Step 4/8: Swapping VIP IP addresses (PRODUCTION CUTOVER)"
-    log_ts "Step 4/8: Swapping VIP IP addresses (PRODUCTION CUTOVER)"
+    ocf_log info "Step 4/9: Verifying reverse subscriptions are streaming"
+    log_ts "Step 4/9: Verifying reverse subscriptions are streaming (${DB_COUNT} databases)"
+
+    # Give subscriptions time to connect (up to 30 seconds)
+    local verify_max_wait=30
+    local verify_waited=0
+    local all_streaming=false
+
+    while [ $verify_waited -lt $verify_max_wait ]; do
+        all_streaming=true
+
+        for db in $DB_LIST; do
+            local reverse_sub_name="pgtwin_migrate_reverse_sub_${db}"
+
+            # Check subscription state
+            local sub_state=$(run_as_postgres_user "source" psql -h "$source_primary" -p "$OCF_RESKEY_pgport" \
+                -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "SELECT srsubstate FROM pg_subscription_rel sr
+                 JOIN pg_subscription s ON sr.srsubid = s.oid
+                 WHERE s.subname = '${reverse_sub_name}'
+                 LIMIT 1;" 2>/dev/null)
+
+            # Check if subscription is enabled and connected
+            local sub_enabled=$(run_as_postgres_user "source" psql -h "$source_primary" -p "$OCF_RESKEY_pgport" \
+                -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
+                "SELECT subenabled FROM pg_subscription WHERE subname = '${reverse_sub_name}';" 2>/dev/null)
+
+            if [ "$sub_enabled" = "t" ]; then
+                # 'r' = ready (streaming), empty = no tables (OK for empty DB)
+                if [ "$sub_state" = "r" ] || [ -z "$sub_state" ]; then
+                    log_ts "  Database $db: ✓ streaming (state=$sub_state)"
+                else
+                    log_ts "  Database $db: connecting (state=$sub_state)"
+                    all_streaming=false
+                fi
+            else
+                log_ts "  Database $db: subscription not enabled (enabled=$sub_enabled)"
+                all_streaming=false
+            fi
+        done
+
+        if [ "$all_streaming" = "true" ]; then
+            ocf_log info "✓ All reverse subscriptions are streaming"
+            log_ts "✓ All reverse subscriptions are streaming"
+            break
+        fi
+
+        sleep 2
+        verify_waited=$((verify_waited + 2))
+    done
+
+    if [ "$all_streaming" != "true" ]; then
+        ocf_log warn "Some subscriptions may not be fully streaming yet, but proceeding (non-fatal)"
+        log_ts "⚠ Some subscriptions may not be fully streaming (non-fatal)"
+    fi
+
+    #------------------------------------------------------------------------
+    # STEP 5: Swap VIP IP addresses (PRODUCTION CUTOVER)
+    # ZERO-RISK: Reverse replication is ALREADY ACTIVE!
+    #------------------------------------------------------------------------
+    echo "step=5" >> "$cutover_state_file"
+    echo "current_step='Swapping VIP IP addresses (PRODUCTION CUTOVER)'" >> "$cutover_state_file"
+
+    ocf_log info "Step 5/9: Swapping VIP IP addresses (PRODUCTION CUTOVER)"
+    log_ts "Step 5/9: Swapping VIP IP addresses (PRODUCTION CUTOVER)"
     log_ts "=========================================="
-    log_ts "CRITICAL MOMENT: Applications will switch from source to target cluster"
+    log_ts "ZERO-RISK: Reverse replication is ALREADY ACTIVE!"
+    log_ts "When apps start writing to target, changes are immediately"
+    log_ts "replicated to source. NO data loss window."
     log_ts "=========================================="
 
     if ! swap_vip_addresses; then
         local error_msg="Failed to swap VIP IP addresses"
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
-        echo "failed_step=3" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
-        rollback_cutover 3 "$error_msg"
+        echo "failed_step=5" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
+        rollback_cutover 5 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
 
     ocf_log info "✓ VIP addresses swapped - Applications now connect to target cluster"
     log_ts "✓ VIP addresses swapped - Applications now connect to target cluster"
-    log_ts "   Replication slot on target cluster has captured all writes since preparation"
+    log_ts "   Reverse replication is ACTIVE - changes are being replicated to source"
 
     #------------------------------------------------------------------------
-    # STEP 5: Disable forward subscriptions (SAFETY - prevent conflicts) - ALL DATABASES
+    # STEP 6: Disable forward subscriptions (SAFETY - prevent conflicts)
     #------------------------------------------------------------------------
-    echo "step=5" >> "$cutover_state_file"
-    echo "current_step=Disabling forward subscriptions (all databases)" >> "$cutover_state_file"
+    echo "step=6" >> "$cutover_state_file"
+    echo "current_step='Disabling forward subscriptions (all databases)'" >> "$cutover_state_file"
 
-    ocf_log info "Step 5/8: Disabling forward subscriptions (source → target) for ALL databases"
-    log_ts "Step 5/8: Disabling forward subscriptions (${DB_COUNT} databases)"
+    ocf_log info "Step 6/9: Disabling forward subscriptions (source → target) for ALL databases"
+    log_ts "Step 6/9: Disabling forward subscriptions (${DB_COUNT} databases)"
     log_ts "   SAFETY: Preventing conflicts - applications now on target via VIP"
-    log_ts "   Forward replication must stop BEFORE source becomes writable again"
 
     local disable_failed=false
     for db in $DB_LIST; do
@@ -2696,24 +3925,25 @@ EOSQL
         local error_msg="Failed to disable forward subscriptions - risk of replication conflicts"
         ocf_log err "$error_msg"
         echo "status=failed" >> "$cutover_state_file"
-        echo "failed_step=5" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
-        rollback_cutover 5 "$error_msg"
+        echo "failed_step=6" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
+        rollback_cutover 6 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
 
     ocf_log info "✓ Forward subscriptions disabled for ALL databases (conflict-safe)"
-    log_ts "✓ Forward subscriptions disabled - safe to restore source to read-write"
+    log_ts "✓ Forward subscriptions disabled"
 
     #------------------------------------------------------------------------
-    # STEP 6: Set source cluster (PG17) back to read-write
+    # STEP 7: Set source cluster (PG17) back to read-write
     #------------------------------------------------------------------------
-    echo "step=6" >> "$cutover_state_file"
-    echo "current_step=Setting source cluster back to read-write" >> "$cutover_state_file"
+    echo "step=7" >> "$cutover_state_file"
+    echo "current_step='Setting source cluster back to read-write'" >> "$cutover_state_file"
 
-    ocf_log info "Step 6/8: Setting source cluster back to read-write"
-    log_ts "Step 6/8: Setting source cluster back to read-write"
-    log_ts "   SAFE: Forward subscriptions already disabled - no conflict risk"
+    ocf_log info "Step 7/9: Setting source cluster back to read-write"
+    log_ts "Step 7/9: Setting source cluster back to read-write"
+    log_ts "   NOTE: pgmigrate apply worker was already writing (via bypass)"
+    log_ts "   This step enables DBA/admin write access"
 
     # Use first database for connection (setting is cluster-wide)
     if ! set_cluster_read_only "source" "$source_primary" "false" "$first_db"; then
@@ -2721,60 +3951,24 @@ EOSQL
         ocf_log err "$error_msg"
         ocf_log err "CRITICAL: Source cluster stuck in read-only mode"
         echo "status=failed" >> "$cutover_state_file"
-        echo "failed_step=6" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
-        rollback_cutover 6 "$error_msg"
-        return $OCF_ERR_GENERIC
-    fi
-
-    ocf_log info "✓ Source cluster is now read-write (ready for reverse replication)"
-    log_ts "✓ Source cluster is now read-write (DBAs have full access)"
-
-    #------------------------------------------------------------------------
-    # STEP 7: Enable reverse subscriptions (PG18 → PG17) - ALL DATABASES
-    #------------------------------------------------------------------------
-    echo "step=7" >> "$cutover_state_file"
-    echo "current_step=Enabling reverse subscriptions (all databases)" >> "$cutover_state_file"
-
-    ocf_log info "Step 7/8: Enabling reverse subscriptions (target → source) for ALL databases"
-    log_ts "Step 7/8: Enabling reverse subscriptions (${DB_COUNT} databases)"
-    log_ts "   Subscriptions will replay all WAL preserved by replication slots"
-
-    local enable_failed=false
-    for db in $DB_LIST; do
-        local reverse_sub_name="pgtwin_migrate_reverse_sub_${db}"
-
-        ocf_log info "Enabling reverse subscription for database: $db"
-        log_ts "  Database $db: enabling reverse subscription..."
-
-        if ! enable_subscription "source" "$source_primary" "$reverse_sub_name" "$db"; then
-            local error_msg="Failed to enable reverse subscription for database: $db"
-            ocf_log err "$error_msg"
-            enable_failed=true
-            break
-        fi
-
-        log_ts "  Database $db: ✓ reverse subscription enabled"
-        update_database_state "$db" "0" "true" "true"
-    done
-
-    if [ "$enable_failed" = "true" ]; then
-        local error_msg="Failed to enable reverse subscriptions"
-        echo "status=failed" >> "$cutover_state_file"
         echo "failed_step=7" >> "$cutover_state_file"
-        echo "error_message=$error_msg" >> "$cutover_state_file"
+        echo "error_message='$error_msg'" >> "$cutover_state_file"
         rollback_cutover 7 "$error_msg"
         return $OCF_ERR_GENERIC
     fi
 
-    ocf_log info "✓ Reverse subscriptions enabled - source cluster now receives changes from target"
-    log_ts "✓ Reverse subscriptions enabled for ALL databases"
+    ocf_log info "✓ Source cluster is now read-write (DBAs have full access)"
+    log_ts "✓ Source cluster is now read-write"
 
-    # Step 7b: Enable reverse DDL triggers (target → source) - ALL DATABASES
-    # Triggers were created (disabled) during quiesce - just enable them now
-    # This ensures CREATE TABLE/ALTER TABLE/DROP TABLE commands are automatically replicated
-    ocf_log info "Enabling reverse DDL replication from target to source (all databases)"
-    log_ts "Enabling reverse DDL triggers (target → source)"
+    #------------------------------------------------------------------------
+    # STEP 8: Enable reverse DDL triggers (target → source)
+    #------------------------------------------------------------------------
+    echo "step=8" >> "$cutover_state_file"
+    echo "current_step='Enabling reverse DDL triggers (all databases)'" >> "$cutover_state_file"
+
+    ocf_log info "Step 8/9: Enabling reverse DDL triggers (target → source) for ALL databases"
+    log_ts "Step 8/9: Enabling reverse DDL triggers (${DB_COUNT} databases)"
+    log_ts "   This ensures CREATE TABLE/ALTER TABLE/DROP TABLE are replicated"
 
     for db in $DB_LIST; do
         local trigger_name="replicate_ddl_to_source_trigger_${db}"
@@ -2788,9 +3982,9 @@ EOSQL
             ocf_log info "✓ Reverse DDL trigger enabled for database: $db"
             log_ts "  Database $db: ✓ reverse DDL trigger enabled"
         else
-            # Fallback: trigger doesn't exist (preparation failed or old version)
-            ocf_log info "Reverse DDL trigger doesn't exist for $db, creating now (fallback)..."
-            log_ts "  Database $db: creating reverse DDL trigger (fallback)"
+            # Fallback: trigger doesn't exist, create now
+            ocf_log info "Reverse DDL trigger doesn't exist for $db, creating now..."
+            log_ts "  Database $db: creating reverse DDL trigger"
             if ! setup_ddl_trigger "target" "$target_primary" "$source_primary" "source" "false" "$db"; then
                 ocf_log warn "Reverse DDL trigger setup failed for database: $db - schema changes must be manually synchronized"
                 log_ts "  Database $db: ⚠ reverse DDL trigger setup failed (non-fatal)"
@@ -2803,18 +3997,18 @@ EOSQL
     done
 
     #------------------------------------------------------------------------
-    # STEP 8: Monitor reverse replication - ALL DATABASES
+    # STEP 9: Monitor reverse replication
     #------------------------------------------------------------------------
-    echo "step=8" >> "$cutover_state_file"
-    echo "current_step=Monitoring reverse replication (all databases)" >> "$cutover_state_file"
+    echo "step=9" >> "$cutover_state_file"
+    echo "current_step='Monitoring reverse replication (all databases)'" >> "$cutover_state_file"
 
-    ocf_log info "Step 8/8: Monitoring reverse replication for ALL databases"
-    log_ts "Step 8/8: Monitoring reverse replication (${DB_COUNT} databases)"
+    ocf_log info "Step 9/9: Monitoring reverse replication for ALL databases"
+    log_ts "Step 9/9: Monitoring reverse replication (${DB_COUNT} databases)"
 
-    # Wait briefly for reverse replication to start
+    # Wait briefly for any pending changes to replicate
     sleep 5
 
-    # Check reverse replication lag (give it 60 seconds to start syncing)
+    # Check reverse replication lag (give it 60 seconds to sync)
     max_wait=60
     waited=0
     local all_synced=false
@@ -2865,7 +4059,7 @@ EOSQL
     #------------------------------------------------------------------------
     echo "step=complete" >> "$cutover_state_file"
     echo "status=complete" >> "$cutover_state_file"
-    echo "current_step=Cutover complete" >> "$cutover_state_file"
+    echo "current_step='Cutover complete'" >> "$cutover_state_file"
 
     # Set cluster state to CUTOVER_COMPLETE (cluster property - cluster-wide, persistent)
     crm_attribute -n migration-state -v "CUTOVER_COMPLETE" 2>/dev/null
@@ -2942,92 +4136,221 @@ reconcile_migration_state() {
 }
 
 pgtwin_migrate_start() {
-    ocf_log info "Starting pgtwin-migrate: Setting up forward replication"
+    ocf_log info "Starting pgtwin-migrate v2.0"
+
+    # v2.0: Determine which cluster should be production
+    local desired_production="$OCF_RESKEY_production_cluster"
+    local current_production=$(crm_attribute -q -n migration-production-cluster 2>/dev/null)
+
+    # If no CIB state, initialize to desired (defaults to source_cluster)
+    if [ -z "$current_production" ]; then
+        current_production="$desired_production"
+    fi
+
+    # Determine replication direction based on production cluster
+    local active_direction
+    if [ "$current_production" = "$OCF_RESKEY_source_cluster" ]; then
+        active_direction="forward"
+        ocf_log info "Production cluster: $current_production (source) - forward replication active"
+    else
+        active_direction="reverse"
+        ocf_log info "Production cluster: $current_production (target) - reverse replication active"
+    fi
+
+    # v2.0: Dynamic database discovery
+    if ! get_database_list; then
+        ocf_log err "Failed to get database list"
+        return $OCF_ERR_GENERIC
+    fi
+    ocf_log info "Database list: $DB_LIST ($DB_COUNT databases)"
 
     # Check migration state from cluster properties (cluster-wide, persistent)
     # Note: Attribute persists until explicitly deleted - handle stale values
     local current_state=$(crm_attribute -G -n migration-state -q 2>/dev/null)
 
-    # Handle active migration in progress
+    # Handle active migration in progress - validate state against reality
     if [ "$current_state" = "FORWARD_REPLICATION" ]; then
-        ocf_log err "Migration state shows FORWARD_REPLICATION - migration may be active elsewhere"
-        ocf_log err "This could indicate:"
-        ocf_log err "  1. Another resource is running the same migration"
-        ocf_log err "  2. Previous migration failed and left stale state"
-        ocf_log err "To start a fresh migration, clear the stale attribute:"
-        ocf_log err "  crm_attribute -D -n migration-state"
-        return $OCF_ERR_GENERIC
+        ocf_log info "Migration state shows FORWARD_REPLICATION - validating against actual state"
+
+        # Check if forward replication infrastructure actually exists
+        local check_source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+        local state_is_valid=false
+
+        if [ -n "$check_source_node" ]; then
+            local first_db=$(echo $DB_LIST | awk '{print $1}')
+            local first_pub="pgtwin_migrate_forward_pub_${first_db}"
+            if check_publication_exists "source" "$OCF_RESKEY_source_replication_vip" "$first_pub" "$first_db"; then
+                state_is_valid=true
+            fi
+        fi
+
+        if [ "$state_is_valid" = "true" ]; then
+            ocf_log info "✓ FORWARD_REPLICATION state validated - publications exist"
+            ocf_log info "pgtwin-migrate already running (forward replication active)"
+
+            # Ensure replication slots exist (recovery from cluster failover/restart)
+            local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+            if [ -n "$check_source_node" ] && [ -n "$target_node" ]; then
+                ensure_forward_replication_slots "$check_source_node" "$OCF_RESKEY_target_replication_vip"
+            fi
+
+            return $OCF_SUCCESS
+        else
+            # State says FORWARD_REPLICATION but no publications exist - stale state
+            ocf_log warn "FORWARD_REPLICATION state is stale (no publications found)"
+            ocf_log info "Clearing stale state and proceeding with fresh setup"
+            crm_attribute -D -n migration-state 2>/dev/null || true
+            current_state=""
+        fi
     fi
 
-    # Handle completed migration - reconcile and return success
+    # Handle completed migration - validate state and reconcile
     if [ "$current_state" = "CUTOVER_COMPLETE" ]; then
-        ocf_log info "=========================================="
-        ocf_log info "✓ Migration already COMPLETED"
-        ocf_log info "=========================================="
-        ocf_log info "Forward migration: ${OCF_RESKEY_source_cluster} → ${OCF_RESKEY_target_cluster} (complete)"
-        ocf_log info "Production VIP (${OCF_RESKEY_production_vip_resource}): Points to target cluster"
-        ocf_log info "Reverse replication: ${OCF_RESKEY_target_cluster} → ${OCF_RESKEY_source_cluster} (active)"
-        ocf_log info ""
+        ocf_log info "Migration state shows CUTOVER_COMPLETE - validating against actual state"
 
-        # v1.0.6: Reconcile state (idempotency/self-healing)
-        reconcile_migration_state
+        # Check if reverse replication infrastructure actually exists
+        local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+        local state_is_valid=false
 
-        ocf_log info "To migrate BACK to source cluster (reverse migration):"
-        ocf_log info "  1. Stop this completed resource: crm resource stop ${OCF_RESOURCE_INSTANCE}"
-        ocf_log info "  2. Create NEW migration resource with swapped source/target:"
-        ocf_log info "     - source_cluster=${OCF_RESKEY_target_cluster}"
-        ocf_log info "     - target_cluster=${OCF_RESKEY_source_cluster}"
-        ocf_log info "     - Swap VIP resources accordingly"
-        ocf_log info "  3. The existing reverse replication becomes forward replication for new migration"
-        ocf_log info ""
-        ocf_log info "To permanently clean up this resource:"
-        ocf_log info "  crm configure delete ${OCF_RESOURCE_INSTANCE}"
-        ocf_log info "=========================================="
-        return $OCF_SUCCESS
+        if [ -n "$target_node" ]; then
+            local first_db=$(echo $DB_LIST | awk '{print $1}')
+            local first_reverse_pub="pgtwin_migrate_reverse_pub_${first_db}"
+            if check_publication_exists "target" "$OCF_RESKEY_target_replication_vip" "$first_reverse_pub" "$first_db"; then
+                state_is_valid=true
+            fi
+        fi
+
+        if [ "$state_is_valid" = "true" ]; then
+            ocf_log info "=========================================="
+            ocf_log info "✓ Migration already COMPLETED (validated)"
+            ocf_log info "=========================================="
+            ocf_log info "Forward migration: ${OCF_RESKEY_source_cluster} → ${OCF_RESKEY_target_cluster} (complete)"
+            ocf_log info "Production VIP (${OCF_RESKEY_production_vip_resource}): Points to target cluster"
+            ocf_log info "Reverse replication: ${OCF_RESKEY_target_cluster} → ${OCF_RESKEY_source_cluster} (active)"
+            ocf_log info ""
+
+            # v1.0.6: Reconcile state (idempotency/self-healing)
+            reconcile_migration_state
+
+            # Ensure replication slots exist (recovery from cluster failover/restart)
+            local source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+            if [ -n "$source_node" ] && [ -n "$target_node" ]; then
+                # After cutover, reverse replication is active (target → source)
+                ensure_reverse_replication_slots "$OCF_RESKEY_source_replication_vip" "$target_node"
+            fi
+
+            ocf_log info "To migrate BACK to source cluster (reverse migration):"
+            ocf_log info "  1. Stop this completed resource: crm resource stop ${OCF_RESOURCE_INSTANCE}"
+            ocf_log info "  2. Create NEW migration resource with swapped source/target:"
+            ocf_log info "     - source_cluster=${OCF_RESKEY_target_cluster}"
+            ocf_log info "     - target_cluster=${OCF_RESKEY_source_cluster}"
+            ocf_log info "     - Swap VIP resources accordingly"
+            ocf_log info "  3. The existing reverse replication becomes forward replication for new migration"
+            ocf_log info ""
+            ocf_log info "To permanently clean up this resource:"
+            ocf_log info "  crm configure delete ${OCF_RESOURCE_INSTANCE}"
+            ocf_log info "=========================================="
+            return $OCF_SUCCESS
+        else
+            # State says CUTOVER_COMPLETE but no reverse publications exist - stale state
+            ocf_log warn "CUTOVER_COMPLETE state is stale (no reverse publications found)"
+            ocf_log info "Clearing stale state and proceeding with fresh setup"
+            crm_attribute -D -n migration-state 2>/dev/null || true
+            current_state=""
+        fi
     fi
 
-    # Check if already running
-    pgtwin_migrate_monitor
-    if [ $? -eq $OCF_SUCCESS ]; then
-        ocf_log info "pgtwin-migrate already running"
-        return $OCF_SUCCESS
+    # v2.0: Check if setup is complete by verifying publications exist for active direction
+    # Publications are created on the PRODUCTION cluster (forward=source, reverse=target)
+    local pub_cluster_type pub_host
+    if [ "$active_direction" = "forward" ]; then
+        pub_cluster_type="source"
+        pub_host="$OCF_RESKEY_source_replication_vip"
+    else
+        pub_cluster_type="target"
+        pub_host="$OCF_RESKEY_target_replication_vip"
     fi
+
+    local check_pub_node=$(discover_cluster_node "$([ "$active_direction" = "forward" ] && echo "$OCF_RESKEY_source_cluster" || echo "$OCF_RESKEY_target_cluster")" "Promoted")
+    if [ -n "$check_pub_node" ]; then
+        # Check if publications exist for first database as indicator of setup completion
+        local first_db=$(echo $DB_LIST | awk '{print $1}')
+        local first_pub="pgtwin_migrate_${active_direction}_pub_${first_db}"
+        if check_publication_exists "$pub_cluster_type" "$pub_host" "$first_pub" "$first_db"; then
+            ocf_log info "pgtwin-migrate already running ($active_direction publications exist)"
+
+            # Ensure replication slots exist (recovery from cluster failover/restart)
+            if [ "$active_direction" = "forward" ]; then
+                local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+                if [ -n "$target_node" ]; then
+                    ensure_forward_replication_slots "$check_pub_node" "$OCF_RESKEY_target_replication_vip"
+                fi
+            else
+                local source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+                if [ -n "$source_node" ]; then
+                    ensure_reverse_replication_slots "$OCF_RESKEY_source_replication_vip" "$check_pub_node"
+                fi
+            fi
+
+            return $OCF_SUCCESS
+        fi
+    fi
+
+    ocf_log info "No existing $active_direction replication detected, proceeding with setup"
 
     # Initialize database migration (creates baseline and state files)
     init_database_migration
 
     ocf_log info "=========================================="
-    ocf_log info "Setting up migration for ${DB_COUNT} database(s)"
+    ocf_log info "Setting up $active_direction replication for ${DB_COUNT} database(s)"
     ocf_log info "Databases: $(echo $DB_LIST | tr ' ' ',')"
+    ocf_log info "Production cluster: $current_production"
     ocf_log info "=========================================="
 
-    # Step 1: Discover source cluster node (based on configured role)
-    ocf_log info "Discovering source cluster ${OCF_RESKEY_source_node_role} node from ${OCF_RESKEY_source_cluster}"
-    local source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "$OCF_RESKEY_source_node_role")
-    if [ -z "$source_node" ]; then
-        ocf_log err "Failed to discover source cluster ${OCF_RESKEY_source_node_role} node"
+    # v2.0: Determine publishing and subscribing clusters based on direction
+    local pub_cluster sub_cluster pub_cluster_name sub_cluster_name
+    if [ "$active_direction" = "forward" ]; then
+        pub_cluster="source"
+        sub_cluster="target"
+        pub_cluster_name="$OCF_RESKEY_source_cluster"
+        sub_cluster_name="$OCF_RESKEY_target_cluster"
+    else
+        pub_cluster="target"
+        sub_cluster="source"
+        pub_cluster_name="$OCF_RESKEY_target_cluster"
+        sub_cluster_name="$OCF_RESKEY_source_cluster"
+    fi
+
+    # Step 1: Discover publishing cluster Promoted node
+    ocf_log info "Discovering publishing cluster Promoted node from ${pub_cluster_name}"
+    local pub_node=$(discover_cluster_node "$pub_cluster_name" "Promoted")
+    if [ -z "$pub_node" ]; then
+        ocf_log err "Failed to discover publishing cluster Promoted node"
         return $OCF_ERR_GENERIC
     fi
-    ocf_log info "Source ${OCF_RESKEY_source_node_role} node: ${source_node}"
+    ocf_log info "Publishing cluster Promoted node: ${pub_node}"
 
-    # Step 2: Discover target cluster Promoted (primary) node
-    # Target always uses primary because subscriptions perform writes (not read-only)
-    ocf_log info "Discovering target cluster Promoted node from ${OCF_RESKEY_target_cluster}"
-    local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
-    if [ -z "$target_node" ]; then
-        ocf_log err "Failed to discover target cluster Promoted node"
+    # Step 2: Discover subscribing cluster Promoted node
+    ocf_log info "Discovering subscribing cluster Promoted node from ${sub_cluster_name}"
+    local sub_node=$(discover_cluster_node "$sub_cluster_name" "Promoted")
+    if [ -z "$sub_node" ]; then
+        ocf_log err "Failed to discover subscribing cluster Promoted node"
         return $OCF_ERR_GENERIC
     fi
-    ocf_log info "Target Promoted node: ${target_node}"
+    ocf_log info "Subscribing cluster Promoted node: ${sub_node}"
 
-    # Step 3: If source using Unpromoted node, call pg_log_standby_snapshot() on source primary
+    # Step 3: Check replication slot availability on publishing cluster
+    if [ -n "$pub_node" ]; then
+        if ! check_replication_slot_availability "$pub_node" "$DB_COUNT"; then
+            return $OCF_ERR_GENERIC
+        fi
+    fi
+
+    # Step 4: If using Unpromoted source node role (forward only), call pg_log_standby_snapshot()
     # This prevents "idle primary" hanging issue when creating subscriptions from standby
-    if [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
+    if [ "$active_direction" = "forward" ] && [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
         ocf_log info "Source using Unpromoted node, calling pg_log_standby_snapshot() on source primary"
-
-        # Get source primary node for snapshot
         local source_primary=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
-
         if [ -n "$source_primary" ]; then
             ocf_log info "Calling pg_log_standby_snapshot() on source primary: ${source_primary}"
             run_as_postgres_user "source" psql -h "$source_primary" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$OCF_RESKEY_pgdatabase" -Atc \
@@ -3035,86 +4358,23 @@ pgtwin_migrate_start() {
         fi
     fi
 
-    # Step 4: Get replication user
-    local repl_user=$(get_replication_user)
-    ocf_log info "Using replication user: ${repl_user}"
-
-    # Step 5: Create publication on source PRIMARY (publications cannot be created on standbys)
-    # Even when using Unpromoted (standby) for publishing, the publication must be created on primary
-    # and it will replicate to standby via physical replication
-    local source_primary=""
-    if [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
-        source_primary=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
-        ocf_log info "Creating publication on source primary (standby is read-only): ${source_primary}"
-    else
-        source_primary="$source_node"
-    fi
-
-    # Step 5: Create publications and subscriptions for ALL databases
-    ocf_log info "Step 5: Setting up forward replication for all databases"
-    ocf_log info "Connecting to Source Replication VIP: ${OCF_RESKEY_source_replication_vip}"
-
-    local setup_failed=false
-    for db in $DB_LIST; do
-        ocf_log info "----------------------------------------"
-        ocf_log info "Setting up replication for database: $db"
-        ocf_log info "----------------------------------------"
-
-        # Database-specific names to avoid collisions
-        local pub_name="pgtwin_migrate_forward_pub_${db}"
-        local sub_name="pgtwin_migrate_forward_sub_${db}"
-        local slot_name="pgtwin_migrate_forward_slot_${db}"
-
-        # Create publication on source
-        if ! setup_publication "source" "$source_primary" "$pub_name" "$db" "false"; then
-            ocf_log err "Failed to create publication for database: $db"
-            setup_failed=true
-            break
-        fi
-
-        # Create subscription on target
-        local conn_str="host=${OCF_RESKEY_source_replication_vip} port=${OCF_RESKEY_pgport} dbname=${db} user=${OCF_RESKEY_migration_dbuser}"
-
-        if ! setup_subscription "target" "$target_node" "$sub_name" "$conn_str" "$pub_name" "$slot_name" "$db" "false"; then
-            ocf_log err "Failed to create subscription for database: $db"
-            # Cleanup publication if subscription failed
-            ocf_log err "Cleaning up publication for database: $db"
-            run_as_postgres_user "source" psql -h "$source_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
-                "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
-            setup_failed=true
-            break
-        fi
-
-        ocf_log info "✓ Forward replication configured for database: $db"
-    done
-
-    if [ "$setup_failed" = "true" ]; then
-        ocf_log err "Forward replication setup failed for one or more databases"
+    # Step 5: Create replication infrastructure using unified function
+    ocf_log info "Step 5: Setting up $active_direction replication for all databases"
+    if ! create_replication_direction "$active_direction"; then
+        ocf_log err "$active_direction replication setup failed"
         return $OCF_ERR_GENERIC
     fi
 
-    ocf_log info "✓ Forward replication configured for all ${DB_COUNT} database(s)"
+    ocf_log info "✓ $active_direction replication configured for all ${DB_COUNT} database(s)"
 
-    # Step 6b: Setup DDL triggers for forward replication (PG17 → PG18) - ALL DATABASES
-    # This ensures CREATE TABLE/ALTER TABLE/DROP TABLE commands are automatically replicated
-    ocf_log info "Setting up DDL replication from source to target (${DB_COUNT} databases)"
-    for db in $DB_LIST; do
-        if ! setup_ddl_trigger "source" "$source_primary" "$target_node" "target" "false" "$db"; then
-            ocf_log warn "DDL trigger setup failed for database: $db - schema changes must be manually synchronized"
-            # Non-fatal: continue even if DDL trigger fails
-        else
-            ocf_log info "✓ DDL trigger setup complete for database: $db"
-        fi
-    done
-
-    # Step 7: Wait a moment for subscriptions to initialize
+    # Step 6: Wait a moment for subscriptions to initialize
     sleep 2
 
-    # Step 8: Verify replication is working for ALL databases
+    # Step 7: Verify replication is working for ALL databases
     ocf_log info "Verifying subscription states (${DB_COUNT} databases)"
     for db in $DB_LIST; do
-        local sub_name="pgtwin_migrate_forward_sub_${db}"
-        local sub_state=$(get_subscription_state "target" "$target_node" "$sub_name")
+        local sub_name="pgtwin_migrate_${active_direction}_sub_${db}"
+        local sub_state=$(get_subscription_state "$sub_cluster" "$sub_node" "$sub_name" "$db")
         if [ -z "$sub_state" ]; then
             ocf_log warn "Could not verify subscription state for database: $db"
         else
@@ -3127,88 +4387,85 @@ pgtwin_migrate_start() {
         fi
     done
 
-    ocf_log info "Forward replication setup completed successfully"
-    ocf_log info "Source: ${source_node} (${OCF_RESKEY_source_node_role}) → Target: ${target_node} (Promoted) via ${OCF_RESKEY_source_replication_vip}"
-    ocf_log info ""
-    ocf_log info "NOTE: Reverse replication infrastructure will be created during cutover (quiesce-based)"
-    ocf_log info "      This eliminates race conditions and minimizes WAL accumulation"
+    # Step 8: Set CIB state and production cluster
+    local state_value
+    if [ "$active_direction" = "forward" ]; then
+        state_value="FORWARD_REPLICATION"
+    else
+        state_value="CUTOVER_COMPLETE"
+    fi
+    crm_attribute -n migration-state -v "$state_value" 2>/dev/null || true
+    crm_attribute -n migration-production-cluster -v "$current_production" 2>/dev/null || true
+
+    ocf_log info "$active_direction replication setup completed successfully"
+    if [ "$active_direction" = "forward" ]; then
+        ocf_log info "Publications on Source: ${pub_node} @ ${OCF_RESKEY_source_replication_vip}"
+        ocf_log info "Subscriptions on Target: ${sub_node} @ ${OCF_RESKEY_target_replication_vip}"
+        ocf_log info ""
+        ocf_log info "To cutover to target cluster:"
+        ocf_log info "  crm resource update ${OCF_RESOURCE_INSTANCE} production_cluster=${OCF_RESKEY_target_cluster}"
+    else
+        ocf_log info "Publications on Target: ${pub_node} @ ${OCF_RESKEY_target_replication_vip}"
+        ocf_log info "Subscriptions on Source: ${sub_node} @ ${OCF_RESKEY_source_replication_vip}"
+        ocf_log info ""
+        ocf_log info "To failback to source cluster:"
+        ocf_log info "  crm resource update ${OCF_RESOURCE_INSTANCE} production_cluster=${OCF_RESKEY_source_cluster}"
+    fi
 
     return $OCF_SUCCESS
 }
 
 pgtwin_migrate_stop() {
-    ocf_log info "Stopping pgtwin-migrate: Cleaning up replication"
+    ocf_log info "Stopping pgtwin-migrate v2.0"
 
-    # Check if already stopped
-    pgtwin_migrate_monitor
-    if [ $? -eq $OCF_NOT_RUNNING ]; then
-        ocf_log info "pgtwin-migrate already stopped"
+    # v2.0: Check finalize_replication flag
+    if ocf_is_true "$OCF_RESKEY_finalize_replication"; then
+        ocf_log info "finalize_replication=true - performing full cleanup"
+
+        # Get database list for cleanup
+        get_database_list >/dev/null 2>&1
+
+        # Call finalize function to clean up everything
+        finalize_all_replication
         return $OCF_SUCCESS
     fi
 
-    # Step 1: Discover source and target nodes (based on configured roles)
-    local source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "$OCF_RESKEY_source_node_role")
-    local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+    # v2.0: Normal stop - preserve infrastructure for restart/migration
+    ocf_log info "Stopping migration resource (infrastructure preserved)"
+    ocf_log info "Replication publications, subscriptions, and slots remain in place"
+    ocf_log info ""
+    ocf_log info "To clean up all replication infrastructure:"
+    ocf_log info "  1. crm resource update ${OCF_RESOURCE_INSTANCE} finalize_replication=true"
+    ocf_log info "  2. crm resource stop ${OCF_RESOURCE_INSTANCE}"
+    ocf_log info "  3. crm configure delete ${OCF_RESOURCE_INSTANCE}"
 
-    if [ -z "$source_node" ] || [ -z "$target_node" ]; then
-        ocf_log warn "Could not discover cluster nodes during stop, attempting cleanup anyway"
-    fi
-
-    # Step 2: Drop subscriptions on target for ALL databases (also drops replication slots)
-    if [ -n "$target_node" ]; then
-        ocf_log info "Dropping subscriptions on target for ${DB_COUNT} database(s)"
-
-        for db in $DB_LIST; do
-            local sub_name="pgtwin_migrate_forward_sub_${db}"
-            ocf_log info "  Dropping subscription: $sub_name (database: $db)"
-
-            run_as_postgres_user "target" psql -h "$target_node" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
-                "DROP SUBSCRIPTION IF EXISTS ${sub_name};" >/dev/null 2>&1
-
-            if [ $? -eq 0 ]; then
-                ocf_log info "  ✓ Subscription dropped: $sub_name"
-            else
-                ocf_log warn "  ✗ Failed to drop subscription: $sub_name (may not exist)"
-            fi
-        done
-    fi
-
-    # Step 3: Drop publications on source primary for ALL databases (publications can only be dropped on primary)
-    local source_primary=""
-    if [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
-        source_primary=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
-    else
-        source_primary="$source_node"
-    fi
-
-    if [ -n "$source_primary" ]; then
-        ocf_log info "Dropping publications on source primary for ${DB_COUNT} database(s)"
-
-        for db in $DB_LIST; do
-            local pub_name="pgtwin_migrate_forward_pub_${db}"
-            ocf_log info "  Dropping publication: $pub_name (database: $db)"
-
-            run_as_postgres_user "source" psql -h "$source_primary" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$db" -Atc \
-                "DROP PUBLICATION IF EXISTS ${pub_name};" >/dev/null 2>&1
-
-            if [ $? -eq 0 ]; then
-                ocf_log info "  ✓ Publication dropped: $pub_name"
-            else
-                ocf_log warn "  ✗ Failed to drop publication: $pub_name (may not exist)"
-            fi
-        done
-    fi
-
-    ocf_log info "Replication cleanup completed for all ${DB_COUNT} database(s)"
     return $OCF_SUCCESS
 }
 
 pgtwin_migrate_monitor() {
-    # Monitor the replication status
+    # Monitor the replication status (v2.0)
 
-    # Step 0: Check if cutover already completed (fast path)
-    # Read from cluster properties (cluster-wide, persistent)
+    # v2.0: Dynamic database discovery
+    get_database_list >/dev/null 2>&1
+    if [ -z "$DB_LIST" ]; then
+        ocf_log warn "No databases discovered for monitoring"
+    fi
+
+    # Determine current production cluster
+    local current_production=$(get_current_production_cluster)
+    local active_direction="forward"
+    if [ "$current_production" = "$OCF_RESKEY_target_cluster" ]; then
+        active_direction="reverse"
+    fi
+
+    # Step 0: Check if cutover in progress
     local current_state=$(crm_attribute -G -n migration-state -q 2>/dev/null)
+    if [ "$current_state" = "CUTOVER_IN_PROGRESS" ]; then
+        ocf_log info "Cutover in progress..."
+        return $OCF_SUCCESS
+    fi
+
+    # v2.0: Removed CUTOVER_COMPLETE auto-stop - resource stays running for bidirectional failover
     if [ "$current_state" = "CUTOVER_COMPLETE" ]; then
         ocf_log info "=========================================="
         ocf_log info "✓ MIGRATION COMPLETE (detected in monitor)"
@@ -3266,6 +4523,18 @@ pgtwin_migrate_monitor() {
         return $OCF_NOT_RUNNING
     fi
 
+    # Step 1b: Periodic slot health check (every 5th monitor cycle to reduce overhead)
+    # This is a safety net for slot recovery if start/notify didn't catch it
+    if [ $((monitor_count % 5)) -eq 0 ]; then
+        local slot_check_host="$source_node"
+        if [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
+            slot_check_host=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+        fi
+        if [ -n "$slot_check_host" ]; then
+            ensure_forward_replication_slots "$slot_check_host" "$OCF_RESKEY_target_replication_vip"
+        fi
+    fi
+
     # Step 2: Check publications and subscriptions for ALL databases
     local source_primary=""
     if [ "$OCF_RESKEY_source_node_role" = "Unpromoted" ]; then
@@ -3275,32 +4544,18 @@ pgtwin_migrate_monitor() {
     fi
 
     local max_lag=0
-    local all_active=true
     local db_count_found=0
 
     for db in $DB_LIST; do
         local pub_name="pgtwin_migrate_forward_pub_${db}"
         local sub_name="pgtwin_migrate_forward_sub_${db}"
 
-        # Check if publication exists
-        if ! check_publication_exists "source" "$source_primary" "$pub_name" "$db"; then
-            ocf_log debug "Publication ${pub_name} does not exist on source primary (database: $db)"
-            return $OCF_NOT_RUNNING
-        fi
-
-        # Check if subscription exists
-        if ! check_subscription_exists "target" "$target_node" "$sub_name" "$db"; then
-            ocf_log debug "Subscription ${sub_name} does not exist on target (database: $db)"
-            return $OCF_NOT_RUNNING
-        fi
-
         ((db_count_found++))
 
-        # Check subscription state and lag
-        local sub_state=$(get_subscription_state "target" "$target_node" "$sub_name")
+        # Monitor subscription state and lag (non-fatal - just report status)
+        local sub_state=$(get_subscription_state "target" "$target_node" "$sub_name" "$db")
         if [ -z "$sub_state" ]; then
-            ocf_log warn "Could not get subscription state for database: $db"
-            all_active=false
+            ocf_log debug "Could not get subscription state for database: $db (may still be initializing)"
             continue
         fi
 
@@ -3309,10 +4564,9 @@ pgtwin_migrate_monitor() {
 
         ocf_log debug "Database $db: subscription=${sub_name}, state=${state}, lag=${lag_bytes} bytes"
 
-        # Check if subscription is active
+        # Log subscription state for monitoring (non-fatal)
         if [ "$state" != "streaming" ] && [ "$state" != "catchup" ]; then
-            ocf_log warn "Database $db: Subscription is not in active state: ${state}"
-            all_active=false
+            ocf_log info "Database $db: Subscription state: ${state} (waiting for streaming)"
         fi
 
         # Track maximum lag
@@ -3323,17 +4577,6 @@ pgtwin_migrate_monitor() {
         # Update per-database state file
         update_database_state "$db" "$lag_bytes" "false" "false"
     done
-
-    # Verify we found all databases
-    if [ "$db_count_found" -ne "$DB_COUNT" ]; then
-        ocf_log warn "Found $db_count_found databases, expected $DB_COUNT"
-        return $OCF_NOT_RUNNING
-    fi
-
-    # Check if all subscriptions are active
-    if [ "$all_active" = "false" ]; then
-        return $OCF_ERR_GENERIC
-    fi
 
     # Log aggregate lag if significant
     if [ "$max_lag" -gt "$OCF_RESKEY_lag_threshold" ]; then
@@ -3388,36 +4631,150 @@ pgtwin_migrate_monitor() {
         ocf_log debug "Monitor running on $current_node (target is $target_node), skipping auto-sync"
     fi
 
-    # Check for cutover preparation (async pattern to avoid monitor timeout)
-    # Use target cluster's PGHOME (dynamically discovered from cluster config)
+    # v2.0: Check for cutover by comparing production_cluster parameter with CIB state
+    # This replaces the old cutover_ready=true mechanism
     local target_pghome=$(get_cluster_pghome "target")
-    # Include resource instance name to avoid confusion with other migration resources
     local cutover_state_file="${target_pghome}/.cutover_in_progress_${OCF_RESOURCE_INSTANCE}"
 
-    if [ "$OCF_RESKEY_cutover_ready" = "true" ]; then
-        # Check if cutover in progress or complete
-        if [ -f "$cutover_state_file" ]; then
-            # Cutover already started, check progress
-            check_cutover_progress
-            return $?
-        fi
-
-        # Check if already completed
-        # Read from cluster properties (cluster-wide, persistent)
-        local current_state=$(crm_attribute -G -n migration-state -q 2>/dev/null)
-        if [ "$current_state" = "CUTOVER_COMPLETE" ]; then
-            ocf_log debug "Cutover already completed"
-            return $OCF_SUCCESS
-        fi
-
-        # Start async cutover
-        ocf_log info "Cutover preparation triggered (cutover_ready=true)"
-        start_async_cutover
+    # Check if cutover already in progress
+    if [ -f "$cutover_state_file" ]; then
+        # Cutover already started, check progress
+        check_cutover_progress
         return $?
     fi
 
+    # v2.0: Fallback cutover detection (every 5th cycle to reduce overhead)
+    # Primary detection is via notify handler, this is the safety net
+    if [ $((monitor_count % 5)) -eq 0 ]; then
+        local current_production=$(get_current_production_cluster)
+        local desired_production="$OCF_RESKEY_production_cluster"
+
+        if [ -n "$desired_production" ] && [ "$desired_production" != "$current_production" ]; then
+            ocf_log info "Monitor detected production_cluster change: $current_production → $desired_production"
+            check_and_trigger_cutover
+            return $?
+        fi
+    fi
+
+    # v2.0: Check for databases without replication (every 10th cycle)
+    # This handles: new databases created after migration started, missed databases, restarts
+    if [ $((monitor_count % 10)) -eq 0 ]; then
+        local current_production=$(get_current_production_cluster)
+        local prod_type="source"
+        local pub_vip="$OCF_RESKEY_source_replication_vip"
+        if [ "$current_production" = "$OCF_RESKEY_target_cluster" ]; then
+            prod_type="target"
+            pub_vip="$OCF_RESKEY_target_replication_vip"
+        fi
+
+        # Determine active direction based on production cluster
+        local check_direction="forward"
+        if [ "$current_production" = "$OCF_RESKEY_target_cluster" ]; then
+            check_direction="reverse"
+        fi
+
+        # Find databases that don't have publications set up yet
+        local dbs_without_replication=""
+        for db in $DB_LIST; do
+            local pub_name="pgtwin_migrate_${check_direction}_pub_${db}"
+            if ! check_publication_exists "$prod_type" "$pub_vip" "$pub_name" "$db" 2>/dev/null; then
+                dbs_without_replication="$dbs_without_replication $db"
+            fi
+        done
+        dbs_without_replication=$(echo "$dbs_without_replication" | sed 's/^ //')
+
+        if [ -n "$dbs_without_replication" ]; then
+            ocf_log info "Database(s) without $check_direction replication: $dbs_without_replication"
+
+            # Determine pub/sub nodes
+            local pub_node sub_node
+            if [ "$check_direction" = "forward" ]; then
+                pub_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+                sub_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+            else
+                pub_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+                sub_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+            fi
+
+            if [ -n "$pub_node" ] && [ -n "$sub_node" ]; then
+                # Check slot availability for new databases
+                local new_db_count=$(echo "$dbs_without_replication" | wc -w)
+                if check_replication_slot_availability_v2 "$prod_type" "$new_db_count"; then
+                    # Setup replication for each database without replication
+                    # setup_database_replication creates the DB on subscriber if needed
+                    for db in $dbs_without_replication; do
+                        ocf_log info "Setting up $check_direction replication for database: $db"
+                        if setup_database_replication "$db" "$check_direction" "$pub_node" "$sub_node" "false" "false"; then
+                            # Setup DDL trigger for the database
+                            if [ "$check_direction" = "forward" ]; then
+                                setup_ddl_trigger "source" "$pub_node" "$sub_node" "target" "false" "$db"
+                            else
+                                setup_ddl_trigger "target" "$pub_node" "$sub_node" "source" "false" "$db"
+                            fi
+                            ocf_log info "✓ Replication setup complete for database: $db"
+                        else
+                            ocf_log err "Failed to setup replication for database: $db"
+                        fi
+                    done
+                fi
+            else
+                ocf_log warn "Cannot setup replication: cluster nodes not available"
+            fi
+        fi
+    fi
+
     # Everything looks good
-    ocf_log debug "Forward replication is running: state=${state}, lag=${lag_bytes} bytes"
+    ocf_log debug "Replication is running: max_lag=${max_lag} bytes"
+    return $OCF_SUCCESS
+}
+
+pgtwin_migrate_notify() {
+    # Handle Pacemaker notifications for slot recovery after cluster events
+    # Notifications are received when source/target clusters have state changes
+    #
+    # To enable notifications, configure ordering with notify:
+    #   order migration-after-source Optional: postgres-clone migration-forward
+    # And set notify=true on migration-forward:
+    #   meta notify="true"
+    #
+    # Environment variables set by Pacemaker:
+    #   OCF_RESKEY_CRM_meta_notify_type: pre/post
+    #   OCF_RESKEY_CRM_meta_notify_operation: start/stop/promote/demote
+    #   OCF_RESKEY_CRM_meta_notify_start_uname: nodes starting
+    #   OCF_RESKEY_CRM_meta_notify_promote_uname: nodes promoting
+
+    local notify_type="${OCF_RESKEY_CRM_meta_notify_type}"
+    local notify_op="${OCF_RESKEY_CRM_meta_notify_operation}"
+
+    ocf_log info "Received notification: type=${notify_type}, operation=${notify_op}"
+
+    # Only act on post-promote notifications (after a new primary is established)
+    if [ "$notify_type" = "post" ] && [ "$notify_op" = "promote" ]; then
+        ocf_log info "Post-promote notification: checking replication slot health"
+
+        # Discover current cluster state
+        local source_node=$(discover_cluster_node "$OCF_RESKEY_source_cluster" "Promoted")
+        local target_node=$(discover_cluster_node "$OCF_RESKEY_target_cluster" "Promoted")
+
+        if [ -z "$source_node" ] || [ -z "$target_node" ]; then
+            ocf_log warn "Cannot check slots: cluster nodes not yet available"
+            return $OCF_SUCCESS
+        fi
+
+        # Check migration state to determine which slots to recover
+        local current_state=$(crm_attribute -G -n migration-state -q 2>/dev/null)
+
+        if [ "$current_state" = "CUTOVER_COMPLETE" ]; then
+            # After cutover, only reverse replication is active
+            ocf_log info "Migration complete: checking reverse replication slots"
+            ensure_reverse_replication_slots "$OCF_RESKEY_source_replication_vip" "$target_node"
+        else
+            # Before cutover, forward replication is active
+            ocf_log info "Migration in progress: checking forward replication slots"
+            ensure_forward_replication_slots "$source_node" "$OCF_RESKEY_target_replication_vip"
+        fi
+    fi
+
     return $OCF_SUCCESS
 }
 
@@ -3433,6 +4790,10 @@ usage|help)         pgtwin_migrate_usage
                     ;;
 internal-cutover)   # Skip validation for internal-cutover (runs without OCF env vars)
                     pgtwin_migrate_prepare_cutover
+                    exit $?
+                    ;;
+internal-cutover-v2)   # v2.0: Bidirectional cutover with delete/create
+                    pgtwin_migrate_prepare_cutover_v2
                     exit $?
                     ;;
 esac
@@ -3452,6 +4813,7 @@ case "$__OCF_ACTION" in
 start)              pgtwin_migrate_start ;;
 stop)               pgtwin_migrate_stop ;;
 monitor)            pgtwin_migrate_monitor ;;
+notify)             pgtwin_migrate_notify ;;
 validate-all)       exit $OCF_SUCCESS ;;
 *)                  pgtwin_migrate_usage
                     exit $OCF_ERR_UNIMPLEMENTED
