@@ -1,3 +1,17 @@
+## [1.7.4] - 2026-03-30
+
+### Fixed
+- **CRITICAL: `get_safe_synchronous_standby_names()` caused write blocking on standby loss**
+  - All four "no standby available" code paths returned `'*'` instead of `''` (empty)
+  - `synchronous_standby_names = '*'` with no connected standbys blocks all PostgreSQL writes
+  - Fix: return `''` (async mode) whenever no standbys are available; sync resumes automatically when standby reconnects
+  - Affected scenarios: clone resource lookup failure, no Unpromoted nodes in cluster, no standbys streaming to PostgreSQL, Unpromoted nodes present but not yet streaming
+
+### Documentation
+- **NEW**: `releasenotes/RELEASE_v1.7.4.md` - Release notes with upgrade instructions
+
+---
+
 ## [1.7.3] - 2026-01-19
 
 ### Added
