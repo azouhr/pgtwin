@@ -1,3 +1,17 @@
+## [1.7.5] - 2026-04-29
+
+### Fixed
+- **REGRESSION: New clusters stuck in async mode (introduced in v1.7.4)**
+  - `get_safe_synchronous_standby_names()` returned `''` when Pacemaker node names didn't match `pg_stat_replication.application_name`
+  - Affects new clusters and manually-configured standbys where `primary_conninfo` lacks an explicit `application_name`
+  - Fix: name-mismatch case now returns `'*'` (sync with any standby) instead of `''`, with a log warning to help admin fix the `application_name`
+  - The v1.7.4 fix (no standbys connected at all → `''`) is preserved
+
+### Documentation
+- **NEW**: `releasenotes/RELEASE_v1.7.5.md` - Release notes with decision table and upgrade guide
+
+---
+
 ## [1.7.4] - 2026-03-30
 
 ### Fixed

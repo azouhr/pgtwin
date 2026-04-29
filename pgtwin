@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.7.4
-# Release Date: 2026-03-30
+# Version: 1.7.5
+# Release Date: 2026-04-29
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -561,14 +561,14 @@ get_safe_synchronous_standby_names() {
 
     if [ -z "$safe_standbys" ]; then
         ocf_log warn "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓"
-        ocf_log warn "┃ WARNING: Cluster has Unpromoted nodes but none connected    ┃"
+        ocf_log warn "┃ WARNING: application_name mismatch between cluster and PG  ┃"
         ocf_log warn "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
-        ocf_log warn "Expected from cluster: $expected_standbys"
-        ocf_log warn "Connected to PostgreSQL: $connected_standbys"
-        ocf_log warn "This indicates standbys are starting but not yet streaming"
-        ocf_log warn "Using synchronous_standby_names='' (async) to prevent write blocking"
-        ocf_log warn "Configuration will update automatically when standbys connect"
-        echo ""
+        ocf_log warn "Expected node names from cluster: $expected_standbys"
+        ocf_log warn "application_names connected to PostgreSQL: $connected_standbys"
+        ocf_log warn "Standbys ARE streaming but application_name does not match node name"
+        ocf_log warn "Using synchronous_standby_names='*' to keep sync replication active"
+        ocf_log warn "Fix: ensure primary_conninfo sets application_name=<nodename> on the standby"
+        echo "*"
         return 0
     fi
 
