@@ -173,15 +173,32 @@ crm configure primitive migration-forward ocf:heartbeat:pgtwin-migrate \
         target_cluster="postgres-clone-18" \
         production_cluster="postgres-clone" \
         production_vip_resource="postgres-vip" \
-        source_replication_vip_resource="postgres-replication-vip" \
-        target_replication_vip_resource="postgres-replication-vip-18" \
+        target_vip_resource="postgres-vip-18" \
+        source_replication_vip="192.168.60.10" \
+        target_replication_vip="192.168.60.20" \
+        source_pgpassfile="/var/lib/pgsql/.pgpass" \
+        target_pgpassfile="/var/lib/pgsql/.pgpass" \
         migration_dbuser="pgmigrate" \
-        migration_dbpassword="SecurePassword" \
     meta \
         target-role=Stopped \
         migration-threshold=3 \
         failure-timeout=300s
 ```
+
+`production_vip_resource` and `target_vip_resource` must both already exist
+as Pacemaker `IPaddr2` primitives before starting the migration resource,
+each colocated with its own cluster's Promoted role (same pattern as the
+replication VIPs above). Cutover works by swapping the two resources' `ip=`
+values, not by moving either resource - without that colocation the IP swap
+still happens but the resource carrying the production address can end up
+running on an arbitrary node instead of the actual new primary.
+
+`source_replication_vip`/`target_replication_vip` are plain IP addresses
+(not resource names) and `source_pgpassfile`/`target_pgpassfile` are not
+auto-discovered from the corresponding `pgtwin` primitive despite the
+`ocf-tester`-visible parameter descriptions suggesting otherwise - set them
+explicitly. Authentication uses `.pgpass` (matching the main `pgtwin` RA),
+there is no `migration_dbpassword` parameter.
 
 ## Usage (v2.0)
 
@@ -256,21 +273,23 @@ ssh root@<source-primary> "sudo -u postgres psql -c \
 | `source_cluster` | Source cluster resource name | `postgres-clone` |
 | `target_cluster` | Target cluster resource name | `postgres-clone-18` |
 | `production_cluster` | Which cluster is production (v2.0) | `postgres-clone` |
-| `production_vip_resource` | Production VIP resource name | `postgres-vip` |
-| `source_replication_vip_resource` | Source replication VIP | `postgres-replication-vip` |
-| `target_replication_vip_resource` | Target replication VIP | `postgres-replication-vip-18` |
+| `production_vip_resource` | Production VIP resource name - must already exist as an `IPaddr2` primitive colocated with `source_cluster`'s Promoted role | `postgres-vip` |
+| `target_vip_resource` | The VIP resource that gets swapped with `production_vip_resource` during cutover - must already exist as an `IPaddr2` primitive colocated with `target_cluster`'s Promoted role | `postgres-vip-18` |
+| `source_replication_vip` | IP address (not a resource name) used to reach the source cluster's primary for logical replication | `192.168.60.10` |
+| `target_replication_vip` | IP address (not a resource name) used to reach the target cluster's primary for logical replication | `192.168.60.20` |
+| `source_pgpassfile` | Path to the `.pgpass` file to use against the source cluster - not auto-discovered, must be set explicitly | `/var/lib/pgsql/.pgpass` |
+| `target_pgpassfile` | Path to the `.pgpass` file to use against the target cluster - not auto-discovered, must be set explicitly | `/var/lib/pgsql/.pgpass` |
 
 ### Optional
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `databases` | (auto-discover) | Comma-separated list of databases. If not set, discovers from production cluster. |
-| `migration_dbuser` | `pgmigrate` | Migration user for logical replication |
-| `migration_dbpassword` | - | Migration password (can use .pgpass instead) |
+| `migration_dbuser` | `pgmigrate` | Migration user for logical replication. Authenticates via `.pgpass` - there is no `migration_dbpassword` parameter. |
 | `pgport` | `5432` | PostgreSQL port |
 | `source_node_role` | `Promoted` | Source node to use: "Promoted" or "Unpromoted" |
 | `finalize_replication` | `false` | When true, stop cleans up all replication infrastructure |
-| `stability_timeout` | `30` | Seconds to wait for cluster stability before cutover |
+| `stability_timeout` | `300` | Seconds to wait for cluster stability before cutover |
 
 ### v2.0 Parameter Changes
 
