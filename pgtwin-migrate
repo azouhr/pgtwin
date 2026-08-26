@@ -3451,7 +3451,13 @@ pgtwin_migrate_prepare_cutover_v2() {
     echo "current_step='Swapping VIP addresses'" >> "$cutover_state_file"
     log_ts "Step 5/8: Swapping VIP addresses"
 
-    swap_vip_addresses
+    if ! swap_vip_addresses; then
+        log_ts "ERROR: Failed to swap VIP addresses - production traffic did NOT move"
+        log_ts "Check that target_vip_resource is configured and exists in the CIB"
+        echo "status=failed" >> "$cutover_state_file"
+        echo "error_message='VIP swap failed - production_cluster NOT updated, traffic still on old side'" >> "$cutover_state_file"
+        return 1
+    fi
     log_ts "✓ VIP addresses swapped"
 
     #------------------------------------------------------------------------
