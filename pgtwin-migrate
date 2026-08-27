@@ -1843,8 +1843,8 @@ EOF
 
 setup_subscription() {
     # Create subscription with immediate refresh to copy table structures
-    # Usage: setup_subscription <cluster_type> <host> <sub_name> <conn_str> <pub_name> <slot_name> <database> [read_only_override]
-    # Example: setup_subscription "target" "pgtwin12" "pgtwin_migrate_sub" "host=..." "pgtwin_migrate_pub" "pgtwin_migrate_slot" "postgres" "false"
+    # Usage: setup_subscription <cluster_type> <host> <sub_name> <conn_str> <pub_name> <slot_name> <database> [read_only_override] [copy_data]
+    # Example: setup_subscription "target" "pgtwin12" "pgtwin_migrate_sub" "host=..." "pgtwin_migrate_pub" "pgtwin_migrate_slot" "postgres" "false" "true"
 
     local cluster_type="$1"
     local host="$2"
@@ -1854,6 +1854,7 @@ setup_subscription() {
     local slot_name="$6"
     local database="$7"       # Database name (for psql -d)
     local read_only_override="${8:-false}"  # Optional, defaults to false
+    local copy_data="${9:-true}"  # Optional, defaults to true (forward direction)
 
     ocf_log info "Checking for subscription: ${sub_name} on ${host} (database: ${database})"
 
@@ -1862,14 +1863,14 @@ setup_subscription() {
         return 0
     fi
 
-    ocf_log info "Creating subscription: ${sub_name} on ${host} (database: ${database})"
+    ocf_log info "Creating subscription: ${sub_name} on ${host} (database: ${database}, copy_data=${copy_data})"
 
     if [ "$read_only_override" = "true" ]; then
         # Create temporary SQL file (safer than HEREDOC in async background process)
         local tmpfile=$(mktemp)
         cat > "$tmpfile" <<EOF
 SET default_transaction_read_only = off;
-CREATE SUBSCRIPTION ${sub_name} CONNECTION '${conn_str}' PUBLICATION ${pub_name} WITH (create_slot = true, slot_name = '${slot_name}', copy_data = true);
+CREATE SUBSCRIPTION ${sub_name} CONNECTION '${conn_str}' PUBLICATION ${pub_name} WITH (create_slot = true, slot_name = '${slot_name}', copy_data = ${copy_data});
 EOF
         run_as_postgres_user "$cluster_type" psql -h "$host" -p "$OCF_RESKEY_pgport" -U "$OCF_RESKEY_migration_dbuser" -d "$database" -f "$tmpfile" >/dev/null 2>&1
         local rc=$?
@@ -1883,7 +1884,7 @@ EOF
             "CREATE SUBSCRIPTION ${sub_name}
              CONNECTION '${conn_str}'
              PUBLICATION ${pub_name}
-             WITH (create_slot = true, slot_name = '${slot_name}', copy_data = true);" 2>&1)
+             WITH (create_slot = true, slot_name = '${slot_name}', copy_data = ${copy_data});" 2>&1)
         local sub_rc=$?
         if [ $sub_rc -ne 0 ]; then
             ocf_log err "Failed to create subscription: ${sub_name} on database: ${database}"
@@ -1893,7 +1894,7 @@ EOF
     fi
 
     ocf_log info "✓ Subscription created: ${sub_name} on database: ${database}"
-    ocf_log info "   Initial table sync started (copy_data=true)"
+    ocf_log info "   Initial table sync started (copy_data=${copy_data})"
 
     return 0
 }
@@ -2106,7 +2107,14 @@ setup_database_replication() {
         ocf_log info "[${db}] Step 3: Creating ENABLED subscription on ${sub_cluster_type}"
         local conn_str="host=${pub_host} port=${OCF_RESKEY_pgport} dbname=${db} user=${OCF_RESKEY_migration_dbuser}"
 
-        if ! setup_subscription "$sub_cluster_type" "$sub_host" "$sub_name" "$conn_str" "$pub_name" "$slot_name" "$db" "false"; then
+        # Reverse direction's subscriber is the old production side, which already
+        # has all the data - it was the source. copy_data=true there makes the
+        # initial tablesync worker try to COPY rows that already exist, which
+        # fails on the first primary key and never reaches streaming state.
+        local copy_data_for_direction="true"
+        [ "$direction" = "reverse" ] && copy_data_for_direction="false"
+
+        if ! setup_subscription "$sub_cluster_type" "$sub_host" "$sub_name" "$conn_str" "$pub_name" "$slot_name" "$db" "false" "$copy_data_for_direction"; then
             ocf_log err "[${db}] Failed to create subscription"
             # Cleanup publication
             ocf_log err "[${db}] Cleaning up publication"
