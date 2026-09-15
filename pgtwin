@@ -844,9 +844,14 @@ parse_pgpass() {
     local local_node=$(get_cluster_node_name)
     local local_hostname=$(hostname)
 
-    # Default to postgres user's .pgpass if not specified
+    # Default to postgres user's .pgpass if not specified.
+    # Resolve the real OS home directory instead of assuming pguser (a
+    # PostgreSQL role name) also names a /var/lib/<pguser> home directory
+    # (Debian-only convention; RHEL/SUSE use /var/lib/pgsql).
     if [ -z "$pgpass_file" ]; then
-        pgpass_file="/var/lib/${OCF_RESKEY_pguser}/.pgpass"
+        local pguser_home
+        pguser_home=$(getent passwd "${OCF_RESKEY_pguser}" 2>/dev/null | cut -d: -f6)
+        pgpass_file="${pguser_home:-/var/lib/pgsql}/.pgpass"
     fi
 
     if [ ! -f "$pgpass_file" ]; then
@@ -1535,13 +1540,12 @@ discover_promoted_node() {
         local is_primary=$(run_as_pguser sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
         if [ "$is_primary" = "t" ]; then
-            # VIP responds and is primary, now get its hostname
-            promoted_node=$(run_as_pguser sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT split_part(inet_server_addr()::text, '.', 4)\"" 2>/dev/null)
-
-            if [ -z "$promoted_node" ]; then
-                # Fallback: just use VIP directly
-                promoted_node="${OCF_RESKEY_vip}"
-            fi
+            # VIP responds and is primary. Use the VIP itself as the
+            # connectable identity instead of deriving one from
+            # inet_server_addr(): that value carries a CIDR suffix for
+            # Pacemaker-managed (/32) VIPs, e.g. "172.16.50.5/32", which
+            # broke the previous last-octet split_part() parsing.
+            promoted_node="${OCF_RESKEY_vip}"
 
             ocf_log info "Discovered promoted node via VIP: ${promoted_node}"
             echo "$promoted_node"
@@ -1628,6 +1632,59 @@ check_replication_health() {
     fi
 }
 
+# dmkif (self-healing, see pgtwin#3): dynamically advertise whether this
+# node is currently a safe promotion candidate. "ineligible" forces the
+# promotion score to -INFINITY, overriding any static location constraint
+# so Pacemaker cannot promote a known-broken/still-recovering node just
+# because an operator's location score prefers it. "eligible" removes the
+# override, returning control to normal operator-configured scoring. Safe
+# to call every monitor cycle; both branches are idempotent.
+set_promotion_eligibility() {
+    local mode="$1"
+    local rsc_name=$(echo "$OCF_RESOURCE_INSTANCE" | sed 's/:[0-9]*$//')
+    local node_name=$(get_cluster_node_name)
+
+    if [ -z "$rsc_name" ] || [ -z "$node_name" ]; then
+        return 1
+    fi
+
+    # dmkif: use the literal "master-$rsc_name" node-attribute name
+    # instead of relying on `--promotion` to derive it. Verified live via
+    # `crm_simulate --show-scores` against the actual CIB: `--promotion -n
+    # "$rsc_name"` was writing the attribute under the bare name
+    # ("pgtwin-pg"), not the name Pacemaker's scheduler actually reads for
+    # a promotable clone's promotion score ("master-pgtwin-pg") - so this
+    # whole eligibility mechanism was silently a no-op the entire time,
+    # positive or negative, on this Pacemaker version
+    # (3.0.3+20260728.7052efa194). Manually writing "master-pgtwin-pg"
+    # instead immediately moved the simulated promotion score from -1 to
+    # 210 and the outcome from "demoted" to "Promoted: [ pg-a ]". Whatever
+    # protection issue #3's fix appeared to provide before was coming from
+    # ordinary fail-count/migration-threshold banning, not this attribute.
+    local master_attr="master-${rsc_name}"
+
+    if [ "$mode" = "ineligible" ]; then
+        crm_attribute -N "$node_name" -n "$master_attr" -v -INFINITY >/dev/null 2>&1
+    else
+        # dmkif: explicit positive floor, not --delete. An unset
+        # master-score falls back to Pacemaker's own implicit default for
+        # a promotable clone instance, which live testing showed can be
+        # *negative* (-1) once resource history is wiped (e.g.
+        # `crm resource cleanup`, or unmanage/manage) - enough to demote
+        # an already-Promoted, perfectly healthy, sole-surviving primary
+        # even with zero competing candidates (the other instance sitting
+        # at -INFINITY). Real production incident: three separate
+        # cleanup/manage cycles each demoted a manually-verified-healthy
+        # primary into an orphaned standby with no primary anywhere,
+        # despite this exact "eligible" path having just run. A small
+        # fixed positive value keeps this node's floor score above that
+        # implicit default without overriding the real differentiators
+        # (resource-stickiness=1000, the pingd-gated location constraint)
+        # that decide *between* two genuinely healthy nodes.
+        crm_attribute -N "$node_name" -n "$master_attr" -v 10 >/dev/null 2>&1
+    fi
+}
+
 pgsql_monitor() {
     local rc
 
@@ -1638,6 +1695,17 @@ pgsql_monitor() {
         check_basebackup_progress
         # Still in progress, return not running so resource won't be started yet
         if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
+            # dmkif (self-healing, see pgtwin#3): a node still catching up
+            # via basebackup isn't running PostgreSQL yet, so it never
+            # reaches the replication-health check further down in this
+            # function that normally sets/clears the promotion-eligibility
+            # veto. Without this, a static location constraint can still
+            # pull promotion onto this node while it has no usable data at
+            # all. Re-assert ineligible on every poll of this state too, as
+            # defense in depth alongside the pgsql_start()-time veto (covers
+            # e.g. a Pacemaker restart mid-recovery where start already ran
+            # once but monitor is what's polling now).
+            set_promotion_eligibility "ineligible"
             ocf_log info "Basebackup still in progress, instance not ready"
             return $OCF_NOT_RUNNING
         fi
@@ -1747,8 +1815,33 @@ pgsql_monitor() {
         if [ $repl_health -eq 0 ]; then
             # Replication is healthy, reset failure counter
             ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+
+            # dmkif (self-healing, see pgtwin#3): this node is caught up and
+            # streaming cleanly. Clear any promotion-eligibility veto we may
+            # have set while it was unhealthy, so normal operator-configured
+            # promotion scoring/location constraints apply again.
+            set_promotion_eligibility "eligible"
+
             return $OCF_SUCCESS
         else
+            # dmkif (self-healing, see pgtwin#3): this node's replication is
+            # not known-good right now. Actively refuse promotion candidacy
+            # by forcing its promotion score to -INFINITY, which overrides
+            # any static `location ... role=Promoted` preference an operator
+            # configured for it. Without this, Pacemaker can repeatedly try
+            # promoting a still-recovering/diverged node purely because a
+            # location constraint prefers it, demoting the current healthy
+            # primary on every recheck cycle and causing a real,
+            # self-inflicted write outage until the broken node eventually
+            # (if ever) catches up. Set this immediately (not only after
+            # replication_failure_threshold is exceeded) since even a single
+            # detected problem means this node should not be a promotion
+            # candidate right now; it self-clears above the moment
+            # replication is confirmed healthy again, so a genuinely
+            # recovered node automatically becomes eligible without any
+            # manual intervention.
+            set_promotion_eligibility "ineligible"
+
             # Replication is unhealthy, increment failure counter
             local failure_count=$(crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -G -q -d 0 -l reboot 2>/dev/null || echo "0")
             failure_count=$((failure_count + 1))
@@ -2027,6 +2120,7 @@ pgsql_start() {
         ocf_log info "Basebackup already in progress, checking status"
         check_basebackup_progress
         if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
+            set_promotion_eligibility "ineligible"
             ocf_log info "Basebackup still in progress, instance not ready"
             return $OCF_NOT_RUNNING
         fi
@@ -2036,6 +2130,18 @@ pgsql_start() {
 
     # Auto-initialization: Check if PGDATA is empty/missing/invalid
     if ! is_valid_pgdata; then
+        # dmkif (self-healing, see pgtwin#3 / pgtwin#4): mark this node
+        # ineligible for promotion the moment we know it's about to become
+        # a standby with no usable data yet, BEFORE the (async, can take a
+        # while) basebackup even starts. Without this, a static
+        # `location ... role=Promoted` constraint favoring this node can
+        # make Pacemaker pull promotion onto it - or repeatedly try to,
+        # demoting a perfectly healthy current primary each time - while
+        # this node has nothing to serve. pgsql_monitor() clears this once
+        # replication is confirmed healthy after basebackup completes and
+        # streaming starts.
+        set_promotion_eligibility "ineligible"
+
         ocf_log info "PGDATA is empty or invalid - triggering automatic standby initialization"
 
         # Ensure .pgpass exists
@@ -2201,6 +2307,33 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
                             local recovery_rc=$?
 
                             if [ $recovery_rc -eq 0 ]; then
+                                # dmkif (fixes pgtwin#5): recover_standby()
+                                # returns 0 both when pg_rewind truly
+                                # finished AND when it only just launched an
+                                # async pg_basebackup fallback (that path's
+                                # start_async_basebackup() returns 0 the
+                                # moment the background job starts, not when
+                                # it completes). Falling through to the
+                                # normal start flow in the latter case races
+                                # ahead of the still-copying data directory:
+                                # postgresql.auto.conf doesn't exist yet, so
+                                # the safety-check further down logs
+                                # "Standby node missing postgresql.auto.conf"
+                                # and the subsequent pg_ctl start attempt
+                                # fails outright against an incomplete
+                                # PGDATA - reliably, on every single first
+                                # attempt, tripping migration-threshold
+                                # before Pacemaker ever gets a real chance to
+                                # let recovery finish. Reuse the same marker
+                                # file pgsql_monitor() already polls for the
+                                # empty-PGDATA bootstrap case, and defer the
+                                # same way if it's present.
+                                local state_dir_check=$(dirname "${PGDATA}")
+                                if [ -f "${state_dir_check}/.pgtwin_basebackup_in_progress" ]; then
+                                    ocf_log info "Recovery started an asynchronous basebackup - not finished yet, deferring to monitor"
+                                    return $OCF_NOT_RUNNING
+                                fi
+
                                 ocf_log info "✅ Automatic recovery succeeded - continuing startup"
                                 # PostgreSQL is stopped after recovery, will be started by normal flow below
                             else
@@ -2708,17 +2841,57 @@ pgsql_demote() {
     ocf_log info "Discovering current promoted node for replication setup"
     primary_host=$(discover_promoted_node)
 
+    # dmkif: discover_promoted_node() can return THIS node itself here.
+    # pgsql_demote() is called while this node is still the (soon-to-be
+    # former) primary and hasn't been stopped yet, so it still answers
+    # "NOT pg_is_in_recovery()" truthfully to VIP/node_list-based discovery
+    # at the exact moment we're trying to find our own future upstream.
+    # Left unchecked this misconfigures primary_conninfo to point at
+    # localhost, which "succeeds" as a degenerate self-referential
+    # streaming connection without ever replicating real data from the
+    # actual new primary. Reject self-discovery here unconditionally.
+    local local_node_name=$(get_cluster_node_name)
+    local local_hostname=$(hostname)
+    if [ -n "$primary_host" ] && { [ "$primary_host" = "$local_node_name" ] || [ "$primary_host" = "$local_hostname" ]; }; then
+        ocf_log warn "discover_promoted_node() returned this node itself ('${primary_host}') during demote - ignoring self-discovery, falling back"
+        primary_host=""
+    fi
+
     if [ -z "$primary_host" ]; then
         # Fallback to .pgpass or node list
-        ocf_log info "Dynamic discovery failed, trying traditional methods"
+        ocf_log info "Dynamic discovery failed (or was self-referential), trying traditional methods"
         primary_host=$(get_replication_host)
 
+        if [ -n "$primary_host" ] && { [ "$primary_host" = "$local_node_name" ] || [ "$primary_host" = "$local_hostname" ]; }; then
+            ocf_log warn ".pgpass-based discovery also returned this node itself ('${primary_host}') - ignoring"
+            primary_host=""
+        fi
+
         if [ -z "$primary_host" ]; then
-            # Fallback to node list (first non-self node)
+            # dmkif: discover_promoted_node() already queried the VIP, every
+            # node_list entry, and the Pacemaker CIB, and found nobody
+            # promoted. This is a last-resort fallback for the case where
+            # a node came up promoted *after* that check ran (a genuine
+            # race) - it is NOT license to guess. Blindly picking "the
+            # first non-self node in node_list" here previously wrote a
+            # primary_conninfo pointing at whatever node came first,
+            # whether or not it was actually running or actually primary -
+            # in the incident that motivated this fix, that node was
+            # neither, and the result was an unrecoverable standby chasing
+            # a phantom primary (self-inflicted, no real primary existed
+            # anywhere at that moment). Verify before trusting a candidate,
+            # exactly like discover_promoted_node()'s own node_list method.
+            ocf_log warn "No promoted node found by discover_promoted_node() or .pgpass; re-checking node_list with verification before falling back"
             for node in ${OCF_RESKEY_node_list}; do
-                if [ "$node" != "$(get_cluster_node_name)" ]; then
-                    primary_host="$node"
-                    break
+                if [ "$node" != "$local_node_name" ] && [ "$node" != "$local_hostname" ]; then
+                    local candidate_is_primary=$(run_as_pguser sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+                    if [ "$candidate_is_primary" = "t" ]; then
+                        primary_host="$node"
+                        ocf_log info "Verified ${node} is actually promoted; using it"
+                        break
+                    else
+                        ocf_log warn "Candidate ${node} from node_list did not verify as promoted (got '${candidate_is_primary}'), not using it"
+                    fi
                 fi
             done
         fi
@@ -3210,7 +3383,16 @@ EOF
             echo '=========================================='
         fi
 
-        setpriv --reuid=${pguid} --regid=${pggid} --clear-groups env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -S ${OCF_RESKEY_slot_name} --progress
+        # dmkif: -c fast forces an immediate checkpoint on the primary
+        # instead of the default spread checkpoint. Without it, live
+        # testing showed pg_basebackup can sit blocked in state=backup /
+        # wait_event=CheckpointStart for up to checkpoint_timeout (5min
+        # default) before any data actually starts copying - on a small
+        # database this dwarfs the real backup time entirely. -c fast
+        # briefly spikes I/O on the primary during the forced checkpoint,
+        # an acceptable tradeoff here since this only runs when a standby
+        # is (re)joining, not on every monitor cycle.
+        setpriv --reuid=${pguid} --regid=${pggid} --clear-groups env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -c fast -S ${OCF_RESKEY_slot_name} --progress
         basebackup_rc=\$?
         echo \${basebackup_rc} > '${rc_file}'
 
