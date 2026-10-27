@@ -1,4 +1,4 @@
-## [1.7.10] - 2026-10-11
+## [1.7.11] - 2026-10-27
 
 ### Fixed
 - **Stale standby was promoted after a staggered shutdown of both nodes**
@@ -17,6 +17,10 @@
     dies, old primary boots first: 116 acknowledged commits lost before the fix).
   - Log: `promotion-by-data-state: decision=...` with both data states.
   - Tests: `test/test-promotion-data-state.sh`; see `doc/FEATURE_PROMOTION_BY_DATA_STATE.md`.
+
+## [1.7.10] - 2026-10-11
+
+### Fixed
 - **Replication slot created at promotion did not reserve any WAL**
   - `create_replication_slot()` called `pg_create_physical_replication_slot(name)` without `immediately_reserve`, so the new slot had `restart_lsn = NULL` and kept no WAL until a standby had connected through it
   - Replication slots are not copied to the standby, therefore every failover creates a fresh, empty slot on the new primary; a standby that stays away for a while finds its WAL recycled and can never catch up (`requested WAL segment ... has already been removed`)
