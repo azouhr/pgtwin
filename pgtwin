@@ -2127,6 +2127,90 @@ validate_pg_version() {
     return 0
 }
 
+# Make sure the replication slot named in primary_slot_name exists on the
+# primary before a standby starts. The standby configuration written by
+# finalize_standby_config() (after pg_rewind, or by an older basebackup)
+# names the slot, but only the pg_basebackup path ever created it. Without
+# the slot the walreceiver fails with 'replication slot "..." does not exist'
+# and the start/retry loop never ends; the slot can also be gone because it
+# was dropped by check_replication_slots() or the primary was rebuilt.
+# Best effort: a failure is logged and the start continues as before.
+ensure_primary_replication_slot() {
+    local primary_host="$1" rep_user="$2" result
+
+    [ -n "${OCF_RESKEY_slot_name}" ] || return 0
+    [ -n "$primary_host" ] && [ -n "$rep_user" ] || return 1
+
+    # immediately_reserve: the slot has to protect WAL from the moment it exists
+    local slot_sql="SELECT CASE WHEN (SELECT count(*) FROM pg_replication_slots WHERE slot_name = '${OCF_RESKEY_slot_name}') = 0 THEN (SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}', true))::text ELSE 'already_exists' END"
+    result=$(run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" 2>&1)
+    if [ $? -ne 0 ]; then
+        ocf_log warn "Could not check replication slot '${OCF_RESKEY_slot_name}' on primary ${primary_host}: ${result}"
+        return 1
+    fi
+    if [ "$result" != "already_exists" ]; then
+        ocf_log warn "Replication slot '${OCF_RESKEY_slot_name}' was missing on primary ${primary_host}, created it (WAL reserved)"
+    fi
+    return 0
+}
+
+# Resolve the directory PostgreSQL writes its server log files to.
+# Prints nothing if the log goes to stderr/syslog only (no log directory).
+get_pg_log_directory() {
+    local logdir
+    logdir=$(get_pg_config_value "log_directory")
+    [ -z "$logdir" ] && return 0
+    case "$logdir" in
+        /*) echo "$logdir" ;;
+        *)  echo "${PGDATA}/${logdir}" ;;
+    esac
+}
+
+# Remember size of every server log file before a start attempt, so that
+# standby_start_failed_for_missing_wal() can look at the lines written by
+# this attempt only (never at older ones).
+snapshot_pg_logs() {
+    local snap="$1" logdir f
+    : > "$snap"
+    logdir=$(get_pg_log_directory)
+    [ -n "$logdir" ] && [ -d "$logdir" ] || return 0
+    for f in "$logdir"/*; do
+        [ -f "$f" ] && echo "$(stat -c %s "$f") $f" >> "$snap"
+    done
+}
+
+# Returns 0 if the server log lines written since snapshot_pg_logs() contain
+# the walreceiver error for a WAL segment the primary has already recycled.
+# That standby can never become consistent by waiting: it needs a new base
+# backup. Written for pgtwin 1.7.5 (standby start loop observed 2026-09-23
+# to 2026-10-10 on pg-b: pg_ctl start timed out every 5 minutes, the
+# fail-count was cleared by failure-timeout, and nothing ever escalated).
+standby_start_failed_for_missing_wal() {
+    local snap="$1" startlog="$2" logdir f old size
+    local pattern='requested WAL segment [0-9A-Fa-f]+ has already been removed'
+    # stderr of the postmaster: the only log when logging_collector is off
+    # (truncated before every attempt, so it holds this attempt only)
+    if [ -s "$startlog" ] && grep -Eq "$pattern" "$startlog"; then
+        return 0
+    fi
+    logdir=$(get_pg_log_directory)
+    [ -n "$logdir" ] && [ -d "$logdir" ] || return 1
+    for f in "$logdir"/*; do
+        [ -f "$f" ] || continue
+        old=$(awk -v f="$f" '{ if (substr($0, index($0, " ") + 1) == f) { print $1; exit } }' "$snap")
+        size=$(stat -c %s "$f")
+        if [ -z "$old" ]; then
+            old=0                       # file created by this attempt
+        elif [ "$size" -le "$old" ]; then
+            continue                    # nothing new written
+        fi
+        if tail -c +$((old + 1)) "$f" | grep -Eq "$pattern"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 pgsql_start() {
     local rc
 
@@ -2389,6 +2473,12 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             fi
         fi
 
+        # The standby configuration names a replication slot; make sure the
+        # primary has it, otherwise the walreceiver fails forever.
+        if [ -n "${OCF_RESKEY_slot_name}" ]; then
+            ensure_primary_replication_slot "$(discover_promoted_node)" "$(get_replication_user)"
+        fi
+
         # Safety check: Verify standby configuration before starting
         # This catches cases where manual pg_basebackup was done or config was corrupted
         if [ -f "${PGDATA}/postgresql.auto.conf" ]; then
@@ -2471,13 +2561,49 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
     fi
 
     # Start PostgreSQL
-    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -w -t 60 start" >/dev/null 2>&1
+    local log_snapshot="${state_dir}/.pgtwin_start_logsnap"
+    local start_log="${state_dir}/.pgtwin_start.log"
+    snapshot_pg_logs "$log_snapshot"
+    : > "$start_log"
+    chown "${OCF_RESKEY_pguser}" "$start_log" 2>/dev/null
+    run_as_pguser sh -c "${PGCTL} -D ${PGDATA} -l ${start_log} -w -t 60 start" >/dev/null 2>&1
     rc=$?
 
     if [ $rc -ne 0 ]; then
+        # A standby whose required WAL no longer exists on the primary
+        # hangs in "waiting for WAL" until pg_ctl times out. Retrying the
+        # same start never helps (the segment is gone), and neither the
+        # timeline check nor pg_rewind notice it when both nodes are on the
+        # same timeline. Fall back to a full base backup instead of failing
+        # forever.
+        if [ -f "${PGDATA}/standby.signal" ] && standby_start_failed_for_missing_wal "$log_snapshot" "$start_log"; then
+            rm -f "$log_snapshot"
+            ocf_log warn "Standby cannot start: WAL required for recovery has already been removed on the primary"
+            ocf_log warn "Falling back to a full pg_basebackup"
+            if pgsql_is_running; then
+                pgsql_stop
+            fi
+            local bb_primary
+            bb_primary=$(discover_promoted_node)
+            if [ -z "$bb_primary" ]; then
+                ocf_log err "Cannot rebuild standby: unable to discover primary node"
+                return $OCF_ERR_GENERIC
+            fi
+            set_promotion_eligibility "ineligible"
+            recover_standby "${bb_primary}" basebackup-only
+            local bb_rc=$?
+            if [ $bb_rc -ne 0 ]; then
+                ocf_log err "Standby rebuild via pg_basebackup failed to start"
+                return $OCF_ERR_GENERIC
+            fi
+            ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
+            return $OCF_NOT_RUNNING
+        fi
+        rm -f "$log_snapshot"
         ocf_log err "Failed to start PostgreSQL"
         return $OCF_ERR_GENERIC
     fi
+    rm -f "$log_snapshot"
 
     # Wait for PostgreSQL to be ready
     local count=0
@@ -3198,19 +3324,35 @@ EOF
 create_replication_slot() {
     ocf_log info "Creating replication slot ${OCF_RESKEY_slot_name}"
 
-    # Check if slot already exists
-    local slot_exists=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_replication_slots WHERE slot_name='${OCF_RESKEY_slot_name}'\"" 2>/dev/null)
+    # Slot state: "<count>|<reserved>|<active>". A slot created without
+    # immediately_reserve has restart_lsn NULL and holds back no WAL at all
+    # until a standby has connected through it. Slots are not replicated to
+    # the standby, so every failover creates a fresh one on the new primary;
+    # a standby that is away for a while (pg-b: 2026-09-23 to 2026-10-10)
+    # then finds its WAL recycled and can never catch up.
+    local slot_state=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) || '|' || count(restart_lsn) || '|' || coalesce(bool_or(active)::int, 0) FROM pg_replication_slots WHERE slot_name='${OCF_RESKEY_slot_name}'\"" 2>/dev/null)
 
-    if [ "$slot_exists" = "1" ]; then
-        ocf_log info "Replication slot ${OCF_RESKEY_slot_name} already exists"
-        return 0
-    fi
+    case "$slot_state" in
+        1\|1\|*)
+            ocf_log info "Replication slot ${OCF_RESKEY_slot_name} already exists"
+            return 0
+            ;;
+        1\|0\|0)
+            # Exists but reserves nothing and nobody is using it: replace it
+            # with a reserving one instead of keeping a slot that protects no WAL.
+            ocf_log warn "Replication slot ${OCF_RESKEY_slot_name} exists without reserved WAL, recreating it"
+            run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_drop_replication_slot('${OCF_RESKEY_slot_name}')\"" >/dev/null 2>&1
+            ;;
+        1\|0\|1)
+            ocf_log info "Replication slot ${OCF_RESKEY_slot_name} already exists (in use)"
+            return 0
+            ;;
+    esac
 
-    # Create the slot
-    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}')\"" >/dev/null 2>&1
+    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}', true)\"" >/dev/null 2>&1
 
     if [ $? -eq 0 ]; then
-        ocf_log info "Replication slot ${OCF_RESKEY_slot_name} created successfully"
+        ocf_log info "Replication slot ${OCF_RESKEY_slot_name} created successfully (WAL reserved)"
         return 0
     else
         ocf_log warn "Failed to create replication slot ${OCF_RESKEY_slot_name}"
@@ -3307,6 +3449,7 @@ EOF
 
 recover_standby() {
     local primary_host="$1"
+    local mode="$2"        # "basebackup-only": skip pg_rewind (WAL already gone)
     local rc
     local rep_user
     local app_name
@@ -3323,8 +3466,10 @@ recover_standby() {
         pgsql_stop
     fi
 
-    # Try pg_rewind first
-    if [ -x "${PG_REWIND}" ]; then
+    # Try pg_rewind first (unless the caller knows it cannot help)
+    if [ "$mode" = "basebackup-only" ]; then
+        ocf_log info "Skipping pg_rewind, going straight to full basebackup"
+    elif [ -x "${PG_REWIND}" ]; then
         ocf_log info "Attempting pg_rewind"
 
         # Ensure .pgpass is in standard location

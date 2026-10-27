@@ -17,6 +17,22 @@
     dies, old primary boots first: 116 acknowledged commits lost before the fix).
   - Log: `promotion-by-data-state: decision=...` with both data states.
   - Tests: `test/test-promotion-data-state.sh`; see `doc/FEATURE_PROMOTION_BY_DATA_STATE.md`.
+- **Replication slot created at promotion did not reserve any WAL**
+  - `create_replication_slot()` called `pg_create_physical_replication_slot(name)` without `immediately_reserve`, so the new slot had `restart_lsn = NULL` and kept no WAL until a standby had connected through it
+  - Replication slots are not copied to the standby, therefore every failover creates a fresh, empty slot on the new primary; a standby that stays away for a while finds its WAL recycled and can never catch up (`requested WAL segment ... has already been removed`)
+  - Fix: create the slot with `immediately_reserve => true`; an existing slot that is idle and has no reserved WAL is dropped and recreated, a slot that already reserves WAL or is in use is left alone
+  - Reproduction: `test/wal-removed-repro/slotcheck.sh`
+- **Standby start loop when the required WAL is gone from the primary**
+  - A standby whose WAL was already recycled on the primary waits in `waiting for WAL to become available`; `pg_ctl -w start` times out and the agent failed with `Failed to start PostgreSQL`. Pacemaker cleared the fail-count after `failure-timeout` and retried the identical start forever, as nothing ever fell back to `pg_basebackup`
+  - The timeline check did not help: with equal timelines it does not run, and after a timeline divergence `pg_rewind` can answer `no rewind required` while the redo segment is still missing
+  - Fix: if the start of a standby fails and the log lines written by that attempt contain `requested WAL segment ... has already been removed`, stop PostgreSQL and rebuild the standby with `pg_basebackup` (skipping `pg_rewind`), then defer to the monitor like the existing empty-PGDATA path. Only log lines written by the failed attempt are considered, with or without `logging_collector`
+  - Reproduction: `test/wal-removed-repro/`
+- **Standby start did not ensure its replication slot exists on the primary**
+  - `finalize_standby_config()` writes `primary_slot_name`, but only the `pg_basebackup` path created the slot. After a `pg_rewind` recovery, a dropped slot or a rebuilt primary the walreceiver failed forever with `replication slot "..." does not exist`; the standby is consistent, so the start succeeded and nothing noticed that replication was down
+  - Fix: before a standby starts, the agent checks the slot on the primary and creates it with `immediately_reserve` if it is missing. Best effort: if the primary cannot be reached the start continues as before
+  - Reproduction: `test/wal-removed-repro/mkstandby-stream.sh`
+
+---
 
 ## [1.7.5] - 2026-04-29
 
