@@ -2344,6 +2344,27 @@ pgsql_start() {
         read file_count < /tmp/.pgtwin_filecount.$$
         rm -f /tmp/.pgtwin_filecount.$$
 
+        # A data directory without a cluster can still hold the files pgtwin
+        # writes itself (demote/finalize on a node whose PGDATA was emptied):
+        # postgresql.auto.conf and the signal files. They are recreated by
+        # finalize_standby_config after the basebackup; remove them instead of
+        # failing every start forever. Anything else is left to the operator.
+        if [ "$file_count" -gt 0 ]; then
+            local leftover only_agent_files=true
+            for leftover in "${PGDATA}"/* "${PGDATA}"/.[!.]*; do
+                [ -e "$leftover" ] || continue
+                case "$(basename "$leftover")" in
+                    postgresql.auto.conf|standby.signal|recovery.signal) ;;
+                    *) only_agent_files=false ;;
+                esac
+            done
+            if [ "$only_agent_files" = "true" ]; then
+                ocf_log warn "PGDATA holds no cluster, only files written by pgtwin ($(ls -A "${PGDATA}" | tr '\n' ' ')) - removing them before pg_basebackup"
+                rm -f "${PGDATA}/postgresql.auto.conf" "${PGDATA}/standby.signal" "${PGDATA}/recovery.signal"
+                file_count=0
+            fi
+        fi
+
         if [ "$file_count" -gt 0 ]; then
             ocf_log err "Cannot run pg_basebackup: PGDATA directory is not empty"
             ocf_log err "Found $file_count file(s) in ${PGDATA}"
