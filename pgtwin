@@ -127,6 +127,13 @@ PG_REWIND="${OCF_RESKEY_pg_bindir}/pg_rewind"
 PG_BASEBACKUP="${OCF_RESKEY_pg_bindir}/pg_basebackup"
 POSTGRES="${OCF_RESKEY_pg_bindir}/postgres"
 
+# Bound every libpq connection attempt (psql, pg_basebackup, pg_rewind; inherited
+# through run_as_pguser/setpriv). Without it a connection to an address that has
+# just moved - the VIP during a switchover, a stale ARP entry - hangs in TCP SYN
+# retries: a single discovery query blocked a promote for 39-72 s in lab tests.
+: ${PGCONNECT_TIMEOUT:=5}
+export PGCONNECT_TIMEOUT
+
 #######################################################################
 
 meta_data() {
@@ -1556,12 +1563,21 @@ discover_promoted_node() {
 
     local promoted_node=""
 
+    # Remote queries authenticate as the replication user against database
+    # "postgres" (the .pgpass entries documented for discovery). Without -U they
+    # ran as the postgres role without a password and could never succeed, so
+    # only the CIB fallback worked. Short connect timeout: during a switchover
+    # the VIP is down and an unanswered connect must not block the action.
+    local disc_user disc_opts=""
+    disc_user=$(get_replication_user 2>/dev/null)
+    [ -n "$disc_user" ] && disc_opts="-U ${disc_user} -d postgres"
+
     # Method 1: Use VIP if configured
     if [ -n "${OCF_RESKEY_vip}" ]; then
         ocf_log debug "Attempting to discover promoted node via VIP ${OCF_RESKEY_vip}"
 
         # Try to connect to VIP and check if it's promoted
-        local is_primary=$(run_as_pguser sh -c "${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+        local is_primary=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
         if [ "$is_primary" = "t" ]; then
             # VIP responds and is primary. Use the VIP itself as the
@@ -1582,7 +1598,7 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via node_list"
 
         for node in ${OCF_RESKEY_node_list}; do
-            local is_primary=$(run_as_pguser sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+            local is_primary=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
             if [ "$is_primary" = "t" ]; then
                 promoted_node="$node"
