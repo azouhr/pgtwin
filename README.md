@@ -493,6 +493,9 @@ sudo crm configure primitive postgres-db pgtwin \
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **1.8.0** | 2026-11-10 | Fast switchover (19-30 s), pg_rewind after crashes, standby-side slot, promotion and recovery fixes ([release notes](releasenotes/RELEASE_v1.8.0.md)) |
+| **1.7.x** | 2026-01 - 2026-10 | pgtwin-migrate, promotion by data state, WAL/slot fixes (see [CHANGELOG](CHANGELOG.md)) |
+| **1.6.x** | 2025-11 - 2025-12 | Container mode, automatic standby initialization, notify support |
 | **1.5.0** | 2025-01-02 | Configuration validation framework, production-safe timeouts |
 | **1.4.0** | 2025-12 | Async pg_basebackup, backup mode |
 | **1.3.0** | 2025-11 | Enhanced configuration checks |

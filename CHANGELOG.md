@@ -1,3 +1,86 @@
+## [1.8.0] - 2026-11-10
+
+Includes the fixes of the unreleased 1.7.12 and 1.7.13 from `dmkif/pgtwin` (hyphenated node names in
+`synchronous_standby_names`, staying eligible for promotion when no primary exists). Release notes:
+`releasenotes/RELEASE_v1.8.0.md`; design for the next step: `doc/DESIGN_STALL_SAFE_SYNC.md`.
+
+### Changed
+- **Stall-safe synchronous replication** (`doc/DESIGN_STALL_SAFE_SYNC.md`). A primary that stalls (paused VM,
+  I/O hang) and continues later while its standby was promoted now waits instead of acknowledging, and is turned
+  into a standby; the promoted node survives because its timeline went on. The behaviour for failing nodes is
+  kept.
+  - The primary monitor and the start path only tighten `synchronous_standby_names`; relaxing happens in promote
+    and in the post-stop notification of the standby. Without fencing (no stop action, no notification) the
+    monitor relaxes when the standby is offline and its PostgreSQL does not answer.
+  - **Relative promotion score, transient** (was a permanent 10): base 10 as before; after a promotion the peer's
+    last known score + 10000, back to 10 once a standby is in sync and the peer is at the base; demote and standby
+    start drop to 10 at once. Of two primaries after a stall or partition the one promoted last survives the
+    scheduler's demote decision, whichever node is DC, also against location and connectivity differences. Steady
+    state scores (failover, ping rule, stickiness arithmetic) are unchanged.
+  - A primary that finds the peer as primary on a newer timeline steps down (stop, `OCF_FAILED_PROMOTED`, restart
+    as standby); a former primary never starts as a second primary.
+  - With fencing, writes now block until the standby is fenced (63 s with the `crm cluster init` delays) instead
+    of until the walsender gives up (~30 s).
+- **`promotion_peer_wait` default 30 s (was 60 s), hard limit 40 s (was 100 s)**, both measured from the start of
+  the check including primary discovery; no wait round is started that would end beyond the limit. The promote
+  action stays well below 60 s.
+- **Equal data states promote the node Pacemaker chose** instead of a tie-break by node name. The tie-break made
+  `crm resource move` to the node with the larger name impossible (after a clean demote both states are always
+  equal); Pacemaker never promotes two instances at once (promoted-max=1).
+- **The replication slot is prepared on the standby** and kept at the REDO point of its last restartpoint, so it
+  exists the moment the node is promoted. Created after the promotion it came too late: the checkpoint PostgreSQL
+  runs right after the promotion completed first and could recycle the WAL a rewound old primary needs.
+- QUICKSTART: `resource-stickiness=50` (was 100). The Promoted role gets the stickiness twice (directly and through
+  the colocated VIP); with 100 a primary that lost its connectivity keeps the role (310 against 260).
+
+### Fixed
+- **Switchover took 49-104 s, now 19-30 s.** No libpq connection had a connect timeout: a discovery query to the
+  just-moved VIP hung in TCP SYN retries for 39-72 s per call (found with resource tracing). The agent now exports
+  `PGCONNECT_TIMEOUT` (default 5 s, passed into the container in container mode), discovery uses 2 s, and a peer
+  that is leaving (standby, shutdown) is recognised before any query.
+- **Discovery queries could never succeed** in a setup following QUICKSTART.md: VIP and node_list queries ran as the
+  `postgres` role without a password. They now use the replication user on database `postgres`, as the `.pgpass`
+  entries are documented for. Only the CIB fallback worked before.
+- **The standby timeline was read from its last checkpoint**, which lags behind; a standby on the new timeline with
+  the same LSN was judged older and refused the promotion. The newest timeline history file in `pg_wal` is used
+  as well.
+- **A demoting primary ran `pg_rewind` against the not yet promoted standby** on every switchover (timeline check
+  in the standby start against a standby). The check now only compares with a node that is primary.
+- **`pg_rewind` failed after every crash of the primary** (`standby mode is not supported by single-user servers`):
+  pg_rewind completes the crash recovery in single-user mode, which refuses to run with `standby.signal`. A full
+  `pg_basebackup` ran instead. The signal files are kept outside PGDATA while pg_rewind runs.
+- **A consistent standby whose WAL is gone on the primary looped forever**: it starts, but the walreceiver fails
+  with `requested WAL segment ... has already been removed`, and the monitor recovery answered with a pg_rewind
+  that changes nothing. The monitor now detects the condition and rebuilds with `pg_basebackup` (1.7.10 covered only
+  a failing start).
+- **A standby vetoed its own promotion when its primary died and could not restart**, so no failover happened
+  (lab: none after 180 s). The node stays eligible when the peer answers as a standby, or when it does not answer
+  and the CIB shows no promoted instance (extends `fix/cold-start-eligible` from dmkif, whose peer query now also
+  authenticates as the replication user).
+- **Automatic standby initialization looped** when PGDATA held only files written by pgtwin itself
+  (`postgresql.auto.conf`, signal files) but no cluster: `pg_basebackup` refused the non-empty directory. These
+  files are removed first; anything else still stops with an error.
+- Hyphenated node names in `synchronous_standby_names` (dmkif, 1.7.12): compare and list the application_name.
+- The pre-basebackup version check never ran (`${PG_CTL}` was undefined; the variable is `PGCTL`).
+- Agent metadata version (said 1.6.9) and `pgtwin.spec` (said 1.6.0) updated.
+
+### Documentation
+- QUICKSTART: Tumbleweed binary links without `/etc/alternatives`, `wal_log_hints = on`, `pg_hba.conf` entry for
+  `replicator` on database `postgres`, no root-owned files in PGDATA, watchdog section (`kernel-default` on the
+  Minimal VM), crmsh init/join with SBD, `fencing-enabled`, controlled startup after the cluster exists,
+  copy-paste-safe resource examples with `vip`, required `migration-threshold`/`failure-timeout`, measured
+  scoring with a `crm_simulate` recipe, failover-time breakdown of the fencing delays, recovery after a failover.
+- QUICKSTART_DUAL_RING_HA: dual rings do not replace fencing; `rsc_defaults` instead of the ignored property.
+- `doc/DESIGN_STALL_SAFE_SYNC.md`: design for stall-safe synchronous replication (not implemented).
+
+### Tests
+- New unit tests: `test/test-cold-start-eligible.sh` (8), `test/test-safe-sync-names.sh` (5);
+  `test/test-promotion-data-state.sh` updated (28).
+- `test/test-pgtwin-ha-suite.sh` no longer deletes the primary's data when started with the second node as primary,
+  and refuses to delete a data directory when no primary exists.
+- Lab (two KVM nodes, PostgreSQL 17.11, Pacemaker 3.0.3, SBD): HA suite 12/12; see the release notes for the
+  failure matrix.
+
 ## [1.7.11] - 2026-10-27
 
 ### Fixed

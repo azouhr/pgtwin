@@ -13,12 +13,12 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.6.0
+Version:        1.8.0
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later
 Group:          Productivity/Clustering/HA
-URL:            https://github.com/yourusername/pgtwin
+URL:            https://github.com/azouhr/pgtwin
 Source0:        %{name}-%{version}.tar.gz
 BuildArch:      noarch
 
@@ -88,6 +88,16 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
+* Tue Nov 10 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.0-1
+- Release v1.8.0: failover timing, recovery and promotion fixes
+- Bound all libpq connections (PGCONNECT_TIMEOUT), fix discovery authentication
+- Promotion by data state: time budget, no name tie-break, real standby timeline
+- Prepare the replication slot on the standby before promotion
+- Rebuild a standby whose WAL is gone also from the monitor path
+- pg_rewind after a crash no longer falls back to pg_basebackup
+- Stay eligible for promotion when no primary exists
+- Includes 1.7.10 to 1.7.13 (see CHANGELOG.md)
+
 * Mon Nov 03 2025 Berthold Gunreben <azouhr@opensuse.org> - 1.6.0-1
 - Release v1.6.0: Automatic Replication Recovery
 - Add automatic replication health monitoring on standby nodes
