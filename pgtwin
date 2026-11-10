@@ -3816,7 +3816,7 @@ start_async_basebackup() {
 
     # Get local PostgreSQL binary major version
     local local_version_output="${state_dir}/.pgtwin_local_version.$$"
-    ${PG_CTL} --version > "${local_version_output}" 2>&1
+    ${PGCTL} --version > "${local_version_output}" 2>&1
     local local_version_full
     read local_version_full < "${local_version_output}" 2>/dev/null || local_version_full=""
     rm -f "${local_version_output}"
