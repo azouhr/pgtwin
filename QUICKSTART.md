@@ -29,32 +29,26 @@ sudo zypper install postgresql17 postgresql17-server postgresql17-contrib sudo
 
 # On both nodes (RHEL/CentOS)
 sudo dnf install postgresql17 postgresql17-server postgresql17-contrib
+```
 
-**NOTE**: There seems to be an issue installing postgresql17 at least in Tumbleweed, where it also installs postgres-18. This is not addressed here.
+**NOTE**: On Tumbleweed, `postgresql17-server` also pulls in the small noarch package `postgresql-server-18`. It contains only wrapper scripts, no PostgreSQL 18 binaries, and can be ignored.
 
-**IMPORTANT**: After installing `postgresql17-server`, the binaries may not be linked to `/usr/bin`. You need to create the symlinks manually:
+**IMPORTANT**: After installing `postgresql17-server`, the binaries may not be linked to `/usr/bin`. Check with `pg_ctl --version`. If the command is not found, link the PostgreSQL 17 binaries directly:
 
 ```bash
-# On both nodes - Link PostgreSQL binaries via alternatives system
-# Step 1: Create symlinks in /etc/alternatives pointing to PostgreSQL 17 binaries
+# On both nodes - link the PostgreSQL 17 binaries into /usr/bin
+# (Current Tumbleweed uses libalternatives, there is no /etc/alternatives directory any more.
+#  Existing files in /usr/bin are left untouched.)
 for f in /usr/lib/postgresql17/bin/*; do
-    sudo ln -sf "$f" "/etc/alternatives/$(basename "$f")"
+    [ -e "/usr/bin/$(basename "$f")" ] || sudo ln -s "$f" "/usr/bin/$(basename "$f")"
 done
 
-# Step 2: Create symlinks in /usr/bin pointing to alternatives
-for f in /usr/lib/postgresql17/bin/*; do
-    sudo ln -sf "/etc/alternatives/$(basename "$f")" "/usr/bin/$(basename "$f")"
-done
-
-# Verify binaries are accessible
+# Verify binaries are accessible and point to version 17
 which psql pg_ctl initdb
-psql --version
+pg_ctl --version     # pg_ctl (PostgreSQL) 17.x
 ```
 
-This creates a two-tier symlink structure:
-- `/usr/bin/psql` → `/etc/alternatives/psql` → `/usr/lib/postgresql17/bin/psql`
-- This allows easy switching between PostgreSQL versions using the alternatives system
-```
+Alternatively, leave `/usr/bin` alone and set the resource parameter `pg_bindir="/usr/lib/postgresql17/bin"` (section 2.7). pgtwin calls all PostgreSQL tools through `pg_bindir` (default: `/usr/bin`).
 
 ### 1.2 Initialize PostgreSQL (Primary Node Only)
 
@@ -75,6 +69,7 @@ wal_level = replica                    # REQUIRED for physical replication
 max_wal_senders = 16                   # REQUIRED (minimum: 2)
 max_replication_slots = 16             # REQUIRED (match wal_senders)
 hot_standby = on                       # Allows read queries on standby
+wal_log_hints = on                     # REQUIRED for pg_rewind (unless data checksums are enabled)
 
 # PRODUCTION TIMEOUTS (v1.5 standards)
 wal_sender_timeout = 30000             # 30 seconds (prevents false disconnections)
@@ -88,6 +83,7 @@ listen_addresses = '*'                 # Or specific IPs: 'localhost,192.168.122
 # REPLICATION
 synchronous_commit = on                # For zero data loss (sync replication)
 synchronous_standby_names = ''         # IMPORTANT: Start with empty (async mode) - pgtwin will enable sync based on rep_mode
+                                       # (the configuration check warns about the empty value on the first start; expected)
 
 # ARCHIVE (optional - for PITR)
 archive_mode = off                     # Enable if you need point-in-time recovery
@@ -139,9 +135,17 @@ host    all             all             ::1/128                 scram-sha-256
 # Replication connections from cluster network
 host    replication     replicator      192.168.122.0/24        scram-sha-256
 
+# pgtwin discovery, pg_rewind and promotion data-state check (replicator on database "postgres")
+host    postgres        replicator      192.168.122.0/24        scram-sha-256
+
 # Application connections
 host    all             all             192.168.122.0/24        scram-sha-256
 ```
+
+**IMPORTANT**: Do not leave backup copies or other files owned by `root` inside PGDATA (for example
+`cp pg_hba.conf pg_hba.conf.orig` run as root). `pg_basebackup` copies every file in PGDATA and aborts with
+`could not open file "./pg_hba.conf.orig": Permission denied`, so the standby can never be initialized. Keep
+backups outside PGDATA, or check with `sudo find /var/lib/pgsql/data ! -user postgres` (must print nothing).
 
 ### 1.5 Start PostgreSQL on Primary (Temporarily)
 
@@ -199,7 +203,7 @@ host    postgres     replicator      192.168.122.0/24        scram-sha-256
 ```bash
 # On primary node - create the replication slot for standby
 sudo -u postgres psql << EOF
-SELECT pg_create_physical_replication_slot('ha_slot');
+SELECT pg_create_physical_replication_slot('ha_slot', true);  -- true = reserve WAL immediately
 EOF
 
 # Verify slot creation
@@ -212,14 +216,14 @@ Ensure nodes can resolve each other's hostnames:
 
 ```bash
 # On both nodes - verify or add hostname resolution
-sudo cat >> /etc/hosts <<EOF
-192.168.122.60   psql1
-192.168.122.120  psql2
+sudo tee -a /etc/hosts <<EOF
+192.168.122.60   pg1
+192.168.122.120  pg2
 EOF
 
 # Test resolution
-ping -c 1 psql1
-ping -c 1 psql2
+ping -c 1 pg1
+ping -c 1 pg2
 ```
 
 **NOTE**: Adjust IP addresses to match your network configuration. Alternatively, you can use IP addresses directly in `.pgpass` (see below).
@@ -270,13 +274,12 @@ For first-time cluster setup, use a controlled startup to avoid race conditions:
 sudo mkdir -p /var/lib/pgsql/data
 sudo chown postgres:postgres /var/lib/pgsql/data
 sudo chmod 700 /var/lib/pgsql/data
-
-# Put node 2 in standby mode (we'll bring it online after node 1 is promoted)
-sudo crm node standby pg2
 ```
 
+Node 2 is put into cluster standby in section 2.5.1 (the cluster does not exist yet at this point).
+
 **What happens next:**
-1. You'll configure the cluster in Part 2 (only node 1 will start initially)
+1. You'll configure the cluster in Part 2 and put node 2 in standby before the resources are created (only node 1 will start initially)
 2. Node 1 becomes promoted (primary)
 3. You bring node 2 online → **automatic initialization triggers**
 4. pgtwin will:
@@ -404,31 +407,83 @@ sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
 ls -l /usr/lib/ocf/resource.d/heartbeat/pgtwin
 ```
 
-### 2.3 Configure Cluster (Node 1)
+### 2.3 Watchdog for SBD (Both Nodes)
+
+SBD fencing needs a watchdog device (`/dev/watchdog`). Check first:
 
 ```bash
-sudo crm cluster init --name CLUSTERNAME
+ls -l /dev/watchdog*
 ```
 
-Answer the questions you are asked. For SBD, you will need a shared block device.
-
-### 2.4 Configure Cluster (Node 2)
+If there is none:
 
 ```bash
-sudo crm cluster join
+# The openSUSE Minimal VM image ships kernel-default-base, which contains NO watchdog
+# drivers (not even softdog). Install the full kernel and reboot:
+sudo zypper install kernel-default
+sudo reboot
+
+# KVM guests: add a watchdog device to the VM definition (virsh edit) and load its driver
+#   <watchdog model='itco' action='reset'/>
+echo iTCO_wdt | sudo tee /etc/modules-load.d/watchdog.conf
+sudo modprobe iTCO_wdt
+
+# Without a hardware/emulated watchdog, softdog works for test setups:
+#   echo softdog | sudo tee /etc/modules-load.d/watchdog.conf; sudo modprobe softdog
 ```
+
+### 2.4 Configure Cluster
+
+```bash
+# On node 1 - with SBD on a shared disk (here /dev/vdb) and the watchdog
+sudo crm cluster init --name CLUSTERNAME -i <interface> -s /dev/vdb -w /dev/watchdog
+
+# On node 2
+sudo crm cluster join -c pg1 -i <interface>
+```
+
+Without `-y`, crmsh asks the open questions interactively. `crm cluster join` needs SSH access from node 2 to
+node 1 as root (crmsh asks for the password if no key is set up). crmsh configures corosync with `two_node: 1`,
+creates the `fence_sbd` resource and enables fencing.
 
 ### 2.5 Configure Cluster Properties
 
 ```bash
 # On node 1
-sudo crm configure property \
-  stonith-enabled=false \
-  no-quorum-policy=ignore \
-  cluster-recheck-interval=1min
+sudo crm configure property cluster-recheck-interval=1min
+
+# Verify that fencing is enabled
+# (Pacemaker 3 renamed stonith-enabled to fencing-enabled; crm cluster init with -s sets it to true)
+sudo crm configure show | grep -E "fencing-enabled|stonith-enabled"
 ```
 
-**Note**: Set `stonith-enabled=true` in production with proper SBD configuration!
+**Note**: Only for a test setup without any fencing device: `sudo crm configure property fencing-enabled=false`
+(`stonith-enabled=false` on Pacemaker 2). Never run a production cluster without fencing.
+
+**Failover time after a node crash is dominated by fencing, not by pgtwin.** Measured on a two-node KVM lab with
+the values `crm cluster init` sets (power-off of the primary until the standby is promoted, 114 s in total):
+
+| Phase | Time | Setting |
+|---|---|---|
+| Corosync declares the node lost | 11 s | `token` 5 s + `consensus` 6 s |
+| Fencing delay | 60 s + 0-30 s | `priority-fencing-delay=60`, `pcmk_delay_max=30s` on the fencing resource |
+| SBD fence completes | 30 s | `msgwait` in the SBD disk header (2 x watchdog timeout) |
+| pgtwin promote | ~5-10 s | data-state check, `pg_ctl promote`, slot |
+
+`priority-fencing-delay` gives the node that holds the primary a head start in a split brain (both nodes alive,
+network down): the other side waits before fencing it. When the primary really died, the standby waits the full
+delay. `pcmk_delay_max` is a second, random tie-break for the same purpose. Check your values with
+`sudo crm configure show | grep -E "priority-fencing-delay|pcmk_delay_max|fencing-timeout"` and
+`sudo sbd -d /dev/vdb dump`, and decide on the trade-off between split-brain protection and failover time for your
+environment before going to production.
+
+#### 2.5.1 Put Node 2 in Standby (Controlled Startup)
+
+If you use the controlled startup from section 1.10, put node 2 in standby **before** creating the resources:
+
+```bash
+sudo crm node standby pg2
+```
 
 ---
 
@@ -540,35 +595,11 @@ sudo chmod 644 /usr/lib/ocf/lib/heartbeat/pgtwin-container-lib.sh
 
 **This configuration works for BOTH bare-metal and container mode.**
 
-The only differences are the parameters marked with **[CONTAINER]** below.
-
-```bash
-sudo crm configure primitive postgres-db pgtwin \
-  params \
-    pgdata="/var/lib/pgsql/data" \
-    pgport="5432" \
-    rep_mode="sync" \
-    node_list="psql1 psql2" \
-    backup_before_basebackup="true" \
-    basebackup_timeout="3600" \
-    pgpassfile="/var/lib/pgsql/.pgpass" \
-    slot_name="ha_slot" \
-    # --- Container Mode Parameters (add these if using containers) ---
-    # container_mode="true" \              # [CONTAINER] Enable container mode
-    # pg_major_version="17" \              # [CONTAINER] PostgreSQL version
-    # container_name="postgres-ha" \       # [CONTAINER] Container name
-    # container_image="..." \              # [CONTAINER] Optional: custom image
-    # pguser="postgres" \                  # [OPTIONAL] Custom username (default: postgres)
-  op start timeout="120s" interval="0" \
-  op stop timeout="120s" interval="0" \
-  op monitor interval="10s" timeout="60s" role="Unpromoted" \
-  op monitor interval="3s" timeout="60s" role="Promoted" \
-  op promote timeout="120s" interval="0" \
-  op demote timeout="120s" interval="0" \
-  op notify timeout="90s" interval="0"
-  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
-
-```
+The only differences are the container parameters, see the parameter guide and the two examples below.
+Copy one of the examples as a whole: every line except the last must end with `\`, and comment lines
+must not be placed inside the command (a `#` line ends the command and the remaining `op ...` lines
+would run as separate shell commands). Clone options (`notify`, `promoted-max`, ...) are set on the
+clone in section 2.8, not on the primitive.
 
 **Parameter Guide**:
 
@@ -577,7 +608,10 @@ sudo crm configure primitive postgres-db pgtwin \
 | `pgdata` | Required | Required | Same for both |
 | `pgport` | Required | Required | Same for both |
 | `rep_mode` | Required | Required | Same for both |
-| `node_list` | Required | Required | Same for both |
+| `node_list` | Required | Required | Same for both, cluster node names |
+| `vip` | Recommended | Recommended | Same address as the VIP resource (section 2.9), used to discover the primary |
+| `promotion_peer_wait` | Optional | Optional | Default 60 s: wait for the peer's data state before promoting without a running primary (0 = off) |
+| `pg_bindir` | Optional | - | Directory of the PostgreSQL binaries (default `/usr/bin`) |
 | `pguser` | Optional | Optional | **If set, must match host username** |
 | `container_mode` | - | **"true"** | Enables container mode |
 | `pg_major_version` | - | **"17"** | PostgreSQL major version |
@@ -587,12 +621,13 @@ sudo crm configure primitive postgres-db pgtwin \
 **Example: Bare-Metal Configuration**
 
 ```bash
-sudo crm configure primitive postgres-db pgtwin \
+sudo crm configure primitive postgres-db ocf:heartbeat:pgtwin \
   params \
     pgdata="/var/lib/pgsql/data" \
     pgport="5432" \
     rep_mode="sync" \
-    node_list="psql1 psql2" \
+    node_list="pg1 pg2" \
+    vip="192.168.122.20" \
     backup_before_basebackup="true" \
     basebackup_timeout="3600" \
     pgpassfile="/var/lib/pgsql/.pgpass" \
@@ -604,14 +639,12 @@ sudo crm configure primitive postgres-db pgtwin \
   op promote timeout="120s" interval="0" \
   op demote timeout="120s" interval="0" \
   op notify timeout="90s" interval="0"
-  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
-
 ```
 
 **Example: Container Mode Configuration**
 
 ```bash
-sudo crm configure primitive postgres-db pgtwin \
+sudo crm configure primitive postgres-db ocf:heartbeat:pgtwin \
   params \
     container_mode="true" \
     pg_major_version="17" \
@@ -619,7 +652,8 @@ sudo crm configure primitive postgres-db pgtwin \
     pgdata="/var/lib/pgsql/data" \
     pgport="5432" \
     rep_mode="sync" \
-    node_list="psql1 psql2" \
+    node_list="pg1 pg2" \
+    vip="192.168.122.20" \
     backup_before_basebackup="true" \
     basebackup_timeout="3600" \
     pgpassfile="/var/lib/pgsql/.pgpass" \
@@ -630,9 +664,7 @@ sudo crm configure primitive postgres-db pgtwin \
   op monitor interval="3s" timeout="60s" role="Promoted" \
   op promote timeout="120s" interval="0" \
   op demote timeout="120s" interval="0" \
-  op notify timeout="90s" interval="0" \
-  meta notify=true promoted-max=1 clone-max=2 clone-node-max=1 interleave=true
-
+  op notify timeout="90s" interval="0"
 ```
 
 ---
@@ -652,13 +684,16 @@ sudo crm configure clone postgres-clone postgres-db \
     interleave="true"
 ```
 
+**IMPORTANT**: `migration-threshold` and `failure-timeout` are **required**, not optional tuning. They bound how
+often a node whose recovery keeps failing can be retried, and therefore how often it can pull promotion away from
+a healthy primary (see issue #3).
+
 ### 2.9 Create Virtual IP Resource
 
 ```bash
 sudo crm configure primitive vip IPaddr2 \
-  params ip="192.168.122.20" \
-  op monitor interval="10s"
-  meta is-managed=true target-role=Started
+  params ip="192.168.122.20" cidr_netmask="24" \
+  op monitor interval="10s" timeout="20s"
 ```
 
 ### 2.10 Create Network Monitoring Resource (Recommended)
@@ -679,7 +714,7 @@ sudo crm configure primitive ping-gateway ocf:pacemaker:ping \
     multiplier="100" \
     attempts="3" \
     timeout="2" \
-  op monitor interval="10s" timeout="20s"
+  op monitor interval="10s" timeout="60s"
 
 # Clone to run on all nodes
 sudo crm configure clone ping-clone ping-gateway \
@@ -695,12 +730,13 @@ sudo crm configure clone ping-clone ping-gateway \
 ### 2.11 Create Constraints
 
 ```bash
-# Set resource stickiness to prevent unnecessary failback
-# Stickiness=100 means "prefer to stay on current node"
-# Combined with location constraints (psql1:100, psql2:50):
-#   - Fresh start: prefers psql1 (100 > 50)
-#   - After failover to psql2: stays on psql2 (50+100 > 100)
-sudo crm configure rsc_defaults resource-stickiness=100
+# Set resource stickiness to prevent unnecessary failback.
+# Use rsc_defaults: the old cluster property default-resource-stickiness is ignored by current Pacemaker.
+# The Promoted role gets the stickiness twice (directly and through the colocated VIP), so the value has to
+# stay below 75 for these locations, otherwise a primary without connectivity is not replaced (see below).
+# A node that is still recovering does not need a higher stickiness to be held back:
+# pgtwin vetoes its promotion itself (see "Dynamic promotion eligibility" below).
+sudo crm configure rsc_defaults resource-stickiness=50
 
 # ⚠️ CRITICAL: VIP MUST run on same node as promoted database
 # This colocation constraint ensures VIP follows promoted (primary) instance
@@ -716,8 +752,8 @@ sudo crm configure order vip-stop-before-demote Mandatory: vip:stop postgres-clo
      symmetrical=false
 
 # Prefer node 1 as primary
-sudo crm configure location postgres-on-psql1 postgres-clone role=Promoted 100: psql1
-sudo crm configure location postgres-on-psql2 postgres-clone role=Promoted 50: psql2
+sudo crm configure location postgres-on-pg1 postgres-clone role=Promoted 100: pg1
+sudo crm configure location postgres-on-pg2 postgres-clone role=Promoted 50: pg2
 
 # Prefer promoted role on nodes with working network connectivity (if using ping resource)
 sudo crm configure location prefer-connected-promoted postgres-clone role=Promoted \
@@ -726,26 +762,42 @@ sudo crm configure location prefer-connected-promoted postgres-clone role=Promot
 
 **How resource placement works:**
 
-**Resource stickiness (prevents unnecessary failback):**
-- Stickiness=100 adds 100 points to the currently running node
-- Prevents automatic migration back to preferred node after recovery
-- Example: psql2 is primary after failover → psql2 score: 50+100=150 > psql1: 100
-- Admin can still manually migrate: `sudo crm resource move postgres-clone psql1`
+**Scoring of the Promoted role** (measured with `crm_simulate` on Pacemaker 3.0.3, VIP colocated with the Promoted role):
 
-**Initial placement (fresh cluster start):**
-- psql1: 100 (location) + 0 (not running) = 100
-- psql2: 50 (location) + 0 (not running) = 50
-- Result: psql1 becomes primary
+`score = location + 10 (master-score) + 200 (if pingd > 0) + 2 x stickiness` for the node that holds the Promoted role,
+`score = location + 10 + 200 (if pingd > 0)` for the other node. The stickiness counts twice because the VIP is colocated
+with the Promoted role and is sticky itself.
 
-**After failover (psql2 is now primary):**
-- psql1: 100 (location) + 0 (not running) = 100
-- psql2: 50 (location) + 100 (stickiness) = 150
-- Result: psql2 stays primary (prevents automatic failback)
+**Resource stickiness (prevents unnecessary failback, must not block the connectivity failover):**
+- Stickiness=50 adds 2 x 50 = 100 points to the node that is currently primary
+- Prevents automatic migration back to the preferred node after recovery: needs `2 x stickiness >= 100 - 50` (a tie keeps the current primary), so stickiness >= 25
+- Must stay below the connectivity bonus: `100 + 10 + 2 x stickiness < 50 + 10 + 200`, so stickiness < 75
+- With stickiness 100 a primary that lost its gateway ping keeps the Promoted role (310 against 260), with 1000 it never moves
+- Admin can still manually migrate: `sudo crm resource move postgres-clone pg1` (then `sudo crm resource clear postgres-clone`)
 
-**Connectivity-based placement:**
-- Nodes with working connectivity: base score (100/50) + stickiness (0/100) + connectivity (200) = 300/350
-- Nodes without connectivity: base score (100/50) + stickiness (0/100) = 100/150
-- Cluster prefers to run primary on connected nodes
+**Initial placement (fresh cluster start):** no node is the current primary, so only the location decides: pg1 (100) is preferred over pg2 (50).
+
+**After failover (pg2 is now primary), both connected:**
+- pg1: 100 + 10 + 200 = 310
+- pg2: 50 + 10 + 200 + 100 (2 x stickiness) = 360
+- Result: pg2 stays primary (prevents automatic failback)
+
+**Primary loses connectivity (pg1 is primary, ping lost):**
+- pg1: 100 + 10 + 100 (2 x stickiness) = 210
+- pg2: 50 + 10 + 200 = 260
+- Result: the connected standby is promoted
+
+Check any change with the live CIB before you rely on it: `sudo crm_simulate -sL | grep "promotion score"`; to try the
+connectivity case, copy the CIB (`sudo cibadmin -Q > /tmp/c.xml`), set `pingd` to 0 on the primary
+(`sudo CIB_file=/tmp/c.xml crm_attribute -N <primary> -n pingd -v 0 -l reboot`) and run `sudo crm_simulate -x /tmp/c.xml -s`.
+
+**Dynamic promotion eligibility (pgtwin):** a standby that is not streaming (recovering, rebuilding, WAL gone)
+sets its own promotion score to `-INFINITY` and back to a positive value once it streams again. Check with
+`sudo crm_mon -1A` (attribute `master-postgres-db`).
+
+**After every real failover**, watch `sudo crm status` while the old primary reintegrates (normally `pg_rewind`,
+seconds). If its recovery keeps looping, stop it (`sudo crm node standby <node>`), empty its PGDATA and bring it
+back (`sudo crm node standby <node> off`): it re-initializes through the empty-PGDATA path (section 1.10).
 
 ### 2.12 Verify Configuration
 
@@ -762,11 +814,11 @@ sudo crm status
 
 ### 2.13 Bring Node 2 Online (If Using Controlled Startup)
 
-If you put node 2 in standby mode in section 1.10, now bring it online:
+If you put node 2 in standby mode in section 2.5.1, now bring it online:
 
 ```bash
-# Bring node 2 online
-sudo crm node online pg2
+# Bring node 2 online (crmsh 5: 'crm node online' is deprecated)
+sudo crm node standby pg2 off
 
 # Watch status
 watch -n 2 'sudo crm status'
@@ -801,7 +853,7 @@ psql -h 192.168.122.20 -U postgres -c "SELECT inet_server_addr();"
 
 ```bash
 # Trigger manual failover to node 2
-sudo crm resource move postgres-clone psql2
+sudo crm resource move postgres-clone pg2
 
 # Watch status
 sudo crm_mon
@@ -999,7 +1051,7 @@ Before deploying to production, verify:
   - Replication slot created and active
 
 - ☑ **Cluster Configuration**
-  - STONITH enabled (`stonith-enabled=true`)
+  - Fencing enabled (`fencing-enabled=true`, Pacemaker 2: `stonith-enabled=true`) with a working watchdog
   - Fencing device configured and tested
   - VIP configured and reachable
   - Both nodes have identical pgtwin agent version

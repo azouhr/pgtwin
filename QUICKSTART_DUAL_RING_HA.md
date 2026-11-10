@@ -14,7 +14,14 @@
 > - ⚠️ Both network paths must be truly independent
 > 
 > **Status**: Experimental - Feedback Welcome
-> **Last Updated**: 2025-12-17
+> **Last Updated**: 2026-11-10
+>
+> ⚠️ **Dual rings do not replace fencing.** They make a network partition between the nodes much
+> less likely, but they do not protect against a node that *stalls* (paused VM, live migration,
+> I/O hang, soft lockup) and continues later. Without fencing Pacemaker reports such a node's
+> standby as stopped as soon as contact is lost, the primary switches to asynchronous replication
+> and can acknowledge commits that are discarded later (see `doc/DESIGN_STALL_SAFE_SYNC.md`).
+> Combine dual rings with fencing: IPMI/BMC or hypervisor fencing (seconds), or SBD.
 
 ---
 
@@ -166,9 +173,14 @@ The actual problem this configuration solves is **partial network partition**:
 
 ### Fencing and Split-Brain Protection
 
-**No STONITH Required**: With dual rings preventing network partition between nodes, traditional fencing (STONITH) is not required for split-brain protection.
+**Fencing is still required.** Dual rings make a partition between the nodes a double failure, but a node
+that stalls and continues later (paused VM, live migration, I/O hang) is not a network failure: the other node
+promotes, and the stalled node still holds the VIP and a writable PostgreSQL when it runs again. Fencing makes
+sure the new primary only takes over once the old one is gone, and it orders "standby confirmed stopped" before
+pgtwin's switch to asynchronous replication (see `doc/DESIGN_STALL_SAFE_SYNC.md`). Use IPMI/BMC or hypervisor
+fencing (fast) or SBD together with the rings.
 
-**Optional Watchdog**: For protection against software hangs (Pacemaker/PostgreSQL process freeze), watchdog-based fencing can be optionally configured:
+**Watchdog**: For protection against software hangs (Pacemaker/PostgreSQL process freeze), configure watchdog-based fencing:
 ```bash
 property cib-bootstrap-options: \
     stonith-enabled=true \
@@ -897,13 +909,17 @@ Then load it with: `sudo crm configure load update pgsql-resource-config.crm`
 
 ```bash
 # Disable STONITH (we're using quorum for split-brain prevention)
-sudo crm configure property stonith-enabled=false
+# Fencing: keep it enabled and configure a fencing device (IPMI/BMC, hypervisor or SBD),
+# dual rings do not replace it (see the note at the top of this guide).
+# Test setups without any fencing device only:
+#   sudo crm configure property fencing-enabled=false    (Pacemaker 2: stonith-enabled=false)
 
 # Enable cluster startup
 sudo crm configure property no-quorum-policy=ignore
 
-# Set PostgreSQL as preferred on psql1
-sudo crm configure property default-resource-stickiness=100
+# Resource stickiness: use rsc_defaults (the property default-resource-stickiness has no effect
+# on current Pacemaker); 50, see the scoring explanation in QUICKSTART.md section 2.11
+sudo crm configure rsc_defaults resource-stickiness=50
 ```
 
 **Important**: For production, consider implementing proper fencing:
@@ -967,11 +983,10 @@ clone ping-clone ping-gateway \
     meta clone-max="2" clone-node-max="1"
 
 # Resource stickiness - prevent unnecessary failback
-# Stickiness=100 means "prefer to stay on current node"
-# Combined with location constraints (psql1:100, psql2:50):
-#   - Fresh start: prefers psql1 (100 > 50)
-#   - After failover to psql2: stays on psql2 (50+100 > 100)
-rsc_defaults resource-stickiness=100
+# The Promoted role gets the stickiness twice (directly and through the colocated VIP):
+# 25 <= stickiness < 75 keeps the failback protection and still lets a primary that lost
+# its connectivity move (see QUICKSTART.md section 2.11 for the measured scores)
+rsc_defaults resource-stickiness=50
 
 # Base location constraints (prefer psql1)
 location prefer-psql1 postgres-clone role=Promoted 100: psql1
