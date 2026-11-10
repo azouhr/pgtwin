@@ -1864,6 +1864,9 @@ pgsql_monitor() {
             # promotion scoring/location constraints apply again.
             set_promotion_eligibility "eligible"
 
+            # Keep the slot ready for a promotion of this node
+            prepare_standby_slot
+
             return $OCF_SUCCESS
         else
             # dmkif (self-healing, see pgtwin#3): this node's replication is
@@ -3148,6 +3151,9 @@ pgsql_promote() {
         ocf_log warn "⚠️  FORCED PROMOTION - Safety checks bypassed! This may cause data loss!"
     fi
 
+    # Make sure the slot exists before the promotion (see prepare_standby_slot)
+    prepare_standby_slot
+
     ocf_log info "Promoting PostgreSQL to primary"
 
     # Promote using pg_ctl (it will remove standby.signal automatically)
@@ -3383,6 +3389,42 @@ EOF
 
     ocf_log info "PostgreSQL demoted successfully"
     return $OCF_SUCCESS
+}
+
+# Keep the replication slot on the STANDBY as well, so that it exists the moment
+# this node is promoted. Created after the promotion it came too late: PostgreSQL
+# runs a checkpoint right after the promotion, which completed before the slot
+# existed, so the slot reserved WAL only from that checkpoint on, and the
+# checkpoint could already recycle the WAL a rewound old primary needs (its
+# replay starts at the last checkpoint before the timelines diverged).
+# The slot is kept at the REDO point of the last restartpoint: exactly the WAL a
+# rewound peer needs from this node stays protected, nothing more. Physical
+# slots are local to the node and survive the promotion; create_replication_slot()
+# then finds a reserving slot and keeps it. Best effort, never fails the caller.
+prepare_standby_slot() {
+    local slot="${OCF_RESKEY_slot_name}"
+    [ -n "$slot" ] || return 0
+    local q="SELECT CASE WHEN NOT pg_is_in_recovery() THEN 'primary' WHEN s.slot_name IS NULL THEN 'missing' WHEN s.active THEN 'active' WHEN s.restart_lsn IS NULL THEN 'recreate' WHEN s.restart_lsn < c.redo_lsn THEN 'advance ' || c.redo_lsn ELSE 'ok' END FROM pg_control_checkpoint() c LEFT JOIN pg_replication_slots s ON s.slot_name = '${slot}'"
+    local state
+    state=$(run_as_pguser ${PSQL} -p ${OCF_RESKEY_pgport} -Atc "$q" 2>/dev/null) || return 0
+
+    case "$state" in
+        recreate)
+            run_as_pguser ${PSQL} -p ${OCF_RESKEY_pgport} -Atc "SELECT pg_drop_replication_slot('${slot}')" >/dev/null 2>&1
+            ;&
+        missing)
+            if run_as_pguser ${PSQL} -p ${OCF_RESKEY_pgport} -Atc "SELECT pg_create_physical_replication_slot('${slot}', true)" >/dev/null 2>&1; then
+                ocf_log info "Replication slot ${slot} prepared on this standby (WAL from the last restartpoint reserved, ready for promotion)"
+            else
+                ocf_log debug "Could not prepare replication slot ${slot} on this standby"
+            fi
+            ;;
+        advance\ *)
+            run_as_pguser ${PSQL} -p ${OCF_RESKEY_pgport} -Atc "SELECT pg_replication_slot_advance('${slot}', '${state#advance }')" >/dev/null 2>&1 || \
+                ocf_log debug "Could not advance replication slot ${slot} on this standby"
+            ;;
+    esac
+    return 0
 }
 
 create_replication_slot() {
