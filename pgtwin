@@ -1733,6 +1733,51 @@ set_promotion_eligibility() {
     fi
 }
 
+# True only if the peer answers and is a standby itself. Then no primary exists
+# anywhere: a standby whose replication is "unhealthy" in that state is not lagging
+# behind a healthy primary, it simply has nothing to replicate from (cold start of both
+# nodes, or a failover that has not promoted yet). Anything else, in particular a peer
+# that does not answer, is not proof and returns false.
+# (dmkif, fix/cold-start-eligible; queries as the replication user on database
+# "postgres" like the other discovery queries - as the postgres role without a
+# password it can never answer in a setup following QUICKSTART.md)
+no_primary_in_cluster() {
+    local peer peer_host state rep_user opts=""
+    peer=$(get_peer_member_name) || return 1
+    [ -n "$peer" ] || return 1
+    peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 1
+    rep_user=$(get_replication_user 2>/dev/null)
+    [ -n "$rep_user" ] && opts="-U ${rep_user} -d postgres"
+    state=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=3 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
+    case "$state" in
+        t) return 0 ;;          # peer is a standby too
+        f) return 1 ;;          # peer is a primary
+    esac
+    # The peer does not answer (its PostgreSQL died, restart failing). The veto
+    # exists to keep a lagging standby from displacing a HEALTHY primary; if
+    # Pacemaker shows no promoted instance anywhere there is none to protect, and
+    # the data-state guard at promote time still waits for the peer. Without this
+    # a standby that saw its primary die vetoed itself and was never promoted
+    # (lab: primary killed, restart blocked, no failover after 180 s).
+    # Conservative: only a successful CIB query without any Promoted instance counts.
+    no_promoted_instance_in_cib
+}
+
+# True only if the CIB can be read and shows no Promoted instance of this clone.
+no_promoted_instance_in_cib() {
+    local rsc_name out
+    command -v crm_resource >/dev/null 2>&1 || return 1
+    rsc_name=$(echo "$OCF_RESOURCE_INSTANCE" | sed 's/:[0-9]*$//')
+    [ -n "$rsc_name" ] || return 1
+    out=$(crm_resource -r "$rsc_name" -W 2>/dev/null) || return 1
+    case "$out" in
+        *"is running on:"*) ;;      # query worked (this node runs an instance)
+        *) return 1 ;;
+    esac
+    echo "$out" | grep -q " Promoted$" && return 1
+    return 0
+}
+
 pgsql_monitor() {
     local rc
 
@@ -1875,6 +1920,19 @@ pgsql_monitor() {
 
             return $OCF_SUCCESS
         else
+            # No primary exists (the peer is a standby as well): there is nothing
+            # this node could replicate from, so the veto below would only keep
+            # both nodes from ever being promoted. Stay eligible and let the
+            # promotion decision (data state of both nodes) pick one. Without
+            # this a cold start of both nodes can end with no primary at all.
+            # (dmkif, fix/cold-start-eligible)
+            if no_primary_in_cluster; then
+                ocf_log info "Replication cannot be healthy: no primary exists (peer is a standby, or down with no promoted instance in the CIB); staying eligible for promotion"
+                ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+                set_promotion_eligibility "eligible"
+                return $OCF_SUCCESS
+            fi
+
             # dmkif (self-healing, see pgtwin#3): this node's replication is
             # not known-good right now. Actively refuse promotion candidacy
             # by forcing its promotion score to -INFINITY, which overrides
