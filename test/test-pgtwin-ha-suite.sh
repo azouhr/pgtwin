@@ -563,15 +563,25 @@ test_slot_size_monitoring() {
 test_automatic_standby_init() {
     test_start "Automatic standby initialization (empty PGDATA)"
 
-    log_debug "Putting ${NODE2} in standby mode"
-    ssh ${SSH_USER}@${NODE1} "crm node standby ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
+    # Wipe the CURRENT standby, never the primary (the test used to assume that
+    # ${NODE2} is the standby and deleted the primary's data otherwise)
+    local promoted=$(get_promoted_node)
+    if [ -z "$promoted" ]; then
+        test_fail "Automatic standby initialization" "No primary found - refusing to delete a data directory"
+        return
+    fi
+    local target="$NODE2"
+    [ "$promoted" = "$NODE2" ] && target="$NODE1"
+
+    log_debug "Putting ${target} in standby mode"
+    ssh ${SSH_USER}@${NODE1} "crm node standby ${target}" 2>&1 | tee -a "$LOG_FILE"
     sleep 3
 
-    log_debug "Deleting PGDATA on ${NODE2}"
-    ssh ${SSH_USER}@${NODE2} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
+    log_debug "Deleting PGDATA on ${target}"
+    ssh ${SSH_USER}@${target} "rm -rf ${PGDATA}/* ${PGDATA}/.*  2>/dev/null; mkdir -p ${PGDATA}; chown postgres:postgres ${PGDATA}; chmod 700 ${PGDATA}" 2>&1 | tee -a "$LOG_FILE"
 
-    log_debug "Bringing ${NODE2} online"
-    ssh ${SSH_USER}@${NODE1} "crm node online ${NODE2}" 2>&1 | tee -a "$LOG_FILE"
+    log_debug "Bringing ${target} online"
+    ssh ${SSH_USER}@${NODE1} "crm node online ${target}" 2>&1 | tee -a "$LOG_FILE"
 
     local max_wait=300
     local count=0
@@ -579,8 +589,8 @@ test_automatic_standby_init() {
 
     while [ $count -lt $max_wait ]; do
         local status=$(ssh ${SSH_USER}@${NODE1} "crm status 2>/dev/null")
-        if echo "$status" | grep -q "Unpromoted.*${NODE2}"; then
-            local in_recovery=$(ssh ${SSH_USER}@${NODE2} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
+        if echo "$status" | grep -q "Unpromoted.*${target}"; then
+            local in_recovery=$(ssh ${SSH_USER}@${target} "sudo -u postgres psql -Atc 'SELECT pg_is_in_recovery();' 2>/dev/null" || echo "")
             if [ "$in_recovery" = "t" ]; then
                 initialized=true
                 log_debug "Automatic initialization completed after $count seconds"
@@ -712,6 +722,10 @@ test_migration_with_basebackup_with_slot() {
     test_start "Migration with pg_basebackup (with replication slot)"
 
     local promoted=$(get_promoted_node)
+    if [ -z "$promoted" ]; then
+        test_fail "Migration with pg_basebackup (with slot)" "No primary found - refusing to delete a data directory"
+        return
+    fi
     local standby_node=""
 
     if [ "$promoted" = "$NODE1" ]; then
@@ -829,6 +843,10 @@ test_slot_missing_during_basebackup() {
     test_start "Handle missing replication slot during basebackup"
 
     local promoted=$(get_promoted_node)
+    if [ -z "$promoted" ]; then
+        test_fail "Missing slot during basebackup" "No primary found - refusing to delete a data directory"
+        return
+    fi
     local standby_node=""
 
     if [ "$promoted" = "$NODE1" ]; then
