@@ -1,0 +1,227 @@
+# Design: Stall-safe synchronous replication
+
+**Status:** Implemented in 1.8.0 in a minimal form (section 8), tested in the lab. Sections 1-7 are the
+original analysis; section 8 describes what was built and how it differs.
+**Date:** 2026-11-10
+
+---
+
+## 1. Problem
+
+A node that stalls (it stops being scheduled but does not die) is the case that redundant rings cannot handle
+and that waiting times can only make less likely:
+
+- Live migration or a paused VM (snapshot, host overload),
+- multipath failover with `queue_if_no_path`, a hanging NFS/iSCSI path,
+- memory pressure, swap storms, kernel soft lockups.
+
+The other node correctly concludes that the stalled node is lost and promotes. When the stalled node runs again,
+all of its processes continue at the same time. Two of them do not wait for Pacemaker to reconcile the cluster
+state first:
+
+1. **PostgreSQL** is not part of Pacemaker. It still listens on the VIP, serves reads (stale data) and accepts
+   commits from the first millisecond after the resume.
+2. **Recurring monitors** already scheduled by `pacemaker-execd` fire immediately when they are overdue. The
+   pgtwin monitor reads the local, still stale CIB copy and has side effects.
+
+The Pacemaker controller itself does wait: it makes no new decisions before the election, the join with the DC
+and the CIB synchronisation. With fencing the node is fenced in exactly that phase.
+
+## 2. Goal and invariant
+
+> **A primary never acknowledges a commit without the confirmation of its synchronous standby, unless it has
+> proof that the standby is gone.**
+
+If that holds, a stalled old primary cannot produce acknowledged commits that a later `pg_rewind` discards.
+Commits that are not acknowledged are the client's problem in the same way as in any failover: the client sees a
+lost connection with an unknown outcome and repeats the request against the new primary.
+
+No waiting time is needed for this. The order of events is guaranteed by Pacemaker (notify, promote and demote
+are scheduled by the DC after the reconcile) and by synchronous replication, not by a timeout.
+
+## 3. How PostgreSQL behaves
+
+| Event on a commit that waits for the synchronous standby | Result for the client | Safe? |
+|---|---|---|
+| Standby confirms | `COMMIT` | yes |
+| Standby never confirms (it is now a primary itself) | commit blocks | yes |
+| Backend terminated: `pg_ctl stop -m fast/immediate`, `pg_terminate_backend()`, node reset | connection lost, no `COMMIT` | yes, client repeats |
+| **Wait cancelled**: `pg_cancel_backend()`, `statement_timeout`, client cancel | **`COMMIT` with a WARNING** "already committed locally, but might not have been replicated" | **no** |
+
+Notes:
+
+- A waiting commit is already written locally and can be visible to other sessions before it is confirmed.
+  Such commits are discarded at the reconcile (`pg_rewind`). This is acceptable because they were never
+  acknowledged.
+- Cancelling is the only way to an acknowledgement without the standby. **The correct reaction to a stalled
+  primary is therefore never to cancel, but to turn it into a secondary or switch it off.** Demote (stop, rewind,
+  start as standby), a stop and fencing all terminate the waiting backends without acknowledging them.
+- pgtwin itself only stops with `pg_ctl -m fast stop`, falling back to `-m immediate`, and never cancels backends
+  (checked in 1.8.0).
+
+## 4. The two cases
+
+### 4.1 The primary stalls
+
+1. The standby is promoted (new timeline). The VIP is still configured on the stalled node, because the cluster
+   could not remove it.
+2. After the resume, commits on the old primary wait for its former standby, which no longer streams from it:
+   **nothing is acknowledged**, as long as the old primary does not switch to async by itself (rule 1).
+3. The old primary becomes a secondary or goes off: fenced (SBD reset), demoted by Pacemaker after the reconcile,
+   or it steps down by itself (rule 2). The waiting sessions are terminated, clients repeat their requests on
+   the new primary.
+
+### 4.2 The standby stalls
+
+The primary switches to async after Pacemaker has confirmed that the standby is stopped; writes continue. When the
+standby runs again, it catches up and pgtwin switches back to sync (observed in the lab). This case is safe; the
+known price of "keep writing without a standby" remains: if the primary is lost before the standby has caught up,
+the commits of the async period are lost.
+
+### 4.3 Why the primary cannot decide locally
+
+At the moment the old primary runs again, case 4.1 and case 4.2 look the same from its point of view: the peer is
+gone and no standby streams. In 4.2 switching to async is right, in 4.1 it breaks the invariant. The primary
+therefore needs **positive proof** before it switches to async, and in a complete partition (no answer at all)
+only a third party can provide it: fencing or a quorum device. Waiting times do not replace that; the fencing
+delays only decide who wins the fencing race.
+
+## 5. Rules
+
+### Rule 1: asynchronous only with proof (smallest change)
+
+Today the primary monitor switches to async when it sees "No Unpromoted nodes in cluster" (to prevent write
+blocking). After a stall this runs before the reconcile, on a stale CIB copy.
+
+Change:
+
+- The monitor no longer relaxes `synchronous_standby_names` by itself. It may still tighten it (standby
+  connected and streaming → sync).
+- The switch to async happens only in the notify path: `post-stop` of the peer instance, which the DC schedules
+  after the reconcile and, with fencing, after the fence.
+- Additional proof that allows the switch in the monitor: the peer answers and its PostgreSQL is a standby that
+  is not streaming, or is verifiably down.
+
+Risk to test: a standby that fails without a stop notification (instance not recovered by Pacemaker) would block
+writes until Pacemaker acts. Expected to be rare; must be covered by the lab matrix.
+
+### Rule 2: the data state decides when both sides meet again
+
+Without fencing (or when fencing fails), Pacemaker finds two promoted instances after the reconcile and demotes
+**one of them by score**, not by data state. With a location preference for the old node it can demote the new
+primary and discard its commits.
+
+Change:
+
+- The primary monitor checks the peer: if the peer answers as **primary on a higher timeline**, this node is the
+  stale one. It removes itself from the Promoted role: VIP off, demote (stop, rewind, standby), without waiting
+  for the scheduler.
+- The demote of a node must not be accepted if the peer has an older data state (the demote gate from
+  `followup/sync-gate-v2`, section 1.3 of the test report, covers part of this).
+
+### Rule 3: client contract (documentation)
+
+- Repeat a request after a lost connection or an error; requests must be safe to repeat (idempotent). This is
+  required for every failover, not only for stalls.
+- Treat the warning "committed locally, but might not have been replicated" as a failure.
+- Do not use `statement_timeout`, `pg_cancel_backend()` or client-side cancel on commit paths.
+
+## 6. Relation to other work
+
+- **Fencing stays.** Redundant rings make a partition less likely; they do not order "standby confirmed gone"
+  before "switch to async". With fencing, Pacemaker only reports the standby as stopped after the fence. The
+  dual-ring quickstart is corrected accordingly.
+- **Sync gate (`followup/sync-gate-v2`, based on patch 0001):** refuses promote and demote without a confirmed
+  synchronous state. Rules 1 and 2 are the same family. Open question 1.7 of the test report (strict vs.
+  fail-open when no primary is discoverable) is decided together with this design: with rule 1 the cluster
+  only runs async with proof, so "strict" becomes the consistent default; `force_promotion` stays the operator
+  override.
+- **Promotion by data state** (1.7.11) already compares timeline and LSN at promote time; rule 2 applies the same
+  comparison when both sides are primary.
+
+## 7. Test plan (lab, before implementation is merged)
+
+| # | Scenario | Expected with rules 1 and 2 |
+|---|---|---|
+| S1 | `virsh suspend` of the primary for 20 s, `resume`, fencing **off** | standby promoted; old primary acknowledges nothing (no async switch), steps down by itself (rule 2), rejoins via `pg_rewind`; no acknowledged commit lost |
+| S2 | as S1, fencing **on** (SBD) | old primary reset after the resume; same result |
+| S3 | `virsh suspend` of the standby for 20 s | primary switches to async only after the confirmed stop; back to sync after catch-up |
+| S4 | writer with acknowledged commits during S1-S3, compare after reconcile | no acknowledged commit missing |
+| S5 | client cancels a waiting commit during S1 | documents the hole of section 3 (`COMMIT` with WARNING) |
+| S6 | timing of the first pgtwin monitor after the resume vs. corosync membership change vs. CIB sync | confirms section 1 (monitor runs before the reconcile) |
+| S7 | standby PostgreSQL dies, node stays up (rule 1 risk) | writes block only until Pacemaker has stopped the instance |
+
+Every scenario is run with the existing regression set (switchover, crash, staggered shutdown, HA suite).
+
+---
+
+## 8. Implementation (1.8.0)
+
+The behaviour for failing nodes is kept (failover, switch to async, recovery). Only the stall is new: a primary
+(A) or standby (B) that stops being scheduled and continues later must be reconciled into the HA setup. Names:
+A' = the old primary after the stall, B' = the standby that was promoted in the meantime (and got the VIP).
+
+**Target outcome:** B' survives, because its timeline went on. B' runs asynchronously and keeps serving; A' waits
+(its commits are not acknowledged) and is turned into a standby.
+
+### 8.1 What was built
+
+| # | Change | Where |
+|---|---|---|
+| 1 | The primary monitor only **tightens** `synchronous_standby_names`, it never relaxes it. Relaxing happens in actions Pacemaker schedules after the cluster state is reconciled: **promote** and the **post-stop notification** of the standby | `pgsql_monitor`, `update_application_name_in_config promote` |
+| 1a | Exception without fencing: Pacemaker marks a lost node offline and its instance stopped *without a stop action*, so no notification arrives. The monitor may relax when the peer is offline in the CIB **and** its PostgreSQL does not answer. A peer that answers is never a reason to relax | `monitor_may_relax_sync()` |
+| 1b | The **start** path may only tighten (a primary restarted by Pacemaker after a stall relaxed here before) | `update_application_name_in_config start` |
+| 2 | **Relative promotion score**, transient attribute: base 10 (the floor of #13, so every steady-state score and the stickiness arithmetic are unchanged); right after a promotion the peer's last known score + 10000; back to 10 once a standby is in sync (rep_mode=async: streaming) and the peer is at the base; demote and standby start drop to the base at once. A primary without an in-sync standby keeps its value and never raises it, so a stale primary cannot outgrow the promoted one. Of two primaries after a stall or partition the one promoted last wins the scheduler's demote decision by a margin that no location (50), connectivity (200) or stickiness difference reaches, whichever node is DC. The permanent attribute of earlier versions is removed (it lives in the CIB configuration, where the copy that wins the CIB merge overwrites the other side's value) | `set_promotion_eligibility()` |
+| 3 | **Step down (rule 2)**: a primary that finds the peer as primary on a newer timeline marks itself ineligible, stops PostgreSQL (terminates waiting commits without acknowledging them) and returns `OCF_FAILED_PROMOTED`; Pacemaker restarts it as standby | `stale_primary_check()` in the primary monitor |
+| 4 | **Never start as a second primary**: a former primary without `standby.signal` starts as standby when another primary is running, and is rewound to it | `pgsql_start` |
+
+### 8.2 What the lab runs showed
+
+The first implementation (only 1 and 3) failed the target in the decisive direction: A' resumed, Pacemaker's
+reconcile made **A' the DC within one second** and demoted **B'** by score (location 100 vs 50) before A''s
+monitor ran; the rule 2 check additionally saw the walsender entry from before the stall as "streaming" and was
+skipped. Points 2 and 4 and 1b come from that run: the decision is made by the scheduler on the merged state, so
+the data state has to be in the score; and Pacemaker stops and restarts A' after the stall (its overdue monitor
+timed out), where the start path started it as primary again and relaxed to async for two seconds (23
+acknowledged commits that were not on B').
+
+A second iteration used `10 + 100 x timeline` as score. It worked, but PostgreSQL's TimeLineID only grows: from
+timeline 9000 on Pacemaker's score limit (1,000,000) would have equalised both nodes silently, and a margin of 100
+does not outweigh a lost ping (200) of the promoted node. The relative score replaces it. Its first version reset
+only on the primary side: for a few seconds the demoted node (monitor every 10 s) still had its bonus while the
+primary (monitor every 3 s) had already reset, and Pacemaker switched over to the "better" standby. Resetting on
+demote/standby start and only when the peer is at the base removed that.
+
+### 8.3 Results
+
+Lab: two KVM nodes, PostgreSQL 17.11, Pacemaker 3.0.3, writer on the stalled node via local socket, every
+acknowledged id checked on the final primary.
+
+| Scenario | Result |
+|---|---|
+| Stall of A (40 s), no fencing, A = node with location preference | B' survives, A' standby after 22 s, 0 acknowledged commits lost, nothing acknowledged after the resume |
+| Stall of A (40 s), no fencing, A = other node | same, A' standby after 23 s |
+| Stall of A (130 s), SBD | B' promoted after the fence, A' reset by SBD at the resume, 0 lost |
+| Stall of B (45 s), no fencing | primary async after 17 s (writes blocked 17 s), back to sync 9 s after the resume, 0 lost |
+| Standby crash, SBD | async after the fence: writes blocked 63 s (= fence time with the `crm cluster init` delays) |
+| Standby crash, no fencing | async 1 s after the standby is offline (before 1a: never, writes blocked) |
+| Regression: switchover (standby, move), primary killed with blocked restart, HA suite | unchanged (19-26 s, 37 s failover, rejoin via pg_rewind) |
+| Ping failover in steady state (`crm_simulate`, primary `pingd=0`) | fails over, 210 vs 260 (same as before 1.8.0) |
+| Stall of A (40 s), no fencing, A has location preference **and** B' lost its ping | B' survives the reconcile (bonus), afterwards the ping rule moves the primary to the connected node as a normal switchover; 0 lost |
+| Switchover, scores sampled every 2 s | new primary 10010, old primary 10 at once, both 10 four seconds after the standby is in sync; one promote, no flapping |
+
+### 8.4 Open points
+
+- **Writes block while the standby is being fenced** (63 s with the default fencing delays). Before, the primary
+  relaxed as soon as its walsender gave up (~30 s). Tuning the fencing delays shortens both.
+- **A standby that runs but does not stream** (authentication, slot, rewind trouble): the monitor no longer
+  relaxes, writes block until the standby's own recovery stops its instance. Before, the primary relaxed within
+  one monitor interval. Option: relax when the condition persists longer than the promote timeout (a reachable
+  standby could otherwise be in the middle of its promotion after a stall of this node).
+- **Full partition**: by design two independent regions; on healing the newer timeline wins (score and rule 2),
+  the other side's writes of the partition are discarded by pg_rewind. Both sides promoted from standby during
+  the partition (same timeline number, different data) needs an operator.
+- Unrelated finding during the tests: a standby that crashed seconds after a timeline switch could not reach a
+  consistent state (`invalid record length` at the end of the old timeline's segment, walreceiver restarted
+  in a loop) and failed every start; the #15 fallback only recognises "already been removed". Kept as
+  `data.torn-wal-case` on pg2 for analysis.

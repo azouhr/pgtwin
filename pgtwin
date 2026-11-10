@@ -70,6 +70,7 @@ fi
 # OCF return codes for promoted/master state
 : ${OCF_RUNNING_PROMOTED:=8}
 : ${OCF_RUNNING_MASTER:=8}
+: ${OCF_FAILED_PROMOTED:=9}
 
 #######################################################################
 # Defaults
@@ -518,6 +519,85 @@ get_application_name() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# Stall-safe synchronous replication (doc/DESIGN_STALL_SAFE_SYNC.md)
+#
+# A primary that stalled (A') wakes up in sync mode while the cluster may already
+# have promoted its peer (B'). Its commits then wait for a standby that never
+# confirms - nothing is acknowledged - as long as A' does not relax
+# synchronous_standby_names by itself. Relaxing therefore happens only in
+# actions Pacemaker schedules after the cluster state is reconciled (promote,
+# post-stop notification of the standby), and in the monitor only when the
+# peer is a current cluster member and answers as a standby (a standby that
+# runs but does not stream). A' steps down when it finds B' as primary on a
+# newer timeline; B' survives because its timeline went on.
+# ---------------------------------------------------------------------------
+
+# Name of the other configured cluster node (also when it is offline)
+get_peer_node_name() {
+    local me
+    me=$(get_cluster_node_name)
+    crm_mon --as-xml 2>/dev/null | xmllint --xpath "//nodes/node[@name!='${me}']/@name" - 2>/dev/null | \
+        sed 's/ *name="\([^"]*\)"/\1\n/g' | grep -v '^$' | head -1
+}
+
+# Ask the peer's PostgreSQL whether it is in recovery: prints t (standby),
+# f (primary) or nothing (does not answer).
+peer_recovery_state() {
+    local peer="$1" peer_host rep_user opts=""
+    peer_host=$(resolve_cluster_node_to_hostname "$peer")
+    rep_user=$(get_replication_user 2>/dev/null)
+    [ -n "$rep_user" ] && opts="-U ${rep_user} -d postgres"
+    run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null
+}
+
+# May the primary monitor relax synchronous replication by itself? Only when the
+# standby is verifiably gone and Pacemaker will not tell us: without fencing a
+# lost node is marked offline and its instance stopped without a stop action,
+# so no post-stop notification arrives. The proof is that the peer is offline
+# in the CIB and its PostgreSQL does not answer. A peer that answers is never a
+# reason to relax: as primary rule 2 applies, as standby it may be about to be
+# promoted (this node stalled). With fencing the notification after the fence
+# relaxes instead.
+fencing_enabled() {
+    local v
+    v=$(crm_attribute -t crm_config -n fencing-enabled -G -q 2>/dev/null) || \
+        v=$(crm_attribute -t crm_config -n stonith-enabled -G -q 2>/dev/null) || v="true"
+    case "$v" in false|no|0|off) return 1 ;; esac
+    return 0
+}
+
+monitor_may_relax_sync() {
+    local peer online
+    fencing_enabled && return 1
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 1
+    online=$(crm_mon --as-xml 2>/dev/null | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
+    [ "$online" = "false" ] || return 1
+    [ -z "$(peer_recovery_state "$peer")" ]
+}
+
+# Rule 2: this primary is stale if the peer answers as primary on a higher
+# timeline. Prints "<local_tli> <peer_tli>".
+stale_primary_check() {
+    local peer peer_host peer_state local_state p_tli l_tli
+    # Not conditional on "no standby streaming": right after a stall the old
+    # walsender entry can still show as streaming
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 1
+    [ "$(peer_recovery_state "$peer")" = "f" ] || return 1
+    peer_host=$(resolve_cluster_node_to_hostname "$peer")
+    peer_state=$(query_data_state "$peer_host") || return 1
+    local_state=$(query_data_state "") || return 1
+    p_tli=${peer_state%% *}
+    l_tli=${local_state%% *}
+    if [ "$p_tli" -gt "$l_tli" ]; then
+        echo "$l_tli $p_tli"
+        return 0
+    fi
+    return 1
+}
+
 # Get safe synchronous_standby_names based on cluster topology and actual connections
 # Returns comma-separated list of nodes that are both Unpromoted in cluster AND connected to PostgreSQL
 # Falls back to '*' if no standbys meet both criteria (prevents write blocking)
@@ -625,6 +705,9 @@ get_safe_synchronous_standby_names() {
 # Update application_name in postgresql.auto.conf
 # This ensures the correct application_name is set when starting or promoting
 update_application_name_in_config() {
+    # $1: "promote" (may relax synchronous replication: the new primary is
+    # authoritative) or "start" (may only tighten)
+    local caller="${1:-start}"
     # v1.7.0: Refactored to use ALTER SYSTEM instead of manual file editing
     # This function now handles both application_name and synchronous_standby_names
     # v1.6.18: synchronous_standby_names now uses cluster topology + connection state
@@ -666,6 +749,11 @@ update_application_name_in_config() {
         else
             # Get safe standby names based on cluster topology AND actual connections
             local safe_sync=$(get_safe_synchronous_standby_names)
+
+            if [ "$caller" != "promote" ] && [ -z "$safe_sync" ] && [ -n "$current_sync" ]; then
+                ocf_log warn "Start: no standby streaming, keeping synchronous_standby_names='${current_sync}' (only promote or the standby's stop may relax it)"
+                safe_sync="$current_sync"
+            fi
 
             if [ "$current_sync" != "$safe_sync" ]; then
                 ocf_log info "Updating synchronous_standby_names based on cluster topology and connection state"
@@ -1711,8 +1799,15 @@ set_promotion_eligibility() {
     # ordinary fail-count/migration-threshold banning, not this attribute.
     local master_attr="master-${rsc_name}"
 
+    # Transient attribute (-l reboot): every node's own attrd owns and reports
+    # its value, so after a partition or stall heals the value each node set for
+    # itself counts - a permanent attribute lives in the CIB configuration, where
+    # the copy that wins the CIB merge overwrites the other side's value. Remove a
+    # permanent value left by earlier versions, it would shadow the transient one.
+    crm_attribute -N "$node_name" -n "$master_attr" -l forever -D >/dev/null 2>&1
+
     if [ "$mode" = "ineligible" ]; then
-        crm_attribute -N "$node_name" -n "$master_attr" -v -INFINITY >/dev/null 2>&1
+        crm_attribute -N "$node_name" -n "$master_attr" -l reboot -v -INFINITY >/dev/null 2>&1
     else
         # dmkif: explicit positive floor, not --delete. An unset
         # master-score falls back to Pacemaker's own implicit default for
@@ -1729,7 +1824,58 @@ set_promotion_eligibility() {
         # implicit default without overriding the real differentiators
         # (resource-stickiness=1000, the pingd-gated location constraint)
         # that decide *between* two genuinely healthy nodes.
-        crm_attribute -N "$node_name" -n "$master_attr" -v 10 >/dev/null 2>&1
+        #
+        #
+        # Relative promotion score (doc/DESIGN_STALL_SAFE_SYNC.md):
+        #   eligible  standby: base score 10
+        #   promoted  right after a promotion: the peer's last known score
+        #             + 10000. Of two primaries after a stall or partition the
+        #             one promoted last (B', newer timeline) wins the scheduler's
+        #             demote decision by a margin no location, connectivity or
+        #             stickiness difference reaches.
+        #   primary   primary monitor: back to 10 once a standby streams in
+        #             sync (it has the same data, the bonus is no longer
+        #             needed); otherwise the score is kept and NEVER raised, so
+        #             a stale primary (A') cannot outgrow the promoted one.
+        # The score only grows with failovers that happen without a resync in
+        # between - no timeline-sized numbers, no limit to run into.
+        local base=10 bonus=10000 limit=900000 score current peer peer_score
+        case "$mode" in
+            promoted)
+                peer=$(get_peer_node_name)
+                peer_score=$(crm_attribute -N "$peer" -n "$master_attr" -l reboot -G -q 2>/dev/null)
+                case "$peer_score" in ""|*[!0-9]*) peer_score=$base ;; esac
+                score=$(( peer_score + bonus ))
+                [ "$score" -le "$limit" ] || score=$limit
+                ;;
+            primary)
+                local synced
+                # "in sync as expected": a synchronous standby with rep_mode=sync,
+                # any streaming standby with rep_mode=async (it never becomes
+                # 'sync' there, the bonus would otherwise stay forever)
+                local sync_filter="AND sync_state IN ('sync', 'quorum')"
+                [ "${OCF_RESKEY_rep_mode}" = "sync" ] || sync_filter=""
+                synced=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' ${sync_filter}\"" 2>/dev/null)
+                # Reset only when the peer is at the base as well: a standby must
+                # never score above its primary, Pacemaker would switch over to it
+                peer=$(get_peer_node_name)
+                peer_score=$(crm_attribute -N "$peer" -n "$master_attr" -l reboot -G -q 2>/dev/null)
+                case "$peer_score" in ""|*[!0-9-]*) peer_score=$base ;; esac
+                if [ -n "$synced" ] && [ "$synced" -gt 0 ] 2>/dev/null && [ "$peer_score" -le "$base" ] 2>/dev/null; then
+                    score=$base
+                else
+                    current=$(crm_attribute -N "$node_name" -n "$master_attr" -l reboot -G -q 2>/dev/null)
+                    case "$current" in
+                        ""|*[!0-9]*) score=$base ;;
+                        *) score=$current ;;
+                    esac
+                fi
+                ;;
+            *)
+                score=$base
+                ;;
+        esac
+        crm_attribute -N "$node_name" -n "$master_attr" -l reboot -v "$score" >/dev/null 2>&1
     fi
 }
 
@@ -1849,6 +1995,22 @@ pgsql_monitor() {
 
     # Check if promoted or unpromoted
     if pgsql_is_promoted; then
+        # Rule 2 (doc/DESIGN_STALL_SAFE_SYNC.md): a primary that has no standby
+        # and finds the peer as primary on a higher timeline is the stale one
+        # (it stalled or was cut off while the peer was promoted). Stop serving
+        # at once - stopping terminates waiting commits without acknowledging
+        # them - and let Pacemaker turn this node into a standby (pg_rewind).
+        local stale
+        if stale=$(stale_primary_check); then
+            ocf_log err "Stale primary: the peer is primary on a newer timeline (local ${stale%% *}, peer ${stale##* }) - stepping down"
+            set_promotion_eligibility "ineligible"
+            pgsql_stop
+            return $OCF_FAILED_PROMOTED
+        fi
+
+        # Relative promotion score of the primary (reset once a standby is in sync)
+        set_promotion_eligibility "primary"
+
         # Check replication slots on primary
         check_replication_slots
 
@@ -1861,6 +2023,19 @@ pgsql_monitor() {
             if ! echo "$current_sync" | grep -qE '^FIRST |^ANY '; then
                 # Get safe standby names based on current cluster topology + connections
                 local safe_sync=$(get_safe_synchronous_standby_names)
+
+                # The monitor only tightens. Relaxing to async from here could run
+                # on a stale view right after this node stalled (its peer may
+                # already be primary): leave that to the post-stop notification,
+                # except for a standby that is a member and runs but does not stream.
+                if [ -z "$safe_sync" ] && [ -n "$current_sync" ] && ! monitor_may_relax_sync; then
+                    local mark="$(dirname "${PGDATA}")/.pgtwin_sync_kept"
+                    if [ -z "$(find "$mark" -mmin -1 2>/dev/null)" ]; then
+                        ocf_log warn "Monitor: no standby streaming, keeping synchronous_standby_names='${current_sync}' until Pacemaker reports the standby stopped (doc/DESIGN_STALL_SAFE_SYNC.md)"
+                        touch "$mark"
+                    fi
+                    safe_sync="$current_sync"
+                fi
 
                 if [ "$current_sync" != "$safe_sync" ]; then
                     ocf_log info "Monitor: Updating synchronous_standby_names due to cluster topology change"
@@ -2491,9 +2666,22 @@ pgsql_start() {
         run_as_pguser touch "${PGDATA}/standby.signal"
     fi
 
+    # Never start as a second primary (doc/DESIGN_STALL_SAFE_SYNC.md): a former
+    # primary that is restarted while another primary runs - after a stall the
+    # cluster stops and starts it again - starts as standby and is rewound to it.
+    if [ ! -f "${PGDATA}/standby.signal" ] && [ -f "${PGDATA}/PG_VERSION" ]; then
+        local other_primary
+        other_primary=$(discover_promoted_node 2>/dev/null)
+        if [ -n "$other_primary" ]; then
+            ocf_log warn "Another primary is running (${other_primary}): starting this former primary as standby"
+            run_as_pguser touch "${PGDATA}/standby.signal"
+        fi
+    fi
+
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
+        set_promotion_eligibility "eligible"
 
         # Non-blocking timeline divergence warning (best effort)
         # This helps admins detect timeline issues before PostgreSQL startup fails
@@ -2743,7 +2931,8 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             ocf_log info "PostgreSQL started successfully"
 
             # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
-            update_application_name_in_config
+            # (start path: may tighten, never relax - doc/DESIGN_STALL_SAFE_SYNC.md)
+            update_application_name_in_config start
 
             # Perform configuration check after successful start
             check_postgresql_config
@@ -3284,8 +3473,12 @@ pgsql_promote() {
         if pgsql_is_promoted; then
             ocf_log info "PostgreSQL promoted successfully"
 
+            # Relative promotion score: this node now wins against a stale
+            # primary that shows up after a stall or partition
+            set_promotion_eligibility "promoted"
+
             # v1.7.0: Update application_name and synchronous_standby_names using ALTER SYSTEM
-            update_application_name_in_config
+            update_application_name_in_config promote
 
             # Create replication slot if needed
             if [ -n "${OCF_RESKEY_slot_name}" ]; then
@@ -3363,6 +3556,8 @@ check_timeline_divergence() {
 
 pgsql_demote() {
     local rc
+    # A node that is no longer primary carries no promotion bonus
+    set_promotion_eligibility "eligible"
     local primary_host=""
     local rep_user
     local app_name
