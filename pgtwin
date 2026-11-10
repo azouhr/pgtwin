@@ -2417,10 +2417,13 @@ pgsql_start() {
             if [ -n "$node_to_check" ]; then
                 local rep_user=$(get_replication_user)
                 if [ -n "$rep_user" ]; then
-                    # Try to query timeline from the node (works even if being demoted)
+                    # Query the timeline only from a node that IS primary. A standby
+                    # reports the timeline of its last restartpoint, which lags behind:
+                    # during a switchover the demoting primary saw the not yet promoted
+                    # standby as "diverged" and ran pg_rewind against it on every switch.
                     local other_timeline=$(run_as_pguser sh -c \
                         "${PSQL} -h ${node_to_check} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \
-                        'SELECT timeline_id FROM pg_control_checkpoint()' 2>/dev/null" || echo "")
+                        'SELECT timeline_id FROM pg_control_checkpoint() WHERE NOT pg_is_in_recovery()' 2>/dev/null" || echo "")
 
                     if [ -n "$other_timeline" ]; then
                         ocf_log info "Other node timeline: ${other_timeline} (${node_to_check})"
