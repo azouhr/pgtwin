@@ -3551,6 +3551,21 @@ recover_standby() {
                 ocf_log warn "Cannot connect to primary ${primary_host} as ${rep_user}, pg_rewind will likely fail"
             fi
 
+            # pg_rewind completes the crash recovery of an uncleanly stopped
+            # target itself, in single-user mode ("postgres --single"), and that
+            # refuses to run with standby.signal present ("standby mode is not
+            # supported by single-user servers"). After every crash of the old
+            # primary pg_rewind therefore failed and a full basebackup ran instead.
+            # Keep the signal files outside PGDATA while pg_rewind runs.
+            local signal_dir
+            signal_dir=$(dirname "${PGDATA}")
+            local sig moved_signals=""
+            for sig in standby.signal recovery.signal; do
+                if [ -f "${PGDATA}/${sig}" ]; then
+                    mv "${PGDATA}/${sig}" "${signal_dir}/.pgtwin_rewind_${sig}" && moved_signals="${moved_signals} ${sig}"
+                fi
+            done
+
             # Run pg_rewind with proper environment variable passing
             ocf_log info "Executing pg_rewind to sync from ${primary_host}"
             run_as_pguser env PGPASSFILE="${pgpass_file}" \
@@ -3559,6 +3574,18 @@ recover_standby() {
                 --source-server="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} dbname=postgres sslmode=prefer" \
                 --progress 2>&1 | tee /tmp/pg_rewind_$$.log
             rc=${PIPESTATUS[0]}
+
+            # Put the signal files back (finalize_standby_config recreates
+            # standby.signal on success anyway)
+            for sig in ${moved_signals}; do
+                if [ -f "${signal_dir}/.pgtwin_rewind_${sig}" ]; then
+                    if [ -f "${PGDATA}/${sig}" ]; then
+                        rm -f "${signal_dir}/.pgtwin_rewind_${sig}"
+                    else
+                        mv "${signal_dir}/.pgtwin_rewind_${sig}" "${PGDATA}/${sig}"
+                    fi
+                fi
+            done
 
             if [ $rc -eq 0 ]; then
                 ocf_log info "pg_rewind completed successfully"
