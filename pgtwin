@@ -89,7 +89,7 @@ OCF_RESKEY_backup_before_basebackup_default="true"
 OCF_RESKEY_basebackup_timeout_default="3600"
 OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
-OCF_RESKEY_promotion_peer_wait_default="60"
+OCF_RESKEY_promotion_peer_wait_default="30"
 OCF_RESKEY_vip_default=""
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
@@ -431,13 +431,15 @@ ahead, so that a stale node cannot win after a staggered shutdown of both
 nodes. If the peer does not answer within this time the standby is
 promoted anyway (availability) and a warning with both known states is
 logged. While the peer's position still advances (crash recovery) the wait
-is extended up to a fixed limit of 100 seconds, which stays below the
-default promote timeout of 120 seconds.
+is extended up to a fixed limit of 40 seconds. Both limits are measured from
+the start of the check (including primary discovery), so that the whole
+promote action stays well below 60 seconds. A peer that is shutting down or
+in standby is not waited for (planned switchover).
 
 0 disables the comparison (previous behaviour). force_promotion=true
 bypasses it as well.
 
-Default: 60
+Default: 30
 </longdesc>
 <shortdesc lang="en">Wait for the peer's data state before promotion (s)</shortdesc>
 <content type="integer" default="${OCF_RESKEY_promotion_peer_wait_default}" />
@@ -2839,8 +2841,8 @@ query_stable_data_state() {
 # True if a node without standby.signal should start as standby: the data-state
 # comparison is enabled, the peer is a cluster member and no primary is running.
 start_as_standby_for_data_comparison() {
-    local wait_max="${OCF_RESKEY_promotion_peer_wait:-60}"
-    case "$wait_max" in ""|*[!0-9]*) wait_max=60 ;; esac
+    local wait_max="${OCF_RESKEY_promotion_peer_wait:-30}"
+    case "$wait_max" in ""|*[!0-9]*) wait_max=30 ;; esac
     [ "$wait_max" -gt 0 ] || return 1
     [ -n "$(get_peer_member_name)" ] || return 1
     [ -z "$(discover_promoted_node 2>/dev/null)" ] || return 1
@@ -2851,15 +2853,28 @@ start_as_standby_for_data_comparison() {
 # state with the peer if the peer is a cluster member. Returns 0 to continue
 # with the existing checks, 1 to refuse the promotion.
 promotion_data_state_guard() {
-    local wait_max="${OCF_RESKEY_promotion_peer_wait:-60}" hard_max=100
+    # Time budget: both limits count from the start of this function (discovery
+    # included), and a round is only started if it can finish within the limit,
+    # so that the promote action stays well below 60 s.
+    local wait_max="${OCF_RESKEY_promotion_peer_wait:-30}" hard_max=40
     local peer local_name waited=0 limit local_state peer_state rc lrc decision
     local l_tli l_lsn p_tli="unknown" p_lsn="unknown" start=$SECONDS
+    local round_start round_cost=0
 
-    case "$wait_max" in ""|*[!0-9]*) wait_max=60 ;; esac
+    case "$wait_max" in ""|*[!0-9]*) wait_max=30 ;; esac
     [ "$wait_max" -gt 0 ] || return 0
 
     peer=$(get_peer_member_name)
     [ -n "$peer" ] || return 0
+
+    # Planned switchover: a peer that is shutting down or in standby flushed its
+    # WAL to this node and gives no data state any more - decide at once, before
+    # any discovery or query (each can cost seconds while the VIP moves).
+    if peer_is_leaving "$peer"; then
+        ocf_log warn "promotion-by-data-state: decision=promote-peer-leaving local=unknown peer=unknown tiebreak=no waited=$((SECONDS - start))s"
+        ocf_log warn "Peer ${peer} is shutting down or in standby; promoting this node without waiting"
+        return 0
+    fi
 
     # Only relevant when no primary is running anywhere
     if [ -n "$(discover_promoted_node 2>/dev/null)" ]; then
@@ -2874,12 +2889,13 @@ promotion_data_state_guard() {
     peer_host=$(resolve_cluster_node_to_hostname "$peer")
 
     while true; do
+        round_start=$SECONDS
         local_state=$(query_stable_data_state ""); lrc=$?
         if [ -z "$local_state" ]; then
             ocf_log warn "promotion-by-data-state: cannot read local data state, using existing checks only"
             return 0
         fi
-        if [ $lrc -eq 2 ] && [ $((SECONDS - start)) -lt $hard_max ]; then
+        if [ $lrc -eq 2 ] && [ $((SECONDS - start + 3)) -lt $hard_max ]; then
             # local recovery still advances: wait until the position is stable
             sleep 1
             continue
@@ -2898,14 +2914,21 @@ promotion_data_state_guard() {
         fi
         waited=$((SECONDS - start))
 
-        decision=$(promotion_decision "$l_tli" "$l_lsn" "$p_tli" "$p_lsn" "$local_name" "$peer" "$waited" "$limit")
+        # A peer that leaves in an orderly way gives no state any more: decide
+        # before the time limit is evaluated (planned switchover must not end up
+        # as "peer unreachable").
+        if [ "$p_tli" = "unknown" ] && peer_is_leaving "$peer"; then
+            ocf_log warn "promotion-by-data-state: decision=promote-peer-leaving local=${l_tli}/${l_lsn} peer=unknown tiebreak=no waited=${waited}s"
+            ocf_log warn "Peer ${peer} is shutting down or in standby; promoting this node without waiting"
+            return 0
+        fi
+
+        # Do not start another round (sleep + queries) that would end beyond the
+        # limit: decide now with what is known.
+        round_cost=$((SECONDS - round_start + 3))
+        decision=$(promotion_decision "$l_tli" "$l_lsn" "$p_tli" "$p_lsn" "$local_name" "$peer" "$((waited + round_cost))" "$limit")
         case "$decision" in
             wait)
-                if [ "$p_tli" = "unknown" ] && peer_is_leaving "$peer"; then
-                    ocf_log warn "promotion-by-data-state: decision=promote-peer-leaving local=${l_tli}/${l_lsn} peer=unknown tiebreak=no waited=${waited}s"
-                    ocf_log warn "Peer ${peer} is shutting down or in standby; promoting this node without waiting"
-                    return 0
-                fi
                 sleep 3
                 continue
                 ;;

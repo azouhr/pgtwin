@@ -20,9 +20,11 @@ peer's before the existing sync/async checks:
 - equal data states: the node with the smaller cluster name is promoted, the other refuses,
 - the peer gives no usable state within `promotion_peer_wait` seconds (not reachable, PostgreSQL not running):
   the node is promoted anyway with a warning (availability over a dead peer); while the peer's position still
-  advances the wait is extended up to 100 seconds, which stays below the 120 s promote timeout,
+  advances the wait is extended up to 40 seconds. Both limits count from the start of the check (discovery included)
+  and no round is started that would end beyond the limit, so the promote action stays well below 60 s,
 - the peer is leaving in an orderly way (Pacemaker `shutdown` attribute set, or node in standby): no usable state will
-  come, the node is promoted at once (`promote-peer-leaving`); a clean shutdown flushes all WAL to the standby first,
+  come, the node is promoted at once (`promote-peer-leaving`), checked before any query; a clean shutdown flushes all
+  WAL to the standby first,
 - a node without `standby.signal` (former primary) that starts while the peer is a cluster member and no primary is
   running is started as standby, so that the same comparison decides who becomes primary (covers: primary dies, standby
   is promoted and writes, new primary dies, old primary boots first),
@@ -35,7 +37,7 @@ A refusal returns an error from the promote action; Pacemaker then promotes the 
 
 | Name | Default | Meaning |
 |---|---|---|
-| `promotion_peer_wait` | 60 | seconds to wait for a usable peer state; 0 disables the comparison |
+| `promotion_peer_wait` | 30 | seconds to wait for a usable peer state (hard limit 40 s); 0 disables the comparison |
 
 ## Log
 
