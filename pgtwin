@@ -1908,11 +1908,33 @@ pgsql_monitor() {
                     # Reset failure counter before recovery attempt
                     ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
 
+                    # A consistent standby (clean shutdown) starts fine but its
+                    # walreceiver fails forever with "requested WAL segment ...
+                    # has already been removed". pg_rewind reports success there
+                    # without fixing anything, so the recovery looped every
+                    # threshold cycle. Watch one walreceiver retry
+                    # (wal_retrieve_retry_interval, default 5 s) and rebuild with
+                    # pg_basebackup if the WAL is gone.
+                    local rec_mode=""
+                    local wal_snap="${state_dir}/.pgtwin_walcheck.$$"
+                    snapshot_pg_logs "$wal_snap"
+                    sleep 6
+                    if standby_start_failed_for_missing_wal "$wal_snap" /dev/null; then
+                        rec_mode="basebackup-only"
+                        ocf_log warn "Standby cannot stream: WAL it needs has already been removed on the primary ${primary_host}"
+                        ocf_log warn "pg_rewind cannot help, rebuilding the standby with pg_basebackup"
+                        set_promotion_eligibility "ineligible"
+                    fi
+                    rm -f "$wal_snap"
+
                     # Trigger recovery (this will stop PostgreSQL, run pg_rewind/basebackup, and restart)
-                    recover_standby "$primary_host"
+                    recover_standby "$primary_host" $rec_mode
                     local recovery_rc=$?
 
-                    if [ $recovery_rc -eq 0 ]; then
+                    if [ $recovery_rc -eq 0 ] && [ "$rec_mode" = "basebackup-only" ]; then
+                        ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
+                        return $OCF_NOT_RUNNING
+                    elif [ $recovery_rc -eq 0 ]; then
                         ocf_log info "Automatic replication recovery completed successfully"
                         return $OCF_SUCCESS
                     else
