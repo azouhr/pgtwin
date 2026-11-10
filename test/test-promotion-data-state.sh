@@ -48,14 +48,14 @@ check "peer newer -> refuse"            refuse "$(promotion_decision 5 0/10 5 0/
 check "peer older -> promote"           promote "$(promotion_decision 5 0/20 5 0/10 pg-a pg-b 0 60)"
 check "peer higher tli -> refuse"       refuse "$(promotion_decision 5 0/FF 6 0/10 pg-a pg-b 0 60)"
 check "equal, smaller name -> promote"  promote "$(promotion_decision 5 0/10 5 0/10 pg-a pg-b 0 60)"
-check "equal, larger name -> refuse"    refuse "$(promotion_decision 5 0/10 5 0/10 pg-b pg-a 0 60)"
+check "equal, larger name -> promote"   promote "$(promotion_decision 5 0/10 5 0/10 pg-b pg-a 0 60)"
 check "peer unknown, waiting"           wait "$(promotion_decision 5 0/10 unknown unknown pg-a pg-b 10 60)"
 check "peer unknown, limit reached"     promote-peer-unreachable "$(promotion_decision 5 0/10 unknown unknown pg-a pg-b 60 60)"
 check "peer unknown, hard limit"        promote-peer-unreachable "$(promotion_decision 5 0/10 unknown unknown pg-a pg-b 100 100)"
 check "peer garbage lsn, waiting"       wait "$(promotion_decision 5 0/10 5 garbage pg-a pg-b 1 60)"
 check "peer garbage lsn, limit"         promote-peer-unreachable "$(promotion_decision 5 0/10 5 garbage pg-a pg-b 60 60)"
-check "symmetry: only one side promotes (a)" promote "$(promotion_decision 5 0/10 5 0/10 pg-a pg-b 0 60)"
-check "symmetry: only one side promotes (b)" refuse "$(promotion_decision 5 0/10 5 0/10 pg-b pg-a 0 60)"
+check "symmetry: older side refuses (a)"    refuse  "$(promotion_decision 5 0/10 5 0/20 pg-a pg-b 0 60)"
+check "symmetry: newer side promotes (b)"   promote "$(promotion_decision 5 0/20 5 0/10 pg-b pg-a 0 60)"
 
 # force_promotion bypass and disabled comparison live in check_promotion_safety /
 # promotion_data_state_guard; verified by static grep so a refactor cannot drop them silently.

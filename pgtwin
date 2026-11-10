@@ -2778,9 +2778,12 @@ promotion_decision() {
         newer) echo promote ;;
         older) echo refuse ;;
         equal)
-            # Same data state: the node with the smaller cluster name wins, the
-            # other refuses. Both nodes compute the same order.
-            if [ "$l_name" \< "$p_name" ]; then echo promote; else echo refuse; fi
+            # Same data state: promoting this node loses nothing, so follow the
+            # scheduler's choice. A tie-break by node name refused every
+            # "crm resource move" to the node with the larger name (after a clean
+            # demote both states are always equal). Pacemaker never promotes two
+            # instances at once (promoted-max=1), so no tie-break is needed.
+            echo promote
             ;;
         *)
             if [ "$waited" -ge "$limit" ]; then echo promote-peer-unreachable; else echo wait; fi
@@ -2821,9 +2824,28 @@ query_data_state() {
     fi
     out=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc \"SELECT (SELECT timeline_id FROM pg_control_checkpoint()) || ' ' || CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text ELSE pg_current_wal_lsn()::text END\"" 2>/dev/null) || return 1
     case "$out" in
-        [0-9]*" "[0-9A-Fa-f]*/[0-9A-Fa-f]*) echo "$out"; return 0 ;;
+        [0-9]*" "[0-9A-Fa-f]*/[0-9A-Fa-f]*) ;;
+        *) return 1 ;;
     esac
-    return 1
+
+    # The checkpoint timeline of a standby lags behind: it only advances with the
+    # next restartpoint. A standby that already follows the primary's new timeline
+    # (same LSN) still reported the old one and was judged "older", so a
+    # "crm resource move" to it was refused. A node receives the history file of a
+    # timeline only when it follows that timeline, so the newest history file in
+    # pg_wal gives the timeline it actually is on. Best effort: needs pg_ls_dir
+    # (granted to the replication user for pg_rewind); without it the checkpoint
+    # timeline is used as before.
+    local hist tli
+    local hist_sql="SELECT max(('x'||substr(f,1,8))::bit(32)::int) FROM pg_ls_dir('pg_wal', true, false) AS f WHERE f ~ '^[0-9A-F]{8}[.]history\$'"
+    hist=$(run_as_pguser env PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc "$hist_sql" 2>/dev/null)
+    tli=${out%% *}
+    case "$hist" in
+        ""|*[!0-9]*) ;;
+        *) [ "$hist" -gt "$tli" ] && out="${hist} ${out#* }" ;;
+    esac
+    echo "$out"
+    return 0
 }
 
 # Two queries 2 seconds apart. Prints "<tli> <lsn>" and returns 0 if both are
@@ -2938,7 +2960,7 @@ promotion_data_state_guard() {
                 ;;
             refuse)
                 ocf_log warn "promotion-by-data-state: decision=refuse local=${l_tli}/${l_lsn} peer=${p_tli}/${p_lsn} tiebreak=$([ "$p_tli/$p_lsn" = "$l_tli/$l_lsn" ] && echo yes || echo no) waited=${waited}s"
-                ocf_log warn "Peer ${peer} has the newer (or preferred equal) data state, not promoting this node"
+                ocf_log warn "Peer ${peer} has the newer data state, not promoting this node"
                 return 1
                 ;;
             promote-peer-unreachable)

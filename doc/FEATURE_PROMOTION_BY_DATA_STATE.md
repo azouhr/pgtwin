@@ -17,7 +17,8 @@ peer's before the existing sync/async checks:
 - both values must be stable (two queries two seconds apart are equal; a position that still advances means crash
   recovery is running and the comparison waits),
 - the node with the higher timeline, then the higher LSN, is promoted; the other node refuses,
-- equal data states: the node with the smaller cluster name is promoted, the other refuses,
+- equal data states: the node chosen by Pacemaker is promoted (nothing can be lost; a tie-break by name made
+  `crm resource move` to the node with the larger name impossible, Pacemaker never promotes two instances at once),
 - the peer gives no usable state within `promotion_peer_wait` seconds (not reachable, PostgreSQL not running):
   the node is promoted anyway with a warning (availability over a dead peer); while the peer's position still
   advances the wait is extended up to 40 seconds. Both limits count from the start of the check (discovery included)
