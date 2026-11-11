@@ -99,6 +99,7 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 - Upgrade: set the transient promotion score before removing the permanent one
 - Standby streams from the primary's node, not the VIP (switchover 60 s slower)
 - Promotion safety check queries as the replication user (needs pg_read_all_stats)
+- Promotion safety check: no search for a fenced or stopped primary (faster failover and switchover)
 
 * Tue Nov 10 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.0-1
 - Release v1.8.0: failover timing, recovery and promotion fixes

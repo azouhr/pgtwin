@@ -253,7 +253,7 @@ over the VIP from the surviving node, every acknowledged id checked on the final
 | Scenario | Result |
 |---|---|
 | Standby frozen, fencing (B) | fenced 4 s after the loss, relaxed 2 s later: writes blocked 12.8 s (1.8.0: until the standby returns), 0 lost |
-| Primary frozen 40 s, fencing | membership lost 6.5 s, fence incl. `priority-fencing-delay` 8.3 s, promote 5 s: write gap 22.4 s, 0 lost |
+| Primary frozen 40 s, fencing | membership lost 6.9 s, fence incl. `priority-fencing-delay` 8.6 s, promote 1.4 s: write gap 20.3 s, 0 lost (before the safety-check change below: 22.4 s, promote 5 s) |
 | Both rings down, fencing | primary fences the standby first (priority delay), relaxed right after: write gap 3.2 s, 0 lost |
 | Both rings down, no fencing (A) | peer promotes, primary never relaxes, steps down 1 s later (rule 2), 0 lost; with the primary's probes blocked for 5 s during the peer's promotion (the race of finding A): "unreachable, waiting", then rule 2, 0 lost |
 | Standby powered off, no fencing | relaxed after 6 s unreachable: write gap 18.6 s (cost of the window), 0 lost |
@@ -261,5 +261,8 @@ over the VIP from the surviving node, every acknowledged id checked on the final
 | Standby streaming from the VIP (D) | moved to the node by the next monitor; switchover 20 s (dmkif 1.8.0: 69-77 s), 0 lost |
 | `test-pgtwin-ha-suite.sh` | 12/12 |
 
-Open: about 3 s pass between `pg_ctl promote` and the startup process logging "received promote request" after a
-fenced primary (to be analysed).
+The promote after a fenced primary took 5 s: the promotion safety check searched the old primary (VIP and node,
+2 s connect timeout each) before failing open. With fencing it now skips the search when the cluster has recorded
+the former primary as offline and clean (promote 1.4 s), and in any case when the former primary is a member
+with no instance running (switchover: write gap 18.0 -> 15.8 s). Without fencing a lost node is always asked:
+there it counts as clean on blind faith while its primary may still run.

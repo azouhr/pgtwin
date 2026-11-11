@@ -43,6 +43,9 @@ Release notes: `releasenotes/RELEASE_v1.8.1.md`.
 - **The promotion safety check blocked promotions while the old primary still answered** (e.g. cluster network
   down): it queried the primary as the postgres role without a password, and without `pg_read_all_stats` the
   replication user cannot read `sync_state`. It now queries as the replication user and names the missing grant.
+  It skips the search for the old primary when the cluster has confirmed it is gone: with fencing when the node
+  is offline and clean, in any case when the node is a member and no instance runs there (switchover). The search
+  failed open after its connect timeouts and cost 4 s of every failover and 2-3 s of every switchover.
 - The standby start no longer warns about an empty `synchronous_standby_names` (no effect on a standby, set by
   pgtwin on promote).
 

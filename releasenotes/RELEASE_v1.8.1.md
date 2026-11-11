@@ -97,7 +97,10 @@ Before a promotion the standby checks that it is `sync` on the primary, if the p
 the cluster network is down). The query ran as the postgres role without a password, and the replication user
 needs `pg_read_all_stats` to see `sync_state`. In setups following QUICKSTART the check therefore blocked the
 promotion whenever the old primary answered. It now queries as the replication user and logs the missing grant
-explicitly.
+explicitly. The check also skips the search for the old primary when the cluster has confirmed it is gone: with
+fencing when the node is offline and clean (fenced or stopped), in any case when the node is a member and no
+instance runs there (switchover). The search could only fail open after its connect timeouts: 4 s of every
+failover, 2-3 s of every switchover. Without fencing a lost node is always asked.
 
 ## Upgrade notes
 
@@ -133,10 +136,10 @@ acknowledged id checked on the final primary.
 | Same, primary's probes blocked for 5 s during the peer's promotion (race of problem 2) | (relax on the first failed probe) | "unreachable, waiting", then step down, 0 lost |
 | Standby powered off, no fencing | relax after one failed probe | relax after 6 s: write gap 18.6 s, 0 lost |
 | Standby frozen, fencing | dmkif: writes blocked 199 s (until the resume) | fenced after 4 s, relaxed 2 s later: write gap 12.8 s, 0 lost |
-| Primary frozen 40 s, fencing | - | takeover, write gap 22.4 s (detection 6.5 s, fence incl. 5 s priority delay 8.3 s, promote 5 s), 0 lost |
+| Primary frozen 40 s, fencing | - | takeover, write gap 20.3 s (detection 6.9 s, fence incl. 5 s priority delay 8.6 s, promote 1.4 s), 0 lost |
 | Both rings down, fencing | - | primary fences the standby first, write gap 3.2 s, 0 lost |
 | Primary with only the permanent score (state after the upgrade), 5 runs | dmkif: demoted in 2 of 4 upgrades | permanent value removed after the transient one, no scheduler action |
 | Standby streaming from the VIP | - | moved to the node by the next monitor within 3 s |
-| Switchover (`crm node standby <primary>`) with VIP discovery | dmkif: 69-77 s | 20 s, 0 lost |
+| Switchover (`crm node standby <primary>`) with VIP discovery | dmkif: 69-77 s | 20 s (write gap 15.8 s), 0 lost |
 | Unit tests (`test-promotion-data-state.sh`, `test-cold-start-eligible.sh`, `test-safe-sync-names.sh`) | - | all pass |
 | `test-pgtwin-ha-suite.sh` | - | 12/12 (dual rings, power fencing) |

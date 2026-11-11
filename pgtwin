@@ -639,8 +639,35 @@ fencing_enabled() {
     return 0
 }
 
+# True if the cluster has recorded the peer as offline and clean: with fencing
+# fenced (confirmed) or stopped in an orderly way, not just lost; its PostgreSQL
+# is not running then. Only meaningful with fencing: without it Pacemaker
+# treats a lost node as clean on blind faith.
+peer_offline_clean() {
+    local peer="$1" xml online unclean pending
+    [ -n "$peer" ] || return 1
+    xml=$(crm_mon --as-xml 2>/dev/null)
+    online=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
+    unclean=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@unclean)" - 2>/dev/null)
+    pending=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@pending)" - 2>/dev/null)
+    [ "$online" = "false" ] && [ "$unclean" = "false" ] && [ "$pending" != "true" ]
+}
+
+# True if the peer is a cluster member and no instance of this resource runs
+# on it: the stop was carried out and confirmed there.
+peer_member_instance_stopped() {
+    local peer="$1" xml online prim
+    [ -n "$peer" ] || return 1
+    prim="${OCF_RESOURCE_INSTANCE%%:*}"
+    xml=$(crm_mon --as-xml 2>/dev/null) || return 1
+    online=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
+    [ "$online" = "true" ] || return 1
+    # running (or failed/unknown) instances list their node; stopped ones do not
+    [ -z "$(echo "$xml" | xmllint --xpath "//resources//resource[@id='${prim}']/node[@name='${peer}']/@name" - 2>/dev/null)" ]
+}
+
 monitor_may_relax_sync() {
-    local peer xml online unclean pending probe
+    local peer xml online probe
     peer=$(get_peer_node_name)
     [ -n "$peer" ] || return 1
     xml=$(crm_mon --as-xml 2>/dev/null)
@@ -655,9 +682,7 @@ monitor_may_relax_sync() {
         # fallback if it did not (failed, or ran while the walsender of the
         # fenced standby was still listed): the cluster has recorded the peer
         # as offline and clean, i.e. fenced or stopped, not just lost.
-        unclean=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@unclean)" - 2>/dev/null)
-        pending=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@pending)" - 2>/dev/null)
-        if [ "$unclean" = "false" ] && [ "$pending" != "true" ]; then
+        if peer_offline_clean "$peer"; then
             ocf_log info "Monitor: peer ${peer} is offline and clean in the cluster (fenced or stopped), relaxing"
             return 0
         fi
@@ -3586,6 +3611,27 @@ check_promotion_safety() {
     # Check if we're in sync mode
     if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         ocf_log info "Promotion safety check: rep_mode=sync - checking synchronous replication state"
+
+        # The check asks the old primary. With fencing, if the cluster has
+        # recorded it as offline and clean (fenced or stopped), there is nobody
+        # to ask: the discovery would only run into its connect timeouts (VIP
+        # and node, 2 s each) and then fail open. Not without fencing: there a
+        # lost node counts as clean on blind faith while its primary may still
+        # run (partition), and this check is what keeps a standby that is not
+        # in sync from being promoted.
+        # Likewise when the peer is a member and Pacemaker reports no instance
+        # running there (its stop was confirmed, e.g. switchover by node
+        # standby) - valid with or without fencing.
+        local safety_peer
+        safety_peer=$(get_peer_node_name)
+        if fencing_enabled && peer_offline_clean "$safety_peer"; then
+            ocf_log info "Promotion safety check: the former primary ${safety_peer} is offline and clean in the cluster (fenced or stopped), nothing to check"
+            return 0
+        fi
+        if peer_member_instance_stopped "$safety_peer"; then
+            ocf_log info "Promotion safety check: no instance runs on ${safety_peer} (stop confirmed by the cluster), nothing to check"
+            return 0
+        fi
 
         # Discover current primary to query sync state
         local primary_host=$(discover_promoted_node)
