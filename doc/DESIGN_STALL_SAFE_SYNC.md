@@ -169,7 +169,8 @@ A' = the old primary after the stall, B' = the standby that was promoted in the 
 | # | Change | Where |
 |---|---|---|
 | 1 | The primary monitor only **tightens** `synchronous_standby_names`, it never relaxes it. Relaxing happens in actions Pacemaker schedules after the cluster state is reconciled: **promote** and the **post-stop notification** of the standby | `pgsql_monitor`, `update_application_name_in_config promote` |
-| 1a | Exception without fencing: Pacemaker marks a lost node offline and its instance stopped *without a stop action*, so no notification arrives. The monitor may relax when the peer is offline in the CIB **and** its PostgreSQL does not answer. A peer that answers is never a reason to relax | `monitor_may_relax_sync()` |
+| 1a | Exception without fencing: Pacemaker marks a lost node offline and its instance stopped *without a stop action*, so no notification arrives. The monitor may relax when the peer is offline in the CIB **and** its PostgreSQL has been unreachable (no connection at all) for `PEER_GONE_WINDOW` = 6 s over at least two probes (1.8.1; 1.8.0 relaxed on a single failed probe, see 8.5). A peer that answers, or whose server reports an error, is never a reason to relax | `monitor_may_relax_sync()`, `peer_probe()` |
+| 1c | With fencing (1.8.1): the post-stop notification Pacemaker sends after the confirmed fence ends the walsender of the stopped peer and relaxes (1.8.0 required an empty `pg_stat_replication`, which the walsender of a fenced standby prevents until `wal_sender_timeout`). Fallback in the monitor: the cluster has recorded the peer as offline **and clean** (fenced or stopped, not just lost). No relax on raw fence events | `pgsql_notify post-stop`, `monitor_may_relax_sync()` |
 | 1b | The **start** path may only tighten (a primary restarted by Pacemaker after a stall relaxed here before) | `update_application_name_in_config start` |
 | 2 | **Relative promotion score**, transient attribute: base 10 (the floor of #13, so every steady-state score and the stickiness arithmetic are unchanged); right after a promotion the peer's last known score + 10000; back to 10 once a standby is in sync (rep_mode=async: streaming) and the peer is at the base; demote and standby start drop to the base at once. A primary without an in-sync standby keeps its value and never raises it, so a stale primary cannot outgrow the promoted one. Of two primaries after a stall or partition the one promoted last wins the scheduler's demote decision by a margin that no location (50), connectivity (200) or stickiness difference reaches, whichever node is DC. The permanent attribute of earlier versions is removed (it lives in the CIB configuration, where the copy that wins the CIB merge overwrites the other side's value) | `set_promotion_eligibility()` |
 | 3 | **Step down (rule 2)**: a primary that finds the peer as primary on a newer timeline marks itself ineligible, stops PostgreSQL (terminates waiting commits without acknowledging them) and returns `OCF_FAILED_PROMOTED`; Pacemaker restarts it as standby | `stale_primary_check()` in the primary monitor |
@@ -212,8 +213,9 @@ acknowledged id checked on the final primary.
 
 ### 8.4 Open points
 
-- **Writes block while the standby is being fenced** (63 s with the default fencing delays). Before, the primary
-  relaxed as soon as its walsender gave up (~30 s). Tuning the fencing delays shortens both.
+- **Writes block while the standby is being fenced**: detection plus fence time (SBD with the `crm cluster init`
+  delays: 63 s; power fencing with token 3000: 13 s, see 8.5). In 1.8.0 the block could be unbounded (8.5,
+  finding B).
 - **A standby that runs but does not stream** (authentication, slot, rewind trouble): the monitor no longer
   relaxes, writes block until the standby's own recovery stops its instance. Before, the primary relaxed within
   one monitor interval. Option: relax when the condition persists longer than the promote timeout (a reachable
@@ -221,7 +223,43 @@ acknowledged id checked on the final primary.
 - **Full partition**: by design two independent regions; on healing the newer timeline wins (score and rule 2),
   the other side's writes of the partition are discarded by pg_rewind. Both sides promoted from standby during
   the partition (same timeline number, different data) needs an operator.
-- Unrelated finding during the tests: a standby that crashed seconds after a timeline switch could not reach a
-  consistent state (`invalid record length` at the end of the old timeline's segment, walreceiver restarted
-  in a loop) and failed every start; the #15 fallback only recognises "already been removed". Kept as
-  `data.torn-wal-case` on pg2 for analysis.
+- Found during the tests and fixed in 1.8.1: a standby that crashed seconds after a timeline switch could not
+  reach a consistent state and failed every start. Cause: a false timeline divergence on the standby start led to
+  `pg_rewind`, whose single-user crash recovery ended the standby's recovery on the primary's timeline (see
+  CHANGELOG 1.8.1).
+- After the resume a stalled primary holds the VIP until it is reset or demoted. Clients whose ARP cache still
+  points to it wait (seen for 40 s by dmkif) although the new primary serves; nothing is acknowledged there.
+
+### 8.5 Findings from dmkif's test run and changes in 1.8.1
+
+dmkif ran the full matrix on 1.8.0 in two labs (SBD; dual knet rings without fencing). Four findings, all
+reproduced or traced in the code:
+
+| | Finding | Cause | 1.8.1 |
+|---|---|---|---|
+| A | Both rings down, no fencing: 4 acknowledged commits lost | rule 1a relaxed on one failed probe while the peer was in the middle of its promotion | probe classified (answers / server error / unreachable), relax only after 6 s unreachable over two probes, one probe per monitor run |
+| B | SBD, standby frozen: writes blocked 199 s (until it came back; unbounded if it never does) | post-stop required an empty `pg_stat_replication`; the fenced standby's walsender stays listed until `wal_sender_timeout`, and nothing relaxed afterwards | rule 1c |
+| C | Upgrade from 1.7.13: primary demoted, 93 s without primary | permanent score deleted before the transient one was in the CIB | transient first, permanent removed once the transient value is visible |
+| D | Every switchover 60 s slower | since 1.8.0 discovery via the VIP succeeds and the standby streamed from the VIP; at the demote the VIP goes first, the connection hangs, the old primary's shutdown waits for its walsender | discovery returns the node behind the VIP (same `pg_postmaster_start_time()`); standbys on the VIP are moved to the node by the monitor |
+
+Found on the way: the promotion safety check queried the primary as the postgres role without a password, and the
+replication user without `pg_read_all_stats` cannot see `sync_state`. In setups following QUICKSTART the check
+therefore blocked every promotion while the old primary still answered (only partitions are affected; a dead
+primary fails open). Fixed (replication user, QUICKSTART grant, explicit log message).
+
+Lab (two KVM nodes, two knet rings, `fence_virsh` power fencing via the hypervisor, token 3000 ms, no SBD; writer
+over the VIP from the surviving node, every acknowledged id checked on the final primary):
+
+| Scenario | Result |
+|---|---|
+| Standby frozen, fencing (B) | fenced 4 s after the loss, relaxed 2 s later: writes blocked 12.8 s (1.8.0: until the standby returns), 0 lost |
+| Primary frozen 40 s, fencing | membership lost 6.5 s, fence incl. `priority-fencing-delay` 8.3 s, promote 5 s: write gap 22.4 s, 0 lost |
+| Both rings down, fencing | primary fences the standby first (priority delay), relaxed right after: write gap 3.2 s, 0 lost |
+| Both rings down, no fencing (A) | peer promotes, primary never relaxes, steps down 1 s later (rule 2), 0 lost; with the primary's probes blocked for 5 s during the peer's promotion (the race of finding A): "unreachable, waiting", then rule 2, 0 lost |
+| Standby powered off, no fencing | relaxed after 6 s unreachable: write gap 18.6 s (cost of the window), 0 lost |
+| Upgrade state (only the permanent score) on the primary, 5 runs (C) | permanent removed after the transient value, no scheduler action |
+| Standby streaming from the VIP (D) | moved to the node by the next monitor; switchover 20 s (dmkif 1.8.0: 69-77 s), 0 lost |
+| `test-pgtwin-ha-suite.sh` | 12/12 |
+
+Open: about 3 s pass between `pg_ctl promote` and the startup process logging "received promote request" after a
+fenced primary (to be analysed).

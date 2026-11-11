@@ -1,8 +1,8 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.8.0
-# Release Date: 2026-11-10
+# Version: 1.8.1
+# Release Date: 2026-11-11
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
 #               physical replication, slot management, pg_rewind support,
@@ -141,7 +141,7 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.8.0">
+<resource-agent name="pgtwin" version="1.8.1">
 <version>1.6.9</version>
 
 <longdesc lang="en">
@@ -527,10 +527,12 @@ get_application_name() {
 # confirms - nothing is acknowledged - as long as A' does not relax
 # synchronous_standby_names by itself. Relaxing therefore happens only in
 # actions Pacemaker schedules after the cluster state is reconciled (promote,
-# post-stop notification of the standby), and in the monitor only when the
-# peer is a current cluster member and answers as a standby (a standby that
-# runs but does not stream). A' steps down when it finds B' as primary on a
-# newer timeline; B' survives because its timeline went on.
+# post-stop notification of the standby, sent after a confirmed fence), and in
+# the monitor only on the cluster's recorded decision (peer offline and clean,
+# with fencing) or, without fencing, when the peer is offline and its
+# PostgreSQL has been unreachable for PEER_GONE_WINDOW seconds. A' steps down
+# when it finds B' as primary on a newer timeline; B' survives because its
+# timeline went on.
 # ---------------------------------------------------------------------------
 
 # Name of the other configured cluster node (also when it is offline)
@@ -544,21 +546,91 @@ get_peer_node_name() {
 # Ask the peer's PostgreSQL whether it is in recovery: prints t (standby),
 # f (primary) or nothing (does not answer).
 peer_recovery_state() {
-    local peer="$1" peer_host rep_user opts=""
+    local r
+    r=$(peer_probe "$1")
+    case "$r" in t|f) echo "$r" ;; esac
+}
+
+# Probe the peer's PostgreSQL and classify the result:
+#   t / f          it answers, in recovery / primary
+#   unreachable    no connection at all (refused, timeout, no route): the
+#                  only result that can count as "the peer is gone"
+#   error: <text>  anything else, e.g. an authentication or startup error. The
+#                  server (or at least its host) is alive, so this is never
+#                  proof that the peer is gone.
+peer_probe() {
+    local peer="$1" peer_host rep_user opts="" out err rc errf cache r
+    # One probe per agent run: rule 2 and rule 1a both ask within the same
+    # monitor, and against a dead host every probe costs the connect timeout
+    # ($$ is the agent's PID also inside command substitutions)
+    cache="${HA_RSCTMP:-/tmp}/pgtwin-probe.$$.${peer}"
+    if [ -f "$cache" ]; then
+        cat "$cache"
+        return 0
+    fi
+    r=$(peer_probe_once "$peer")
+    echo "$r" > "$cache" 2>/dev/null
+    echo "$r"
+}
+
+peer_probe_once() {
+    local peer="$1" peer_host rep_user opts="" out err rc errf
     peer_host=$(resolve_cluster_node_to_hostname "$peer")
     rep_user=$(get_replication_user 2>/dev/null)
     [ -n "$rep_user" ] && opts="-U ${rep_user} -d postgres"
-    run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null
+    errf=$(mktemp "${HA_RSCTMP:-/tmp}/pgtwin-probe.XXXXXX" 2>/dev/null) || errf=/dev/null
+    out=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>"$errf")
+    rc=$?
+    err=""
+    [ "$errf" != /dev/null ] && { err=$(tr '\n' ' ' < "$errf"); rm -f "$errf"; }
+    if [ $rc -eq 0 ]; then
+        case "$out" in t|f) echo "$out"; return 0 ;; esac
+    fi
+    case "$err" in
+        *"Connection refused"*|*"timeout expired"*|*"No route to host"*|*"Network is unreachable"*|*"Connection timed out"*)
+            echo "unreachable" ;;
+        *)
+            echo "error: ${err:-psql exit code ${rc}}" ;;
+    esac
 }
 
+# Rule 1a: how long the peer must be unreachable without a break before a
+# primary without fencing may relax (doc/DESIGN_STALL_SAFE_SYNC.md). A single
+# failed probe is no proof: the peer may be in the middle of its promotion.
+PEER_GONE_WINDOW=6
+# A marker not refreshed for this long belongs to an earlier incident
+PEER_GONE_STALE=20
+
+peer_gone_mark() { echo "$(dirname "${PGDATA}")/.pgtwin_peer_unreachable"; }
+
+# Records an unreachable probe; true once the peer has been unreachable for at
+# least PEER_GONE_WINDOW seconds over at least two probes
+peer_gone_long_enough() {
+    local mark first last count now
+    mark=$(peer_gone_mark)
+    now=$(date +%s)
+    if [ -f "$mark" ] && read -r first last count < "$mark" 2>/dev/null && \
+       [ -n "$count" ] && [ $(( now - last )) -le $PEER_GONE_STALE ]; then
+        count=$(( count + 1 ))
+    else
+        first=$now count=1
+    fi
+    echo "$first $now $count" > "$mark"
+    [ $count -ge 2 ] && [ $(( now - first )) -ge $PEER_GONE_WINDOW ]
+}
+
+peer_gone_reset() { rm -f "$(peer_gone_mark)"; }
+
 # May the primary monitor relax synchronous replication by itself? Only when the
-# standby is verifiably gone and Pacemaker will not tell us: without fencing a
-# lost node is marked offline and its instance stopped without a stop action,
-# so no post-stop notification arrives. The proof is that the peer is offline
-# in the CIB and its PostgreSQL does not answer. A peer that answers is never a
-# reason to relax: as primary rule 2 applies, as standby it may be about to be
-# promoted (this node stalled). With fencing the notification after the fence
-# relaxes instead.
+# standby is verifiably gone. Without fencing a lost node is marked offline and
+# its instance stopped without a stop action, so no post-stop notification
+# arrives. The proof is that the peer is offline in the CIB and its PostgreSQL
+# has not answered for PEER_GONE_WINDOW seconds (dmkif: a single failed probe
+# hit the peer in the middle of its promotion). A peer that answers, or whose
+# server reports an error, is never a reason to relax: as primary rule 2
+# applies, as standby it may be about to be promoted (this node stalled). With
+# fencing the notification after the fence relaxes; the monitor only follows
+# the cluster's recorded result (peer offline and clean).
 fencing_enabled() {
     local v
     v=$(crm_attribute -t crm_config -n fencing-enabled -G -q 2>/dev/null) || \
@@ -568,13 +640,47 @@ fencing_enabled() {
 }
 
 monitor_may_relax_sync() {
-    local peer online
-    fencing_enabled && return 1
+    local peer xml online unclean pending probe
     peer=$(get_peer_node_name)
     [ -n "$peer" ] || return 1
-    online=$(crm_mon --as-xml 2>/dev/null | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
-    [ "$online" = "false" ] || return 1
-    [ -z "$(peer_recovery_state "$peer")" ]
+    xml=$(crm_mon --as-xml 2>/dev/null)
+    online=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
+    if [ "$online" != "false" ]; then
+        peer_gone_reset
+        return 1
+    fi
+
+    if fencing_enabled; then
+        # The post-stop notification after the fence relaxes. This is the
+        # fallback if it did not (failed, or ran while the walsender of the
+        # fenced standby was still listed): the cluster has recorded the peer
+        # as offline and clean, i.e. fenced or stopped, not just lost.
+        unclean=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@unclean)" - 2>/dev/null)
+        pending=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@pending)" - 2>/dev/null)
+        if [ "$unclean" = "false" ] && [ "$pending" != "true" ]; then
+            ocf_log info "Monitor: peer ${peer} is offline and clean in the cluster (fenced or stopped), relaxing"
+            return 0
+        fi
+        return 1
+    fi
+
+    # No fencing: the peer must not answer at all, and not just once
+    probe=$(peer_probe "$peer")
+    case "$probe" in
+        unreachable)
+            if peer_gone_long_enough; then
+                ocf_log warn "Monitor: peer ${peer} offline in the cluster and its PostgreSQL unreachable for ${PEER_GONE_WINDOW}s or more, relaxing"
+                return 0
+            fi
+            ocf_log info "Monitor: peer ${peer} offline and unreachable, waiting ${PEER_GONE_WINDOW}s before relaxing"
+            return 1
+            ;;
+        *)
+            peer_gone_reset
+            ocf_log info "Monitor: peer ${peer} is offline in the cluster but its PostgreSQL answers (${probe}), not relaxing"
+            return 1
+            ;;
+    esac
 }
 
 # Rule 2: this primary is stale if the peer answers as primary on a higher
@@ -1380,7 +1486,11 @@ check_postgresql_config() {
     # 6. Check synchronous_standby_names
     local sync_standby_names=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SHOW synchronous_standby_names\"" 2>/dev/null)
 
-    if [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+    if [ "${OCF_RESKEY_rep_mode}" = "sync" ] && ! pgsql_is_promoted; then
+        # synchronous_standby_names has no effect on a standby; pgtwin sets it
+        # on promotion
+        ocf_log debug "synchronous_standby_names on a standby: not checked (set by pgtwin on promote)"
+    elif [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
         # Synchronous mode - should have standby configured
         if [ -z "$sync_standby_names" ] || [ "$sync_standby_names" = "" ]; then
             ocf_log warn "CONFIGURATION WARNING: synchronous_standby_names is EMPTY with rep_mode='sync'"
@@ -1653,6 +1763,25 @@ get_pg_config_value() {
     echo "$config_value"
 }
 
+# True if primary_conninfo of this standby connects to the VIP
+standby_conninfo_uses_vip() {
+    [ -n "${OCF_RESKEY_vip}" ] && [ -f "${PGDATA}/postgresql.auto.conf" ] || return 1
+    grep "^primary_conninfo" "${PGDATA}/postgresql.auto.conf" | grep -qE "host=${OCF_RESKEY_vip//./\\.}([ ']|$)"
+}
+
+# Point a running standby that streams from the VIP to the primary's node
+# address (PostgreSQL restarts the walreceiver on reload)
+standby_conninfo_off_vip() {
+    local node rep_user
+    standby_conninfo_uses_vip || return 0
+    node=$(discover_promoted_node 2>/dev/null)
+    rep_user=$(get_replication_user 2>/dev/null)
+    if [ -n "$node" ] && [ "$node" != "${OCF_RESKEY_vip}" ] && [ -n "$rep_user" ]; then
+        ocf_log info "Standby streams from the VIP ${OCF_RESKEY_vip}: switching primary_conninfo to the primary's node ${node}"
+        finalize_standby_config "$node" "$rep_user"
+    fi
+}
+
 discover_promoted_node() {
     # Discover which node is currently promoted (primary)
     # Try multiple methods in order of reliability
@@ -1673,16 +1802,29 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via VIP ${OCF_RESKEY_vip}"
 
         # Try to connect to VIP and check if it's promoted
-        local is_primary=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+        local vip_answer=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery(), pg_postmaster_start_time()\"" 2>/dev/null)
+        local is_primary="${vip_answer%%|*}" vip_started="${vip_answer#*|}"
 
         if [ "$is_primary" = "t" ]; then
-            # VIP responds and is primary. Use the VIP itself as the
-            # connectable identity instead of deriving one from
-            # inet_server_addr(): that value carries a CIDR suffix for
-            # Pacemaker-managed (/32) VIPs, e.g. "172.16.50.5/32", which
-            # broke the previous last-octet split_part() parsing.
-            promoted_node="${OCF_RESKEY_vip}"
+            # The VIP answers as primary. Return the node behind it, not the
+            # VIP: a standby streaming from the VIP loses its connection
+            # silently when the VIP moves away at a demote (no RST), and the
+            # old primary's shutdown then waits for its walsender until
+            # wal_sender_timeout (dmkif: every switchover took 60 s longer).
+            # The node is the peer whose postmaster has the same start time;
+            # if none matches (e.g. the VIP is on this node) keep the VIP.
+            local me=$(get_cluster_node_name) node node_started
+            for node in ${OCF_RESKEY_node_list}; do
+                [ "$node" = "$me" ] && continue
+                node_started=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT pg_postmaster_start_time() WHERE NOT pg_is_in_recovery()\"" 2>/dev/null)
+                if [ -n "$node_started" ] && [ "$node_started" = "$vip_started" ]; then
+                    ocf_log info "Discovered promoted node via VIP ${OCF_RESKEY_vip}: ${node}"
+                    echo "$node"
+                    return 0
+                fi
+            done
 
+            promoted_node="${OCF_RESKEY_vip}"
             ocf_log info "Discovered promoted node via VIP: ${promoted_node}"
             echo "$promoted_node"
             return 0
@@ -1802,12 +1944,13 @@ set_promotion_eligibility() {
     # Transient attribute (-l reboot): every node's own attrd owns and reports
     # its value, so after a partition or stall heals the value each node set for
     # itself counts - a permanent attribute lives in the CIB configuration, where
-    # the copy that wins the CIB merge overwrites the other side's value. Remove a
-    # permanent value left by earlier versions, it would shadow the transient one.
-    crm_attribute -N "$node_name" -n "$master_attr" -l forever -D >/dev/null 2>&1
-
+    # the copy that wins the CIB merge overwrites the other side's value. A
+    # permanent value left by earlier versions is removed afterwards
+    # (drop_permanent_promotion_score), never before the transient value is in
+    # the CIB: in between the node would have no promotion score at all.
     if [ "$mode" = "ineligible" ]; then
         crm_attribute -N "$node_name" -n "$master_attr" -l reboot -v -INFINITY >/dev/null 2>&1
+        drop_permanent_promotion_score "$node_name" "$master_attr" "-INFINITY"
     else
         # dmkif: explicit positive floor, not --delete. An unset
         # master-score falls back to Pacemaker's own implicit default for
@@ -1876,7 +2019,28 @@ set_promotion_eligibility() {
                 ;;
         esac
         crm_attribute -N "$node_name" -n "$master_attr" -l reboot -v "$score" >/dev/null 2>&1
+        drop_permanent_promotion_score "$node_name" "$master_attr" "$score"
     fi
+}
+
+# Remove a permanent promotion score written by versions before 1.8, but only
+# once the transient value is visible in the CIB (attrd writes it
+# asynchronously). Deleting first left a window without any score, in which
+# the scheduler demoted the primary (dmkif, upgrade from 1.7.13).
+drop_permanent_promotion_score() {
+    local node_name="$1" attr="$2" want="$3" i v
+    crm_attribute -N "$node_name" -n "$attr" -l forever -G -q >/dev/null 2>&1 || return 0
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        v=$(crm_attribute -N "$node_name" -n "$attr" -l reboot -G -q 2>/dev/null)
+        if [ "$v" = "$want" ]; then
+            crm_attribute -N "$node_name" -n "$attr" -l forever -D >/dev/null 2>&1
+            ocf_log info "Removed the permanent ${attr} of ${node_name} left by an earlier version (transient value ${want} in place)"
+            return 0
+        fi
+        sleep 0.5
+    done
+    ocf_log warn "Transient ${attr}=${want} of ${node_name} not visible in the CIB yet, keeping the permanent value for now"
+    return 1
 }
 
 # True only if the peer answers and is a standby itself. Then no primary exists
@@ -2026,8 +2190,11 @@ pgsql_monitor() {
 
                 # The monitor only tightens. Relaxing to async from here could run
                 # on a stale view right after this node stalled (its peer may
-                # already be primary): leave that to the post-stop notification,
-                # except for a standby that is a member and runs but does not stream.
+                # already be primary): leave that to the post-stop notification.
+                # Exceptions (monitor_may_relax_sync): with fencing the cluster
+                # recorded the peer as offline and clean; without fencing the
+                # peer is offline and its PostgreSQL unreachable for
+                # PEER_GONE_WINDOW seconds.
                 if [ -z "$safe_sync" ] && [ -n "$current_sync" ] && ! monitor_may_relax_sync; then
                     local mark="$(dirname "${PGDATA}")/.pgtwin_sync_kept"
                     if [ -z "$(find "$mark" -mmin -1 2>/dev/null)" ]; then
@@ -2092,6 +2259,10 @@ pgsql_monitor() {
 
             # Keep the slot ready for a promotion of this node
             prepare_standby_slot
+
+            # Standbys set up by 1.8.0 stream from the VIP: move them to the
+            # primary's node address (discover_promoted_node), see there
+            standby_conninfo_off_vip
 
             return $OCF_SUCCESS
         else
@@ -2169,6 +2340,19 @@ pgsql_monitor() {
                     # Trigger recovery (this will stop PostgreSQL, run pg_rewind/basebackup, and restart)
                     recover_standby "$primary_host" $rec_mode
                     local recovery_rc=$?
+
+                    # This standby could not stream. A pg_rewind that found
+                    # nothing to do changed nothing, and the next cycles would
+                    # repeat the same "recovery" forever (dmkif, TC15 on 1.8.0:
+                    # "record with incorrect prev-link" at the same LSN after
+                    # every start). Rebuild instead.
+                    if [ $recovery_rc -eq 0 ] && [ "$rec_mode" != "basebackup-only" ] && [ "${REWIND_NOOP:-0}" = "1" ]; then
+                        ocf_log warn "pg_rewind found nothing to rewind, but this standby cannot stream from ${primary_host}: rebuilding it with pg_basebackup"
+                        set_promotion_eligibility "ineligible"
+                        rec_mode="basebackup-only"
+                        recover_standby "$primary_host" basebackup-only
+                        recovery_rc=$?
+                    fi
 
                     if [ $recovery_rc -eq 0 ] && [ "$rec_mode" = "basebackup-only" ]; then
                         ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
@@ -2448,6 +2632,45 @@ get_pg_log_directory() {
     esac
 }
 
+# "Database cluster state" from pg_controldata ("in production", "shut down",
+# "in archive recovery", "shut down in recovery", ...). Empty if unreadable.
+local_cluster_state() {
+    run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null | \
+        sed -n 's/^Database cluster state: *//p'
+}
+
+# Timeline this data directory actually follows.
+# "Latest checkpoint's TimeLineID" is the timeline of the last checkpoint or,
+# on a standby, of the last restartpoint. A standby that has replayed a
+# timeline switch keeps the old value until its next restartpoint (up to
+# checkpoint_timeout). The start path took that for a divergence and ran
+# pg_rewind against a standby that had just crashed, which broke it (see
+# recover_standby). For a node in recovery the minimum recovery point's
+# timeline and the history files it received from its primary count as well;
+# a standby never writes WAL of its own, so it cannot have diverged from them.
+# A primary (or a crashed primary) keeps its checkpoint timeline.
+local_effective_timeline() {
+    local cd tli state min_tli h hex n
+    cd=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null)
+    tli=$(echo "$cd" | sed -n "s/^Latest checkpoint's TimeLineID: *//p")
+    case "$tli" in ''|*[!0-9]*) return 1 ;; esac
+    state=$(echo "$cd" | sed -n 's/^Database cluster state: *//p')
+    case "$state" in
+        "in archive recovery"|"shut down in recovery")
+            min_tli=$(echo "$cd" | sed -n "s/^Min recovery ending loc's timeline: *//p")
+            case "$min_tli" in ''|*[!0-9]*) ;; *) [ "$min_tli" -gt "$tli" ] && tli=$min_tli ;; esac
+            for h in "${PGDATA}"/pg_wal/*.history; do
+                [ -f "$h" ] || continue
+                hex=$(basename "$h" .history)
+                case "$hex" in [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]) ;; *) continue ;; esac
+                n=$((16#$hex))
+                [ "$n" -gt "$tli" ] && tli=$n
+            done
+            ;;
+    esac
+    echo "$tli"
+}
+
 # Remember size of every server log file before a start attempt, so that
 # standby_start_failed_for_missing_wal() can look at the lines written by
 # this attempt only (never at older ones).
@@ -2467,16 +2690,15 @@ snapshot_pg_logs() {
 # backup. Written for pgtwin 1.7.5 (standby start loop observed 2026-09-23
 # to 2026-10-10 on pg-b: pg_ctl start timed out every 5 minutes, the
 # fail-count was cleared by failure-timeout, and nothing ever escalated).
-standby_start_failed_for_missing_wal() {
+# Print the server log text written since snapshot_pg_logs() (all log files)
+# plus the postmaster's stderr log of this start attempt.
+new_pg_log_text() {
     local snap="$1" startlog="$2" logdir f old size
-    local pattern='requested WAL segment [0-9A-Fa-f]+ has already been removed'
     # stderr of the postmaster: the only log when logging_collector is off
     # (truncated before every attempt, so it holds this attempt only)
-    if [ -s "$startlog" ] && grep -Eq "$pattern" "$startlog"; then
-        return 0
-    fi
+    [ -s "$startlog" ] && cat "$startlog"
     logdir=$(get_pg_log_directory)
-    [ -n "$logdir" ] && [ -d "$logdir" ] || return 1
+    [ -n "$logdir" ] && [ -d "$logdir" ] || return 0
     for f in "$logdir"/*; do
         [ -f "$f" ] || continue
         old=$(awk -v f="$f" '{ if (substr($0, index($0, " ") + 1) == f) { print $1; exit } }' "$snap")
@@ -2486,11 +2708,27 @@ standby_start_failed_for_missing_wal() {
         elif [ "$size" -le "$old" ]; then
             continue                    # nothing new written
         fi
-        if tail -c +$((old + 1)) "$f" | grep -Eq "$pattern"; then
-            return 0
-        fi
+        tail -c +$((old + 1)) "$f"
     done
-    return 1
+}
+
+standby_start_failed_for_missing_wal() {
+    new_pg_log_text "$1" "$2" | \
+        grep -Eq 'requested WAL segment [0-9A-Fa-f]+ has already been removed'
+}
+
+# Returns 0 if recovery failed to read the WAL at one and the same LSN at least
+# three times since snapshot_pg_logs(): the walreceiver delivered the primary's
+# WAL again and again, and replay still could not continue at that point. The
+# local control file or WAL does not fit the primary's timeline (seen after a
+# standby crash: "record with incorrect prev-link", "invalid resource manager
+# ID", "invalid record length" at the position of a checkpoint the primary does
+# not have). Waiting never helps, pg_rewind sees nothing to do. A standby that
+# only waits at the end of its WAL logs such a line once, then moves on.
+standby_start_stuck_at_invalid_wal() {
+    new_pg_log_text "$1" "$2" | \
+        grep -Eo '(invalid record length|record with incorrect prev-link [0-9A-F]+/[0-9A-F]+|invalid resource manager ID [0-9]+|invalid magic number [0-9A-F]+ in WAL segment [0-9A-F]+, LSN|incorrect resource manager data checksum in record|contrecord is requested by|unexpected pageaddr [0-9A-F]+/[0-9A-F]+ in WAL segment [0-9A-F]+, LSN|invalid contrecord length [0-9]+ \(expected [0-9]+\)) at [0-9A-F]+/[0-9A-F]+' | \
+        sed -E 's/.* at ([0-9A-F]+\/[0-9A-F]+)$/\1/' | sort | uniq -c | awk '$1 >= 3 { found = 1 } END { exit !found }'
 }
 
 pgsql_start() {
@@ -2687,8 +2925,7 @@ pgsql_start() {
         # This helps admins detect timeline issues before PostgreSQL startup fails
         local local_timeline=""
         if command -v pg_controldata >/dev/null 2>&1; then
-            local_timeline=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null | \
-                grep "Latest checkpoint's TimeLineID:" | awk '{print $NF}')
+            local_timeline=$(local_effective_timeline)
         fi
 
         if [ -n "$local_timeline" ]; then
@@ -2808,7 +3045,8 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             # 2. Missing application_name
             # 3. Wrong passfile location
             if echo "$primary_conninfo" | grep -qE "host=\s|user=\s|host=$|user=$" || \
-               ! echo "$primary_conninfo" | grep -q "application_name="; then
+               ! echo "$primary_conninfo" | grep -q "application_name=" || \
+               standby_conninfo_uses_vip; then
                 ocf_log warn "Detected potentially incorrect standby configuration - attempting to fix"
 
                 # Try to discover primary node to fix configuration
@@ -2895,9 +3133,17 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
         # timeline check nor pg_rewind notice it when both nodes are on the
         # same timeline. Fall back to a full base backup instead of failing
         # forever.
-        if [ -f "${PGDATA}/standby.signal" ] && standby_start_failed_for_missing_wal "$log_snapshot" "$start_log"; then
+        local bb_reason=""
+        if [ -f "${PGDATA}/standby.signal" ]; then
+            if standby_start_failed_for_missing_wal "$log_snapshot" "$start_log"; then
+                bb_reason="WAL required for recovery has already been removed on the primary"
+            elif standby_start_stuck_at_invalid_wal "$log_snapshot" "$start_log"; then
+                bb_reason="recovery fails at the same WAL position on every retry (local WAL or control file do not match the primary's timeline)"
+            fi
+        fi
+        if [ -n "$bb_reason" ]; then
             rm -f "$log_snapshot"
-            ocf_log warn "Standby cannot start: WAL required for recovery has already been removed on the primary"
+            ocf_log warn "Standby cannot start: ${bb_reason}"
             ocf_log warn "Falling back to a full pg_basebackup"
             if pgsql_is_running; then
                 pgsql_stop
@@ -3355,12 +3601,17 @@ check_promotion_safety() {
         app_name="$APPLICATION_NAME"
         ocf_log info "Checking if application_name='${app_name}' is synchronized on primary ${primary_host}"
 
-        # Query primary: Is this standby in sync state?
-        local sync_state=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -Atc \"
-            SELECT sync_state
+        # Query primary: Is this standby in sync state? As the replication user
+        # on database "postgres", like the discovery queries: as the postgres
+        # role without a password the query failed and read as "not found"
+        local chk_user chk_opts=""
+        chk_user=$(get_replication_user 2>/dev/null)
+        [ -n "$chk_user" ] && chk_opts="-U ${chk_user} -d postgres"
+        local sync_state=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} ${chk_opts} -Atc \"
+            SELECT coalesce(sync_state, 'hidden')
             FROM pg_stat_replication
             WHERE application_name='${app_name}'
-                AND state='streaming'
+                AND (state='streaming' OR state IS NULL)
         \"" 2>/dev/null)
 
         if [ "$sync_state" = "sync" ]; then
@@ -3376,6 +3627,13 @@ check_promotion_safety() {
             ocf_log warn "❌ Promotion safety check FAILED: Node has sync_state='async' (not in synchronous replication)"
             ocf_log warn "This can happen during startup while standby is catching up"
             ocf_log warn "Blocking promotion until synchronous replication is established"
+            return 1
+        elif [ "$sync_state" = "hidden" ]; then
+            # Without pg_read_all_stats PostgreSQL hides state and sync_state of
+            # the walsender from the replication user
+            ocf_log warn "❌ Promotion safety check FAILED: the replication user ${chk_user} cannot read state/sync_state in pg_stat_replication on ${primary_host}"
+            ocf_log warn "Fix: GRANT pg_read_all_stats TO ${chk_user:-<replication user>}; (QUICKSTART.md 1.6)"
+            ocf_log warn "Blocking promotion while the primary is reachable"
             return 1
         elif [ -z "$sync_state" ]; then
             ocf_log warn "❌ Promotion safety check FAILED: Node not found in pg_stat_replication on primary"
@@ -3821,7 +4079,7 @@ finalize_standby_config() {
         # Reload configuration
         run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c 'SELECT pg_reload_conf()'" >/dev/null 2>&1
 
-        ocf_log info "Standby configuration updated via ALTER SYSTEM (requires PostgreSQL restart to take effect)"
+        ocf_log info "Standby configuration updated via ALTER SYSTEM and reloaded (the walreceiver reconnects with the new primary_conninfo)"
     else
         ocf_log info "PostgreSQL is stopped - directly updating postgresql.auto.conf (preferred method)"
 
@@ -3874,6 +4132,23 @@ recover_standby() {
         pgsql_stop
     fi
 
+    # A standby that crashed ("in archive recovery") must not go through
+    # pg_rewind. pg_rewind finishes the crash recovery of an uncleanly stopped
+    # target in single-user mode, which replays up to the minimum recovery point
+    # on its timeline and then ENDS recovery: it writes an end-of-recovery
+    # checkpoint at the end of the locally received WAL, on the primary's current
+    # timeline. If that WAL ended in a partially received record, the checkpoint
+    # overwrites a position where the primary has a different record. pg_rewind
+    # then finds both on the same timeline ("no rewind required"), and the
+    # standby fails forever with "record with incorrect prev-link" at that LSN
+    # (dmkif, TC15 on 1.8.0). A standby has written no WAL of its own, so there
+    # is nothing to rewind: rebuild it.
+    REWIND_NOOP=0
+    if [ "$mode" != "basebackup-only" ] && [ "$(local_cluster_state)" = "in archive recovery" ]; then
+        ocf_log warn "Data directory was not shut down cleanly while in recovery (crashed standby): pg_rewind would end its recovery and fork the timeline, rebuilding with pg_basebackup instead"
+        mode="basebackup-only"
+    fi
+
     # Try pg_rewind first (unless the caller knows it cannot help)
     if [ "$mode" = "basebackup-only" ]; then
         ocf_log info "Skipping pg_rewind, going straight to full basebackup"
@@ -3901,14 +4176,23 @@ recover_standby() {
             # supported by single-user servers"). After every crash of the old
             # primary pg_rewind therefore failed and a full basebackup ran instead.
             # Keep the signal files outside PGDATA while pg_rewind runs.
+            # Only for a crashed PRIMARY ("in production"): its crash recovery
+            # stays on its own timeline, which pg_rewind then rewinds. A crashed
+            # standby never gets here (see above).
             local signal_dir
             signal_dir=$(dirname "${PGDATA}")
             local sig moved_signals=""
-            for sig in standby.signal recovery.signal; do
-                if [ -f "${PGDATA}/${sig}" ]; then
-                    mv "${PGDATA}/${sig}" "${signal_dir}/.pgtwin_rewind_${sig}" && moved_signals="${moved_signals} ${sig}"
-                fi
-            done
+            local target_state
+            target_state=$(local_cluster_state)
+            case "$target_state" in
+                "in production"|"shutting down")
+                    for sig in standby.signal recovery.signal; do
+                        if [ -f "${PGDATA}/${sig}" ]; then
+                            mv "${PGDATA}/${sig}" "${signal_dir}/.pgtwin_rewind_${sig}" && moved_signals="${moved_signals} ${sig}"
+                        fi
+                    done
+                    ;;
+            esac
 
             # Run pg_rewind with proper environment variable passing
             ocf_log info "Executing pg_rewind to sync from ${primary_host}"
@@ -3932,7 +4216,12 @@ recover_standby() {
             done
 
             if [ $rc -eq 0 ]; then
-                ocf_log info "pg_rewind completed successfully"
+                if grep -q "no rewind required" /tmp/pg_rewind_$$.log 2>/dev/null; then
+                    REWIND_NOOP=1
+                    ocf_log info "pg_rewind completed successfully (no rewind required, data directory unchanged)"
+                else
+                    ocf_log info "pg_rewind completed successfully"
+                fi
                 rm -f /tmp/pg_rewind_$$.log
 
                 # Finalize standby configuration (creates standby.signal and postgresql.auto.conf)
@@ -4423,12 +4712,30 @@ pgsql_notify() {
             fi
             ;;
         post-stop)
-            # After a node stops, check if we need to disable sync replication
-            if pgsql_is_promoted; then
-                local active_standbys=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication\"" 2>/dev/null)
-
-                if [ "$active_standbys" = "0" ] && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
-                    disable_sync_replication
+            # After the standby stopped (or was fenced: Pacemaker sends this
+            # only after the fence is confirmed), relax synchronous replication.
+            # A walsender of a fenced or frozen standby stays listed in
+            # pg_stat_replication until wal_sender_timeout, so it is ended
+            # instead of being taken as a connected standby.
+            if pgsql_is_promoted && [ "${OCF_RESKEY_rep_mode}" = "sync" ]; then
+                local me stopped n peer_app="" remaining
+                me=$(get_cluster_node_name)
+                stopped="${OCF_RESKEY_CRM_meta_notify_stop_uname}"
+                for n in $stopped; do
+                    [ "$n" = "$me" ] && continue
+                    peer_app="${peer_app:+${peer_app},}'$(echo "${n%%.*}" | tr '-' '_')'"
+                done
+                if [ -z "$peer_app" ]; then
+                    ocf_log info "Post-stop notification: no peer instance stopped (${stopped:-none}), synchronous replication unchanged"
+                else
+                    run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_terminate_backend(pid) FROM pg_stat_replication WHERE application_name IN (${peer_app})\"" >/dev/null 2>&1
+                    remaining=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' AND application_name NOT IN (${peer_app})\"" 2>/dev/null)
+                    if [ "$remaining" = "0" ]; then
+                        ocf_log info "Post-stop notification: standby on ${stopped} stopped (confirmed by the cluster), its walsender ended"
+                        disable_sync_replication
+                    else
+                        ocf_log info "Post-stop notification: standby on ${stopped} stopped, but ${remaining:-unknown} other standby(s) still streaming, synchronous replication unchanged"
+                    fi
                 fi
             fi
             ;;
@@ -4533,6 +4840,9 @@ pgsql_validate() {
 
 #######################################################################
 # Main
+
+# Per-run peer probe cache (peer_probe)
+trap 'rm -f "${HA_RSCTMP:-/tmp}"/pgtwin-probe.$$.* 2>/dev/null' EXIT
 
 case "$__OCF_ACTION" in
 meta-data)	meta_data

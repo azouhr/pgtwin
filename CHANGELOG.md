@@ -1,4 +1,57 @@
-## [1.8.0] - 2026-11-10
+## [1.8.1] - 2026-11-11
+
+Release notes: `releasenotes/RELEASE_v1.8.1.md`.
+
+### Fixed
+- **A standby that crashed shortly after a timeline switch could be left unrecoverable** (regression in 1.8.0,
+  reported by dmkif with TC15, reproduced in the lab). After a switchover or a rejoin the standby's control file
+  keeps the old checkpoint timeline until its first restartpoint (up to `checkpoint_timeout`). When it crashed in
+  that window, the start path took the lag for a divergence and ran `pg_rewind`. Since 1.8.0 the signal files are
+  moved aside for `pg_rewind`, so its single-user crash recovery ended recovery: it wrote an end-of-recovery
+  checkpoint on the primary's current timeline at the end of the locally received WAL, at a position where the
+  primary has a different record. `pg_rewind` then reported "no rewind required", and the standby failed every
+  start or retry at that LSN (`record with incorrect prev-link`, `invalid resource manager ID`, `invalid record
+  length`) until fail-count INFINITY. Only a basebackup helped. Before 1.8.0 the same false divergence led to a
+  full basebackup.
+  - The standby start compares the timeline the standby follows (for a node in recovery: the newest of the
+    checkpoint timeline, the minimum recovery point's timeline and the history files) instead of the checkpoint
+    timeline. A crashed standby restarts as a standby without `pg_rewind`.
+  - `pg_rewind` is never run on a crashed standby (`in archive recovery`): it has no WAL of its own to rewind and
+    is rebuilt with `pg_basebackup` if a divergence is reported. The signal files are moved aside only for a
+    crashed primary.
+  - Standbys already in that state are repaired: when the monitor's recovery gets "no rewind required" for a
+    standby that cannot stream, it rebuilds with `pg_basebackup`; a standby start that fails at the same WAL
+    position three times falls back to `pg_basebackup` like the missing-WAL case.
+- **Acknowledged commits could be lost when both cluster rings failed without fencing** (1.8.0, dmkif, 4 ids in
+  one run). Rule 1a relaxed `synchronous_standby_names` after a single failed probe of the peer's PostgreSQL; the
+  peer was in the middle of its promotion. The probe result is now classified (answers / server error /
+  unreachable); the monitor relaxes only after the peer has been unreachable for 6 s over at least two probes, and
+  never when it answers or its server reports an error. The peer is probed once per monitor run.
+- **With fencing, writes stayed blocked after a standby was fenced until it came back** (1.8.0, dmkif: 199 s,
+  unbounded if the standby never returns). The post-stop notification only relaxed with an empty
+  `pg_stat_replication`, but the walsender of a fenced or frozen standby stays listed until `wal_sender_timeout`.
+  The notification now ends the walsender of the stopped peer and relaxes, and logs its decision. Fallback in the
+  monitor: the cluster has recorded the peer as offline and clean (fenced or stopped).
+- **Upgrade from 1.7.x could demote the primary** (1.8.0, dmkif: 2 of 4 upgrades, 93 s without primary). The
+  permanent promotion score of earlier versions was deleted before the transient one was in the CIB. Now the
+  transient value is set first and the permanent one is removed once the transient value is visible.
+- **Every switchover took `wal_sender_timeout` longer** (1.8.0, dmkif: 69-77 s). Since 1.8.0 discovery via the VIP
+  authenticates and succeeds, and the standby streamed from the VIP. At a demote the VIP is stopped first, the
+  standby's connection hangs without a reset, and the old primary's shutdown waits for its walsender. Discovery now
+  returns the node behind the VIP (matching `pg_postmaster_start_time()`), and the monitor moves a standby that
+  streams from the VIP to that node (reload, no restart).
+- **The promotion safety check blocked promotions while the old primary still answered** (e.g. cluster network
+  down): it queried the primary as the postgres role without a password, and without `pg_read_all_stats` the
+  replication user cannot read `sync_state`. It now queries as the replication user and names the missing grant.
+- The standby start no longer warns about an empty `synchronous_standby_names` (no effect on a standby, set by
+  pgtwin on promote).
+
+### Documentation
+- QUICKSTART: `GRANT pg_read_all_stats TO replicator`.
+- Downgrade to 1.7.x: set the permanent promotion score to 10 on every node first, then remove the transient one
+  (release notes 1.8.0 and 1.8.1; order corrected by dmkif).
+- `doc/DESIGN_STALL_SAFE_SYNC.md` section 8.5: findings and lab results with dual rings and power fencing.
+
 
 Includes the fixes of the unreleased 1.7.12 and 1.7.13 from `dmkif/pgtwin` (hyphenated node names in
 `synchronous_standby_names`, staying eligible for promotion when no primary exists). Release notes:

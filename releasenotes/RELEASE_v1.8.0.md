@@ -44,6 +44,13 @@ No acknowledged commit was lost in any of the tests.
   standby is offline and does not answer). With fencing, writes block until the standby is fenced; a standby that
   runs but does not stream keeps writes blocked until its own recovery stops it. See
   `doc/DESIGN_STALL_SAFE_SYNC.md` section 8.
+- **Downgrade to 1.7.x**: the transient value of 1.8 shadows the permanent `master-<rsc>` attribute until the node
+  reboots (also a bonus of 10000 or `-INFINITY`), and a 1.7.13 primary does not write the permanent value itself.
+  On every node, in this order: first `crm_attribute -N <node> -n master-<rsc> -l forever -v 10`, then
+  `crm_attribute -N <node> -n master-<rsc> -l reboot -D`. Deleting only the transient value leaves the primary
+  without a score and it is demoted (corrected after dmkif's rollback test).
+- **Upgrade to 1.8.1**: 1.8.0 can leave a standby that crashed shortly after a timeline switch unrecoverable (see
+  `RELEASE_v1.8.1.md`).
 
 ---
 

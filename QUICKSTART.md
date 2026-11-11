@@ -170,8 +170,13 @@ sudo -u postgres psql -c "SHOW restart_after_crash;"  # Must show 'off'
 sudo -u postgres psql << EOF
 CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
 GRANT pg_read_all_data TO replicator;
+GRANT pg_read_all_stats TO replicator;
 EOF
 ```
+
+`pg_read_all_stats` lets the standby read its own `sync_state` in `pg_stat_replication` on the primary. pgtwin
+checks it before a promotion while the primary still answers (for example when only the cluster network is
+interrupted); without it PostgreSQL hides the column and the promotion is blocked.
 
 ### 1.6.1 Grant pg_rewind Permissions
 

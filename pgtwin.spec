@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.8.0
+Version:        1.8.1
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later
@@ -88,6 +88,18 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
+* Wed Nov 11 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.1-1
+- Release v1.8.1: a crashed standby could be left unrecoverable (regression in 1.8.0)
+- Start path uses the timeline a standby follows, no false divergence after a crash
+- Never run pg_rewind on a crashed standby, rebuild it with pg_basebackup
+- Repair standbys already in that state (monitor and start fall back to pg_basebackup)
+- No synchronous_standby_names warning on a standby
+- No fencing: relax only after the peer is unreachable for 6 s (acknowledged commits were lost)
+- Fencing: post-stop ends the fenced standby's walsender and relaxes (writes stayed blocked)
+- Upgrade: set the transient promotion score before removing the permanent one
+- Standby streams from the primary's node, not the VIP (switchover 60 s slower)
+- Promotion safety check queries as the replication user (needs pg_read_all_stats)
+
 * Tue Nov 10 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.0-1
 - Release v1.8.0: failover timing, recovery and promotion fixes
 - Bound all libpq connections (PGCONNECT_TIMEOUT), fix discovery authentication

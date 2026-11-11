@@ -493,6 +493,7 @@ sudo crm configure primitive postgres-db pgtwin \
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **1.8.1** | 2026-11-11 | Fixes from the 1.8.0 field tests: crashed standby after a timeline switch, no relax while the peer promotes, relax after a confirmed fence, upgrade score race, standby streams from the node instead of the VIP ([release notes](releasenotes/RELEASE_v1.8.1.md)) |
 | **1.8.0** | 2026-11-10 | Fast switchover (19-30 s), pg_rewind after crashes, standby-side slot, promotion and recovery fixes ([release notes](releasenotes/RELEASE_v1.8.0.md)) |
 | **1.7.x** | 2026-01 - 2026-10 | pgtwin-migrate, promotion by data state, WAL/slot fixes (see [CHANGELOG](CHANGELOG.md)) |
 | **1.6.x** | 2025-11 - 2025-12 | Container mode, automatic standby initialization, notify support |
