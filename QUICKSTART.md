@@ -1116,6 +1116,30 @@ cannot authenticate afterwards it is handled like any standby that cannot stream
 items above). To remove the parameter use `crm resource param postgres-db delete conn_require_auth` in the same
 procedure.
 
+### Quorum in a two-node cluster
+
+A real quorum is a majority of votes: at least three voters, preferably an odd number (with four, a 2/2 split
+leaves no side with a majority). Two nodes cannot have one: each half of a split holds exactly half of the votes.
+
+Corosync's `two_node: 1` (set by `crm cluster init`) therefore lowers the requirement to one vote, and a single
+node is reported as "quorate". That only means it may keep running services; it says nothing about whether the
+other node is dead or just cut off, and in a partition both halves report quorum. The one thing it adds is
+`wait_for_all`: after a start, a node counts itself quorate only once it has seen its peer. pgtwin sets
+`no-quorum-policy=ignore`, so that a node can still start when the other one is dead or under repair.
+
+A third vote (a QDevice, a third node) only helps if it sits in a third place that fails independently of both
+data centres; in a two data centre setup there is none. pgtwin is built for that setup and does not rely on
+quorum. Its protection is:
+
+- **fencing first**: as long as a fence device can reach the other node, it is stopped, and two primaries never
+  happen;
+- **never promote a node that may miss acknowledged commits**: the "not in sync" record (next section) and the
+  rule for a node that starts alone (below);
+- **when no fence device can confirm** (below): `fence_pgtwin` treats "no connection answers" as "this node is
+  alone". In a full partition both sides may then run as primary; when they meet, the node promoted last stays
+  primary. With `isolation_action=demote` the side that also lost its gateway acknowledges nothing and steps
+  down.
+
 ### A standby recorded as not in sync
 
 When the primary stops waiting for its standby (standby fenced, stopped, or gone without fencing) it first
@@ -1143,7 +1167,7 @@ other node has and this one lacks (it is rewound or rebuilt when it rejoins).
 | `<node>` is alone and was not primary/async ("This node is alone ...") | `crm_attribute -N <node> -n pgtwin-promote-alone-postgres-db -l reboot -v true` |
 | Both nodes up, no primary, the other node has newer data ("Cold start: <other> has the newer data state") | `crm node standby <other>`: the other node stops, `<node>` is promoted; `crm node online <other>` afterwards, it is rewound to `<node>` |
 | A fence is not confirmed (no fence device reaches the other node) | only if the other node is really down: `stonith_admin --confirm <other>` |
-| Both nodes ran as primary after a full partition | before the partition heals, stop the side to discard (`crm cluster stop` there); after the heal the node promoted last stays primary automatically |
+| Both nodes ran as primary after a full partition | before the partition heals, stop the side to discard (`crm cluster stop` there) and start it again only after the heal (started while still cut off, it would be promoted alone again); it is rewound and its commits since the partition are lost. Without this, after the heal the node promoted last stays primary automatically |
 | Alone without gateway (`isolation_action=demote`, "Alone without gateway") | restore the gateway, or `crm resource param postgres-db set isolation_action none` |
 
 Check the data first: `sudo -u postgres pg_controldata /var/lib/pgsql/data | grep -E "TimeLineID|checkpoint location"`

@@ -1,3 +1,24 @@
+## [1.8.3] - 2026-11-12
+
+Release notes: `releasenotes/RELEASE_v1.8.3.md`.
+
+### Fixed
+- **The surviving primary of a full partition kept the other side's "not in sync" record.** While both nodes
+  ran as primary, the other side recorded this node before relaxing; when that record survived the CIB merge
+  (lab: the discarded side was stopped before the heal and rejoined later), it stayed on the node that remained
+  primary, because a node never removed its own record. A later cold start then had no candidate: the survivor
+  at -INFINITY because of the record, the other node because its data was older. A primary now removes the
+  record on itself once the peer streams from it as synchronous standby: the peer has been rewound or rebuilt,
+  the commits the record referred to exist nowhere any more. A stale primary still cannot drop a record the new
+  primary set for it (the new primary never streams from it).
+
+### Documentation
+- QUICKSTART "Choosing the primary by hand": after a full partition, start the stopped side again only after
+  the heal. Both full-partition overrides tested in the lab.
+- QUICKSTART "Quorum in a two-node cluster": what `two_node: 1` means (a single node is reported quorate, both
+  halves of a partition are), why `no-quorum-policy=ignore` is the default, and that pgtwin relies on fencing and
+  the data rules, not on quorum, because a two data centre setup has no independent third vote.
+
 ## [1.8.2] - 2026-11-12
 
 Release notes: `releasenotes/RELEASE_v1.8.2.md`.

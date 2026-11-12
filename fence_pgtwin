@@ -22,7 +22,7 @@
 #
 # Copyright: same license as pgtwin (GPL-2.0-or-later)
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 
 action="reboot"; target=""; delay=5; ping_count=5; ping_interval=2
 extra_addresses=""; gateway_attribute=""

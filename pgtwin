@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.8.2
+# Version: 1.8.3
 # Release Date: 2026-11-11
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
@@ -165,7 +165,7 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.8.2">
+<resource-agent name="pgtwin" version="1.8.3">
 <version>1.6.9</version>
 
 <longdesc lang="en">
@@ -664,12 +664,35 @@ mark_peer_unsynced() {
 # Primary monitor: remove the marker once the peer streams as synchronous
 # standby and has flushed everything written before (the LSN seen when it was
 # first found in sync; all commits acknowledged without it lie below).
+# Primary: remove the record on this node itself once the peer ($1 =
+# application_name) streams from it as synchronous standby (see the caller).
+clear_own_unsynced_if_peer_follows() {
+    local app="$1" me since n
+    me=$(get_cluster_node_name)
+    since=$(node_unsynced_since "$me")
+    [ -n "$since" ] || return 0
+    n=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE application_name = '${app}' AND state = 'streaming' AND sync_state IN ('sync', 'quorum')\"" 2>/dev/null)
+    [ "$n" -gt 0 ] 2>/dev/null || return 0
+    crm_attribute -N "$me" -n "$(unsynced_attr)" -l forever -D >/dev/null 2>&1
+    ocf_log info "This primary carried $(unsynced_attr) (since ${since}, set by the peer while both were primary); the peer now follows it as synchronous standby, the record is void: removed"
+    return 0
+}
+
 clear_peer_unsynced_if_synced() {
     local peer app target_file target done_sql res i
     peer=$(get_peer_node_name)
     [ -n "$peer" ] || return 0
-    [ -n "$(node_unsynced_since "$peer")" ] || return 0
     app=$(echo "${peer%%.*}" | tr '-' '_')
+
+    # A record on THIS node, left by the peer while both were primary (full
+    # partition): it says this node may miss commits the peer acknowledged. Once
+    # the peer streams from this node as synchronous standby it has been rewound
+    # or rebuilt to this node's history, and those commits exist nowhere any
+    # more: the record is void. Kept, it made this primary ineligible in a later
+    # cold start or lone restart (lab 2026-11-12: no candidate at all).
+    clear_own_unsynced_if_peer_follows "$app"
+
+    [ -n "$(node_unsynced_since "$peer")" ] || return 0
     target_file="$(dirname "${PGDATA}")/.pgtwin_unsynced_target"
     if [ ! -s "$target_file" ]; then
         res=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_current_wal_lsn() FROM pg_stat_replication WHERE application_name = '${app}' AND state = 'streaming' AND sync_state IN ('sync', 'quorum') LIMIT 1\"" 2>/dev/null)

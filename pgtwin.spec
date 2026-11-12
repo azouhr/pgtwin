@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.8.2
+Version:        1.8.3
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later
@@ -91,6 +91,11 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
+* Thu Nov 12 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.3-1
+- Release v1.8.3: a primary removes the "not in sync" record on itself once the
+  peer follows it as synchronous standby (record left from a full partition made
+  the surviving primary ineligible in a later cold start)
+
 * Thu Nov 12 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.2-1
 - Release v1.8.2: sick standby is stopped, not tolerated; "not in sync" marker; conn_require_auth
 - A standby that runs but cannot stream fails its monitor after replication_failure_threshold;

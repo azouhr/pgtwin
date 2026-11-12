@@ -311,8 +311,12 @@ standby) that would be all of them.
    same monitor run. A primary that demotes cleanly also clears it when the peer streamed from it right before
    the stop and has received past its shutdown checkpoint: the walsender ships all WAL before the shutdown ends,
    so every commit lies below that checkpoint. Without this, a switchover seconds after a rejoin found the target
-   still recorded and the cluster ended without primary (HA suite, first 1.8.2 run). A node never clears its own
-   record: a stale primary (A') would otherwise drop the record B' set for it.
+   still recorded and the cluster ended without primary (HA suite, first 1.8.2 run). A node clears its own
+   record only as primary, once the peer streams from it as synchronous standby (1.8.3): the peer has then been
+   rewound or rebuilt to this node's history, and the commits the record refers to exist nowhere any more. After
+   a full partition with two primaries the survivor otherwise kept the record the other side set while both ran,
+   and a later cold start had no candidate at all (lab 2026-11-12). A stale primary (A') still cannot drop the
+   record B' set for it: B' never streams from A' as its synchronous standby, A' steps down and is rewound.
 
 The record is permanent so it survives a reboot of either node. Setting it too often is harmless (it is cleared
 seconds after the standby is back in sync); setting it too rarely would lose commits, hence "record first".
