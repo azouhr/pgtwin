@@ -908,7 +908,6 @@ Then load it with: `sudo crm configure load update pgsql-resource-config.crm`
 ### Set Cluster Properties
 
 ```bash
-# Disable STONITH (we're using quorum for split-brain prevention)
 # Fencing: keep it enabled and configure a fencing device (IPMI/BMC, hypervisor or SBD),
 # dual rings do not replace it (see the note at the top of this guide).
 # Test setups without any fencing device only:

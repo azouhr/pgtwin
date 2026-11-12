@@ -486,9 +486,10 @@ pgtwin_container_exec() {
         return 1
     fi
 
-    # Pass the libpq connect timeout set by pgtwin into the container
-    # (exec does not inherit the caller's environment)
-    $container_cmd exec ${PGCONNECT_TIMEOUT:+-e PGCONNECT_TIMEOUT="$PGCONNECT_TIMEOUT"} "$container_name" "$@"
+    # Pass the libpq connect timeout and, for remote connections, the
+    # required authentication (conn_require_auth) set by pgtwin into the
+    # container (exec does not inherit the caller's environment)
+    $container_cmd exec ${PGCONNECT_TIMEOUT:+-e PGCONNECT_TIMEOUT="$PGCONNECT_TIMEOUT"} ${PGREQUIREAUTH:+-e PGREQUIREAUTH="$PGREQUIREAUTH"} "$container_name" "$@"
     return $?
 }
 

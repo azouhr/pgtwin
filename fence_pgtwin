@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# fence_pgtwin - last fencing level for a pgtwin cluster: declares the peer
+# gone when no connection between the nodes answers any more.
+#
+# pgtwin cannot tell "the other node is dead" from "the other node is fully
+# partitioned". As long as any fence device can reach the other side, it must
+# be used (levels before this one). When none of them can confirm, this agent
+# states "this node is alone" if
+#   1. the target is not a member of this node's cluster partition,
+#   2. after the delay, every address of the target (its corosync ring
+#      addresses plus extra_addresses) fails ping_count consecutive pings,
+#   3. if gateway_attribute is set: this node's gateway attribute is above 0.
+# Otherwise it fails and the fence stays unconfirmed (operator: stonith_admin
+# --confirm). In a real full partition both sides may get here; with the
+# gateway check only a side that still reaches its gateway goes on.
+#
+# Use it ONLY as the last level of fencing_topology, after the real devices:
+#   fencing_topology pg1: fence-virsh fence-alone  pg2: fence-virsh fence-alone
+#
+# Arguments come on stdin (key=value, Pacemaker) or as --key=value options.
+#
+# Copyright: same license as pgtwin (GPL-2.0-or-later)
+
+VERSION="1.8.2"
+
+action="reboot"; target=""; delay=5; ping_count=5; ping_interval=2
+extra_addresses=""; gateway_attribute=""
+
+log() {
+    logger -t fence_pgtwin -p daemon."$1" -- "$2" 2>/dev/null
+    echo "fence_pgtwin: $2" >&2
+}
+
+set_arg() {
+    local k="$1" v="$2"
+    case "$k" in
+        action|option) action="$v" ;;
+        port|plug) target="$v" ;;
+        nodename) [ -n "$target" ] || target="$v" ;;
+        delay) delay="$v" ;;
+        ping_count) ping_count="$v" ;;
+        ping_interval) ping_interval="$v" ;;
+        extra_addresses) extra_addresses="$v" ;;
+        gateway_attribute) gateway_attribute="$v" ;;
+    esac
+}
+
+metadata() {
+cat <<EOF
+<?xml version="1.0" ?>
+<resource-agent name="fence_pgtwin" shortdesc="Last fencing level of a pgtwin cluster: the peer is gone when no connection answers">
+<longdesc>
+Use only as the LAST level of fencing_topology, after fence devices that can
+really stop the other node (hypervisor, BMC, power). When all of them fail,
+fence_pgtwin reports the target as fenced if it is not a member of this
+node's cluster partition, none of its addresses (corosync ring addresses plus
+extra_addresses) answers ping_count consecutive pings, and - with
+gateway_attribute set - this node still reaches its gateway. This cannot tell
+a dead node from a fully partitioned one: in a full partition both sides may
+be confirmed and both run as primary until they meet again (pgtwin then keeps
+the node promoted last; the other one is rewound and loses the commits it
+acknowledged in between). Any answering address makes it fail: the target is
+alive and the operator decides.
+</longdesc>
+<vendor-url>https://github.com/azouhr/pgtwin</vendor-url>
+<parameters>
+<parameter name="action" unique="0" required="0">
+  <getopt mixed="-o, --action=[action]" />
+  <content type="string" default="reboot" />
+  <shortdesc lang="en">Fencing action</shortdesc>
+</parameter>
+<parameter name="plug" unique="0" required="0">
+  <getopt mixed="-n, --plug=[node]" />
+  <content type="string" />
+  <shortdesc lang="en">Cluster node name of the target</shortdesc>
+</parameter>
+<parameter name="port" unique="0" required="0" deprecated="1">
+  <content type="string" />
+  <shortdesc lang="en">Cluster node name of the target (alias of plug)</shortdesc>
+</parameter>
+<parameter name="delay" unique="0" required="0">
+  <getopt mixed="--delay=[seconds]" />
+  <content type="integer" default="5" />
+  <shortdesc lang="en">Seconds to wait before checking (a late answer of the target still wins)</shortdesc>
+</parameter>
+<parameter name="ping_count" unique="0" required="0">
+  <getopt mixed="--ping-count=[n]" />
+  <content type="integer" default="5" />
+  <shortdesc lang="en">Consecutive pings per address that must all fail</shortdesc>
+</parameter>
+<parameter name="ping_interval" unique="0" required="0">
+  <getopt mixed="--ping-interval=[seconds]" />
+  <content type="integer" default="2" />
+  <shortdesc lang="en">Seconds between the pings</shortdesc>
+</parameter>
+<parameter name="extra_addresses" unique="0" required="0">
+  <getopt mixed="--extra-addresses=[node:addr,...]" />
+  <content type="string" default="" />
+  <shortdesc lang="en">Further addresses of the nodes (client or storage network), e.g. "pg1:10.0.0.1,pg2:10.0.0.2"</shortdesc>
+</parameter>
+<parameter name="gateway_attribute" unique="0" required="0">
+  <getopt mixed="--gateway-attribute=[name]" />
+  <content type="string" default="" />
+  <shortdesc lang="en">Node attribute of the ping resource (e.g. pingd); if set, confirm only while this node's value is above 0</shortdesc>
+</parameter>
+</parameters>
+<actions>
+  <action name="off" />
+  <action name="reboot" />
+  <action name="status" />
+  <action name="monitor" />
+  <action name="list" />
+  <action name="metadata" />
+  <action name="validate-all" />
+</actions>
+</resource-agent>
+EOF
+}
+
+# Addresses of node $1: corosync ring addresses plus extra_addresses
+node_addresses() {
+    local node="$1" idx
+    if command -v corosync-cmapctl >/dev/null 2>&1; then
+        idx=$(corosync-cmapctl -b nodelist.node 2>/dev/null | \
+              sed -n "s/^nodelist\.node\.\([0-9]*\)\.name (str) = ${node}\$/\1/p" | head -1)
+        [ -n "$idx" ] && corosync-cmapctl -b "nodelist.node.${idx}." 2>/dev/null | \
+            sed -n 's/^nodelist\.node\.[0-9]*\.ring[0-9]*_addr (str) = //p'
+    fi
+    echo "$extra_addresses" | tr ',' '\n' | sed -n "s/^ *${node}:\(.*\)\$/\1/p"
+}
+
+# True (0) if node $1 is a member of this node's cluster partition
+is_member() {
+    crm_node -l 2>/dev/null | awk -v n="$1" '$2 == n && $3 == "member" { f=1 } END { exit !f }'
+}
+
+# True (0) if any address answers at least one of $1 pings
+any_address_answers() {
+    local count="$1" addrs="$2" a pids="" rc=1 p
+    for a in $addrs; do
+        ping -n -q -c "$count" -i "$ping_interval" -W 1 "$a" >/dev/null 2>&1 &
+        pids="$pids $!"
+    done
+    for p in $pids; do wait "$p" && rc=0; done
+    return $rc
+}
+
+gateway_ok() {
+    local v
+    [ -n "$gateway_attribute" ] || return 0
+    v=$(crm_attribute -N "$(crm_node -n 2>/dev/null)" -n "$gateway_attribute" -l reboot -G -q 2>/dev/null)
+    case "$v" in ""|*[!0-9]*) return 1 ;; esac
+    [ "$v" -gt 0 ]
+}
+
+validate() {
+    local v
+    for v in "$delay" "$ping_count" "$ping_interval"; do
+        case "$v" in ""|*[!0-9]*) echo "delay, ping_count and ping_interval must be integers" >&2; return 1 ;; esac
+    done
+    [ "$ping_count" -ge 1 ] || { echo "ping_count must be at least 1" >&2; return 1; }
+    command -v ping >/dev/null 2>&1 || { echo "ping not found" >&2; return 1; }
+    command -v crm_node >/dev/null 2>&1 || { echo "crm_node not found" >&2; return 1; }
+    return 0
+}
+
+# --- arguments: stdin from Pacemaker, or command line options ---------------
+if [ $# -gt 0 ]; then
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -o) action="$2"; shift ;;
+            -n) target="$2"; shift ;;
+            --*=*) k="${1%%=*}"; k="${k#--}"; set_arg "$(echo "$k" | tr '-' '_')" "${1#*=}" ;;
+        esac
+        shift
+    done
+elif [ ! -t 0 ]; then
+    while IFS= read -r line; do
+        case "$line" in
+            ""|\#*) ;;
+            *=*) set_arg "${line%%=*}" "${line#*=}" ;;
+        esac
+    done
+fi
+
+case "$action" in
+    metadata) metadata; exit 0 ;;
+    validate-all) validate; exit $? ;;
+    monitor) validate >/dev/null 2>&1; exit $? ;;
+    list) crm_node -l 2>/dev/null | awk '{ print $2 }'; exit 0 ;;
+esac
+
+validate || exit 1
+[ -n "$target" ] || { log err "no target node given"; exit 1; }
+if [ "$target" = "$(crm_node -n 2>/dev/null)" ]; then
+    log err "refusing to declare this node itself gone ($target)"
+    exit 1
+fi
+
+addrs=$(node_addresses "$target" | sort -u | tr '\n' ' ')
+
+case "$action" in
+    status)
+        if is_member "$target"; then exit 0; fi
+        [ -n "$addrs" ] && any_address_answers 1 "$addrs" && exit 0
+        exit 2
+        ;;
+    off|reboot)
+        ;;
+    on)
+        log err "action on is not supported"; exit 1 ;;
+    *)
+        echo "unknown action: $action" >&2; exit 1 ;;
+esac
+
+if [ -z "$addrs" ]; then
+    log err "no addresses known for ${target} (corosync nodelist, extra_addresses): not confirming"
+    exit 1
+fi
+log warning "${action} ${target}: the other fence devices failed; checking whether ${target} is gone (delay ${delay}s, ${ping_count} pings to: ${addrs})"
+sleep "$delay"
+if is_member "$target"; then
+    log err "${target} is a member of this cluster partition again: not confirming"
+    exit 1
+fi
+if any_address_answers "$ping_count" "$addrs"; then
+    log err "${target} answers on at least one address: it is alive, not confirming (operator: stonith_admin --confirm ${target} once it is really down)"
+    exit 1
+fi
+if is_member "$target"; then
+    log err "${target} rejoined during the check: not confirming"
+    exit 1
+fi
+if ! gateway_ok; then
+    log err "${target} does not answer, but this node has lost its gateway (${gateway_attribute}): not confirming, this node is the one cut off"
+    exit 1
+fi
+log warning "${target} does not answer on any address and is not a cluster member: this node is alone, confirming ${action} of ${target}"
+exit 0

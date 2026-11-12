@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.8.1
+# Version: 1.8.2
 # Release Date: 2026-11-11
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
@@ -92,6 +92,10 @@ OCF_RESKEY_pgpassfile_default=""
 OCF_RESKEY_replication_failure_threshold_default="5"
 OCF_RESKEY_promotion_peer_wait_default="30"
 OCF_RESKEY_vip_default=""
+OCF_RESKEY_conn_require_auth_default=""
+OCF_RESKEY_isolation_action_default="none"
+OCF_RESKEY_gateway_attribute_default="pingd"
+OCF_RESKEY_isolation_threshold_default="3"
 OCF_RESKEY_container_mode_default="false"
 OCF_RESKEY_pg_major_version_default=""
 OCF_RESKEY_container_name_default="postgres-ha"
@@ -114,6 +118,10 @@ OCF_RESKEY_container_image_default="registry.opensuse.org/devel/bci/tumbleweed/c
 : ${OCF_RESKEY_replication_failure_threshold=${OCF_RESKEY_replication_failure_threshold_default}}
 : ${OCF_RESKEY_promotion_peer_wait=${OCF_RESKEY_promotion_peer_wait_default}}
 : ${OCF_RESKEY_vip=${OCF_RESKEY_vip_default}}
+: ${OCF_RESKEY_conn_require_auth=${OCF_RESKEY_conn_require_auth_default}}
+: ${OCF_RESKEY_isolation_action=${OCF_RESKEY_isolation_action_default}}
+: ${OCF_RESKEY_gateway_attribute=${OCF_RESKEY_gateway_attribute_default}}
+: ${OCF_RESKEY_isolation_threshold=${OCF_RESKEY_isolation_threshold_default}}
 : ${OCF_RESKEY_container_mode=${OCF_RESKEY_container_mode_default}}
 : ${OCF_RESKEY_pg_major_version=${OCF_RESKEY_pg_major_version_default}}
 : ${OCF_RESKEY_container_name=${OCF_RESKEY_container_name_default}}
@@ -135,13 +143,29 @@ POSTGRES="${OCF_RESKEY_pg_bindir}/postgres"
 : ${PGCONNECT_TIMEOUT:=5}
 export PGCONNECT_TIMEOUT
 
+# conn_require_auth: the authentication every connection of this agent to
+# another node must see (libpq require_auth, PostgreSQL 16+). Without it libpq
+# accepts a server that skips authentication, so whoever answers on a node's
+# address or the VIP could pose as primary or standby without credentials.
+# Only remote connections get it: local ones use the socket (peer, no
+# authentication exchange) and would fail. REMOTE_PGENV prefixes remote
+# psql/pg_basebackup/pg_rewind calls, REMOTE_CONNINFO is appended to
+# primary_conninfo and the pg_rewind source. The value is validated
+# (pgsql_validate) to libpq's method list syntax, so it needs no quoting.
+REMOTE_PGENV=""
+REMOTE_CONNINFO=""
+if [ -n "${OCF_RESKEY_conn_require_auth}" ]; then
+    REMOTE_PGENV="PGREQUIREAUTH=${OCF_RESKEY_conn_require_auth}"
+    REMOTE_CONNINFO=" require_auth=${OCF_RESKEY_conn_require_auth}"
+fi
+
 #######################################################################
 
 meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.8.1">
+<resource-agent name="pgtwin" version="1.8.2">
 <version>1.6.9</version>
 
 <longdesc lang="en">
@@ -314,17 +338,83 @@ If empty, defaults to ~postgres/.pgpass
 
 <parameter name="replication_failure_threshold" unique="0">
 <longdesc lang="en">
-Number of consecutive monitor cycles with failed/missing replication before
-automatically triggering recovery (pg_rewind or pg_basebackup).
+Number of consecutive standby monitor cycles without streaming replication
+after which the standby fails its instance while a primary is online. Pacemaker
+then stops it (and fences the node if the stop fails), the primary stops
+waiting for it on the stop notification, and the next start repairs it if it
+can (pg_rewind on a timeline divergence, pg_basebackup when WAL is missing). A
+standby that cannot be repaired (authentication, pg_hba) ends banned after
+migration-threshold failures.
 
-This prevents temporary network issues from triggering unnecessary recovery,
-while ensuring persistent replication failures (like timeline divergence) are
-automatically resolved.
+The threshold is the time a standby gets to set up, recover or catch up
+before it is stopped. With rep_mode=sync writes on the primary wait for that
+long: about (threshold + 1) x the Unpromoted monitor interval. Reads and the
+failover of a lost primary are not affected; short interruptions (a primary
+restart, a switchover) stay well below it.
 
-Default: 5 (approximately 40 seconds with default 8s monitor interval for standby)
+Default: 5 (about 60 s with a 10 s monitor interval)
 </longdesc>
 <shortdesc lang="en">Replication failure threshold</shortdesc>
 <content type="integer" default="${OCF_RESKEY_replication_failure_threshold_default}" />
+</parameter>
+
+<parameter name="conn_require_auth" unique="0" reloadable="1">
+<longdesc lang="en">
+Authentication method(s) that every connection of this agent to another node
+(discovery, probes, streaming replication, pg_rewind, pg_basebackup) requires
+from the server, as libpq's require_auth (PostgreSQL 16 or newer), for example
+"scram-sha-256".
+
+Empty (default): libpq accepts any server, including one that skips
+authentication. Convenient for test setups; in production anyone who answers on
+a node's address or the VIP could then pose as primary or standby without
+credentials. Set it before production (QUICKSTART, production checklist).
+Local connections over the socket are not affected. Can be changed without a
+restart (reload-agent): standbys switch their primary_conninfo with their next
+monitor.
+</longdesc>
+<shortdesc lang="en">Required server authentication (require_auth)</shortdesc>
+<content type="string" default="${OCF_RESKEY_conn_require_auth_default}" />
+</parameter>
+
+<parameter name="isolation_action" unique="0" reloadable="1">
+<longdesc lang="en">
+What a node does when it is alone (the peer is not a cluster member) and has
+also lost its gateway (the node attribute gateway_attribute is 0):
+
+none (default): nothing; the node keeps its role.
+demote: a primary sets its promotion score to -INFINITY after
+isolation_threshold monitor runs, and Pacemaker demotes it to standby; a
+standby is not a promotion candidate. Combine it with the gateway check of the
+fence_pgtwin fence agent (gateway_attribute there): a primary without gateway
+then never gets a fence confirmation, never stops waiting for its standby and
+acknowledges nothing while it is cut off.
+
+Needs a ping resource that sets the attribute (ocf:pacemaker:ping). For a setup
+in two data centres in which each side should go on after a partition, every
+side needs a gateway it reaches on its own (redundant gateway, QUICKSTART).
+</longdesc>
+<shortdesc lang="en">Action when alone without gateway (none, demote)</shortdesc>
+<content type="string" default="${OCF_RESKEY_isolation_action_default}" />
+</parameter>
+
+<parameter name="gateway_attribute" unique="0" reloadable="1">
+<longdesc lang="en">
+Node attribute with the gateway connectivity (set by ocf:pacemaker:ping,
+name= parameter there). 0 means the gateway is lost; a missing attribute is
+treated as unknown and never triggers isolation_action.
+</longdesc>
+<shortdesc lang="en">Gateway connectivity attribute</shortdesc>
+<content type="string" default="${OCF_RESKEY_gateway_attribute_default}" />
+</parameter>
+
+<parameter name="isolation_threshold" unique="0" reloadable="1">
+<longdesc lang="en">
+Consecutive primary monitor runs alone and without gateway before
+isolation_action=demote takes effect.
+</longdesc>
+<shortdesc lang="en">Monitor runs before the isolation action</shortdesc>
+<content type="integer" default="${OCF_RESKEY_isolation_threshold_default}" />
 </parameter>
 
 <parameter name="vip" unique="0">
@@ -479,6 +569,7 @@ Default: false
 <action name="notify"       timeout="90s" />
 <action name="meta-data"    timeout="5s" />
 <action name="validate-all" timeout="5s" />
+<action name="reload-agent" timeout="20s" />
 </actions>
 </resource-agent>
 END
@@ -536,6 +627,268 @@ get_application_name() {
 # ---------------------------------------------------------------------------
 
 # Name of the other configured cluster node (also when it is offline)
+# "Not in sync" marker (doc/DESIGN_STALL_SAFE_SYNC.md, section 9). Before a
+# primary with rep_mode=sync stops waiting for its standby it records in the
+# CIB that the peer may miss acknowledged commits. While the marker is set the
+# peer is never a promotion candidate (set_promotion_eligibility, promote
+# refuses), also not when no primary is left: promoting it would silently lose
+# those commits. Only a primary that sees the peer as its synchronous standby,
+# caught up past the point where waiting resumed, removes it. A permanent node
+# attribute: it must survive a reboot of either node.
+unsynced_attr() { echo "pgtwin-unsynced-${OCF_RESOURCE_INSTANCE%%:*}"; }
+
+node_unsynced_since() {
+    crm_attribute -N "$1" -n "$(unsynced_attr)" -l forever -G -q 2>/dev/null
+}
+
+# Set the marker on the peer and wait until it is in the CIB. Returns 1 if it
+# could not be written: the caller must then keep waiting for the standby.
+mark_peer_unsynced() {
+    local peer i
+    [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 0
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 0
+    [ -n "$(node_unsynced_since "$peer")" ] && return 0
+    crm_attribute -N "$peer" -n "$(unsynced_attr)" -l forever -v "$(date +%s)" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [ -n "$(node_unsynced_since "$peer")" ]; then
+            ocf_log warn "Marked ${peer} as not in sync ($(unsynced_attr)): it is no promotion candidate until it is a synchronous standby again"
+            return 0
+        fi
+        sleep 0.5
+    done
+    ocf_log err "Could not record ${peer} as not in sync in the CIB: keeping synchronous replication"
+    return 1
+}
+
+# Primary monitor: remove the marker once the peer streams as synchronous
+# standby and has flushed everything written before (the LSN seen when it was
+# first found in sync; all commits acknowledged without it lie below).
+clear_peer_unsynced_if_synced() {
+    local peer app target_file target done_sql res i
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 0
+    [ -n "$(node_unsynced_since "$peer")" ] || return 0
+    app=$(echo "${peer%%.*}" | tr '-' '_')
+    target_file="$(dirname "${PGDATA}")/.pgtwin_unsynced_target"
+    if [ ! -s "$target_file" ]; then
+        res=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT pg_current_wal_lsn() FROM pg_stat_replication WHERE application_name = '${app}' AND state = 'streaming' AND sync_state IN ('sync', 'quorum') LIMIT 1\"" 2>/dev/null)
+        case "$res" in
+            */*) echo "$res" > "$target_file" ;;
+            *) return 0 ;;
+        esac
+    fi
+    # A synchronous standby confirms every flush: usually done within the
+    # same run (a switchover right after a rejoin must find the record gone)
+    target=$(cat "$target_file")
+    for i in 1 2 3 4 5; do
+        done_sql="SELECT CASE WHEN count(*) = 0 THEN 'gone' WHEN bool_or(pg_wal_lsn_diff(flush_lsn, '${target}') >= 0) THEN 'done' ELSE 'wait' END FROM pg_stat_replication WHERE application_name = '${app}' AND state = 'streaming' AND sync_state IN ('sync', 'quorum')"
+        res=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"${done_sql}\"" 2>/dev/null)
+        case "$res" in
+            done)
+                crm_attribute -N "$peer" -n "$(unsynced_attr)" -l forever -D >/dev/null 2>&1
+                rm -f "$target_file"
+                ocf_log info "${peer} is in sync again (flushed past ${target}): removed $(unsynced_attr), it is a promotion candidate again"
+                return 0
+                ;;
+            gone) rm -f "$target_file"; return 0 ;;
+        esac
+        sleep 0.2
+    done
+    return 0
+}
+
+# Demote: after a clean stop the walsender has shipped all WAL up to the
+# shutdown checkpoint to a connected standby. If the peer streamed from this
+# node right before the stop and has received past that checkpoint, it has
+# every commit this node acknowledged: remove its record, so the promotion of
+# the switchover is not refused. $1: streaming before the stop (true/false)
+clear_peer_unsynced_after_clean_stop() {
+    local was_streaming="$1" peer peer_host rep_user cd ckpt ok
+    [ "$was_streaming" = "true" ] || return 0
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 0
+    [ -n "$(node_unsynced_since "$peer")" ] || return 0
+    cd=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null)
+    echo "$cd" | grep -qE '^Database cluster state: +shut down$' || return 0
+    ckpt=$(echo "$cd" | sed -n 's/^Latest checkpoint location: *//p')
+    case "$ckpt" in */*) ;; *) return 0 ;; esac
+    peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 0
+    rep_user=$(get_replication_user 2>/dev/null)
+    [ -n "$rep_user" ] || return 0
+    ok=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=3 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_is_in_recovery() AND pg_wal_lsn_diff(pg_last_wal_receive_lsn(), '${ckpt}') > 0\"" 2>/dev/null)
+    if [ "$ok" = "t" ]; then
+        crm_attribute -N "$peer" -n "$(unsynced_attr)" -l forever -D >/dev/null 2>&1
+        rm -f "$(dirname "${PGDATA}")/.pgtwin_unsynced_target"
+        ocf_log info "${peer} received all WAL up to this node's shutdown checkpoint ${ckpt}: removed $(unsynced_attr)"
+    fi
+    return 0
+}
+
+# Rebuild requested by the standby monitor before it failed the instance
+rebuild_request_file() { echo "$(dirname "${PGDATA}")/.pgtwin_rebuild_requested"; }
+
+# Start: replace this standby with a fresh pg_basebackup of the primary.
+# Returns the start's exit code.
+start_rebuild_standby() {
+    local reason="$1" bb_primary bb_rc
+    ocf_log warn "Standby cannot start: ${reason}"
+    ocf_log warn "Falling back to a full pg_basebackup"
+    if pgsql_is_running; then
+        pgsql_stop
+    fi
+    bb_primary=$(discover_promoted_node)
+    if [ -z "$bb_primary" ]; then
+        ocf_log err "Cannot rebuild standby: unable to discover primary node"
+        return $OCF_ERR_GENERIC
+    fi
+    set_promotion_eligibility "ineligible"
+    recover_standby "${bb_primary}" basebackup-only
+    bb_rc=$?
+    if [ $bb_rc -ne 0 ]; then
+        ocf_log err "Standby rebuild via pg_basebackup failed to start"
+        return $OCF_ERR_GENERIC
+    fi
+    ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
+    return $OCF_NOT_RUNNING
+}
+
+# --- Promotion of a node that is alone (rep_mode=sync) -----------------------
+# A node whose peer is not a cluster member cannot compare data states. It may be
+# promoted only if nobody can have written after it:
+#   - it was primary with the peer recorded as not in sync (primary/async): the
+#     peer was never a promotion candidate after that. Running primary: an empty
+#     synchronous_standby_names (start path). Demoted at a shutdown: alone_ok_file.
+#   - it has been a healthy, unrecorded standby of the peer while both were
+#     cluster members since this node booted (streamed_flag, in HA_RSCTMP and
+#     therefore gone after a reboot): an ordinary failover, the record rules apply.
+# Any other state (standby or primary/sync when it went down) is not eligible:
+# the peer may have been promoted later. Once the peer is a member again, the
+# data-state comparison decides. Operator override: alone_override_attr.
+alone_ok_file() { echo "$(dirname "${PGDATA}")/.pgtwin_last_primary_async"; }
+streamed_flag() { echo "${HA_RSCTMP:-/run/resource-agents}/pgtwin-${OCF_RESOURCE_INSTANCE%%:*}.streamed"; }
+alone_override_attr() { echo "pgtwin-promote-alone-${OCF_RESOURCE_INSTANCE%%:*}"; }
+
+# Standby monitor, replication healthy: remember that this node followed the
+# peer as a cluster member and was not recorded, and forget an older primary/async
+# state (this node now follows a primary, its own last writes are superseded).
+note_streamed_as_member() {
+    [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 0
+    [ -n "$(get_peer_member_name)" ] || return 0
+    [ -z "$(node_unsynced_since "$(get_cluster_node_name)")" ] || return 0
+    if [ ! -f "$(streamed_flag)" ]; then
+        mkdir -p "$(dirname "$(streamed_flag)")" 2>/dev/null
+        touch "$(streamed_flag)" 2>/dev/null
+    fi
+    rm -f "$(alone_ok_file)" 2>/dev/null
+}
+
+# True (0) if this node is alone and must not be promoted. Logs the reason (at
+# most every 5 minutes) when $1 = log.
+promotion_alone_blocked() {
+    local me ov mark
+    [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 1
+    [ -n "$(get_peer_member_name)" ] && return 1
+    [ -f "$(streamed_flag)" ] && return 1
+    [ -f "$(alone_ok_file)" ] && return 1
+    me=$(get_cluster_node_name)
+    ov=$(crm_attribute -N "$me" -n "$(alone_override_attr)" -l reboot -G -q 2>/dev/null)
+    case "$ov" in true|yes|1) return 1 ;; esac
+    if [ "$1" = "log" ]; then
+        mark="$(dirname "${PGDATA}")/.pgtwin_alone_logged"
+        if [ -z "$(find "$mark" -mmin -5 2>/dev/null)" ]; then
+            ocf_log warn "This node is alone (peer not a cluster member) and was not primary/async when it went down: not a promotion candidate, the peer may have newer data. It becomes one when the peer joins (data-state comparison) or by the operator: crm_attribute -N ${me} -n $(alone_override_attr) -l reboot -v true"
+            touch "$mark" 2>/dev/null
+        fi
+    fi
+    return 0
+}
+
+# --- Alone without gateway (isolation_action) ---------------------------------
+# True (0) if the gateway attribute of this node exists and is 0. A missing or
+# unreadable attribute is "unknown" and never counts as lost.
+gateway_lost() {
+    local v
+    v=$(crm_attribute -N "$(get_cluster_node_name)" -n "${OCF_RESKEY_gateway_attribute}" -l reboot -G -q 2>/dev/null)
+    [ "$v" = "0" ]
+}
+
+# True (0) if isolation_action=demote applies now: the peer is not a cluster
+# member and this node has lost its gateway.
+isolated_without_gateway() {
+    [ "${OCF_RESKEY_isolation_action}" = "demote" ] || return 1
+    [ -z "$(get_peer_member_name)" ] || return 1
+    gateway_lost
+}
+
+# Primary monitor: count the runs alone without gateway (HA_RSCTMP, gone after
+# a reboot). True (0) once isolation_threshold is reached: the caller sets the
+# promotion score to -INFINITY and Pacemaker demotes this node.
+primary_isolation_reached() {
+    local f n thr="${OCF_RESKEY_isolation_threshold}"
+    case "$thr" in ""|*[!0-9]*) thr=3 ;; esac
+    f="${HA_RSCTMP:-/run/resource-agents}/pgtwin-${OCF_RESOURCE_INSTANCE%%:*}.isolated"
+    if ! isolated_without_gateway; then
+        [ -f "$f" ] && ocf_log info "Isolation over (peer member or gateway back): keeping the primary role"
+        rm -f "$f" 2>/dev/null
+        return 1
+    fi
+    n=$(cat "$f" 2>/dev/null); case "$n" in ""|*[!0-9]*) n=0 ;; esac
+    n=$((n + 1))
+    mkdir -p "$(dirname "$f")" 2>/dev/null; echo "$n" > "$f" 2>/dev/null
+    if [ "$n" -ge "$thr" ]; then
+        ocf_log err "Alone without gateway (peer not a cluster member, ${OCF_RESKEY_gateway_attribute}=0) for ${n} monitor runs: giving up the primary role (isolation_action=demote)"
+        return 0
+    fi
+    ocf_log warn "Alone without gateway (peer not a cluster member, ${OCF_RESKEY_gateway_attribute}=0): ${n}/${thr} monitor runs before demoting (isolation_action=demote)"
+    return 1
+}
+
+# --- Cold start: rank the data states before Pacemaker picks a node ----------
+# Both nodes are standbys and no primary exists: compare timeline and WAL
+# position with the peer as soon as both answer, so that the scheduler promotes
+# the node with the newer data right away instead of promoting by location and
+# having promotion_data_state_guard refuse (a failed promote, dmkif T5). Newer:
+# score bonus above any location or ping preference; older: -INFINITY; equal:
+# normal score, the scheduler's choice (either node loses nothing). The guard at
+# promote time stays the safety net. Returns 1 if not applicable (no standby,
+# peer not a member, peer no standby, a state unreadable).
+cold_start_eligibility() {
+    local peer peer_host l p cmp
+    [ -f "${PGDATA}/standby.signal" ] || return 1
+    peer=$(get_peer_member_name); [ -n "$peer" ] || return 1
+    [ "$(peer_recovery_state "$peer")" = "t" ] || return 1
+    peer_host=$(resolve_cluster_node_to_hostname "$peer")
+    l=$(query_data_state "") || return 1
+    p=$(query_data_state "$peer_host") || return 1
+    cmp=$(data_state_compare "${l%% *}" "${l##* }" "${p%% *}" "${p##* }") || return 1
+    case "$cmp" in
+        newer)
+            ocf_log info "Cold start: this node has the newer data state (local ${l% *}/${l##* }, ${peer} ${p% *}/${p##* }): preferred for promotion"
+            set_promotion_eligibility "newer"
+            ;;
+        older)
+            ocf_log info "Cold start: ${peer} has the newer data state (local ${l% *}/${l##* }, ${peer} ${p% *}/${p##* }): not a promotion candidate"
+            set_promotion_eligibility "ineligible"
+            ;;
+        *)
+            set_promotion_eligibility "eligible"
+            ;;
+    esac
+    return 0
+}
+
+# True if the peer is an online cluster member running the Promoted instance
+peer_promoted_member() {
+    local peer prim xml
+    peer=$(get_peer_node_name)
+    [ -n "$peer" ] || return 1
+    prim="${OCF_RESOURCE_INSTANCE%%:*}"
+    xml=$(crm_mon --as-xml 2>/dev/null) || return 1
+    [ "$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)" = "true" ] || return 1
+    [ -n "$(echo "$xml" | xmllint --xpath "//resources//resource[@id='${prim}' and @role='Promoted']/node[@name='${peer}']/@name" - 2>/dev/null)" ]
+}
+
 get_peer_node_name() {
     local me
     me=$(get_cluster_node_name)
@@ -579,7 +932,7 @@ peer_probe_once() {
     rep_user=$(get_replication_user 2>/dev/null)
     [ -n "$rep_user" ] && opts="-U ${rep_user} -d postgres"
     errf=$(mktemp "${HA_RSCTMP:-/tmp}/pgtwin-probe.XXXXXX" 2>/dev/null) || errf=/dev/null
-    out=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>"$errf")
+    out=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=2 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>"$errf")
     rc=$?
     err=""
     [ "$errf" != /dev/null ] && { err=$(tr '\n' ' ' < "$errf"); rm -f "$errf"; }
@@ -686,6 +1039,14 @@ monitor_may_relax_sync() {
             ocf_log info "Monitor: peer ${peer} is offline and clean in the cluster (fenced or stopped), relaxing"
             return 0
         fi
+        return 1
+    fi
+
+    # Alone without gateway (isolation_action=demote): this node is the one cut
+    # off, keep waiting and acknowledge nothing
+    if [ "${OCF_RESKEY_isolation_action}" = "demote" ] && gateway_lost; then
+        peer_gone_reset
+        ocf_log warn "Monitor: peer ${peer} offline, but this node has lost its gateway (${OCF_RESKEY_gateway_attribute}=0): not relaxing (isolation_action=demote)"
         return 1
     fi
 
@@ -883,6 +1244,12 @@ update_application_name_in_config() {
 
             if [ "$caller" != "promote" ] && [ -z "$safe_sync" ] && [ -n "$current_sync" ]; then
                 ocf_log warn "Start: no standby streaming, keeping synchronous_standby_names='${current_sync}' (only promote or the standby's stop may relax it)"
+                safe_sync="$current_sync"
+            fi
+
+            # Asynchronous from here: record that the peer may miss acknowledged
+            # commits first; without that record keep waiting for it
+            if [ -z "$safe_sync" ] && ! mark_peer_unsynced; then
                 safe_sync="$current_sync"
             fi
 
@@ -1228,7 +1595,7 @@ check_disk_space_for_basebackup() {
         else
             # Fallback: try to get from primary
             ocf_log warn "Could not determine local disk usage, querying primary database size"
-            local db_size_bytes=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
+            local db_size_bytes=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
 
             if [ -n "$db_size_bytes" ] && [ "$db_size_bytes" -gt 0 ]; then
                 actual_disk_usage_mb=$((db_size_bytes / 1024 / 1024))
@@ -1244,7 +1611,7 @@ check_disk_space_for_basebackup() {
     else
         # PGDATA doesn't exist yet - use conservative estimate from primary
         ocf_log info "PGDATA does not exist, querying primary for size estimate"
-        local db_size_bytes=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
+        local db_size_bytes=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U $(get_replication_user) -d postgres -Atc \"SELECT pg_database_size('postgres')\"" 2>/dev/null)
 
         if [ -n "$db_size_bytes" ] && [ "$db_size_bytes" -gt 0 ]; then
             actual_disk_usage_mb=$((db_size_bytes / 1024 / 1024))
@@ -1807,6 +2174,73 @@ standby_conninfo_off_vip() {
     fi
 }
 
+# conn_require_auth: syntax of libpq's require_auth (comma-separated methods,
+# each optionally negated with "!")
+isolation_params_valid() {
+    case "${OCF_RESKEY_isolation_action}" in
+        none|demote) ;;
+        *) ocf_exit_reason "isolation_action must be none or demote (got '${OCF_RESKEY_isolation_action}')"; return 1 ;;
+    esac
+    case "${OCF_RESKEY_isolation_threshold}" in
+        ""|*[!0-9]*|0) ocf_exit_reason "isolation_threshold must be a positive integer"; return 1 ;;
+    esac
+    return 0
+}
+
+conn_require_auth_valid() {
+    [ -z "${OCF_RESKEY_conn_require_auth}" ] && return 0
+    echo "${OCF_RESKEY_conn_require_auth}" | grep -qE '^!?[a-z0-9-]+(,!?[a-z0-9-]+)*$' && return 0
+    ocf_exit_reason "Invalid conn_require_auth '${OCF_RESKEY_conn_require_auth}': expected libpq require_auth methods, e.g. scram-sha-256"
+    return 1
+}
+
+# require_auth needs libpq 16 or newer; a client that does not know it fails
+# every remote connection. Container images of the supported versions have it.
+conn_require_auth_supported() {
+    local ver major
+    [ -z "${OCF_RESKEY_conn_require_auth}" ] && return 0
+    [ "${OCF_RESKEY_container_mode}" = "true" ] && return 0
+    ver=$("${PSQL}" --version 2>/dev/null | awk '{print $NF}')
+    major=${ver%%.*}
+    case "$major" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+    if [ "$major" -lt 16 ]; then
+        ocf_exit_reason "conn_require_auth needs psql/libpq 16 or newer, found ${ver}"
+        return 1
+    fi
+    return 0
+}
+
+# True if primary_conninfo of this standby does not carry the require_auth of
+# conn_require_auth (parameter set, changed or removed since it was written)
+standby_conninfo_auth_outdated() {
+    local conninfo
+    [ -f "${PGDATA}/postgresql.auto.conf" ] || return 1
+    conninfo=$(grep "^primary_conninfo" "${PGDATA}/postgresql.auto.conf")
+    [ -n "$conninfo" ] || return 1
+    if [ -n "${OCF_RESKEY_conn_require_auth}" ]; then
+        echo "$conninfo" | grep -qF "require_auth=${OCF_RESKEY_conn_require_auth}'" && return 1
+        echo "$conninfo" | grep -qF "require_auth=${OCF_RESKEY_conn_require_auth} " && return 1
+        return 0
+    fi
+    echo "$conninfo" | grep -q "require_auth=" && return 0
+    return 1
+}
+
+# Rewrite primary_conninfo of a running standby when conn_require_auth changed
+# (same host; PostgreSQL restarts the walreceiver on reload)
+standby_conninfo_sync_auth() {
+    local host rep_user
+    standby_conninfo_auth_outdated || return 0
+    host=$(grep "^primary_conninfo" "${PGDATA}/postgresql.auto.conf" | sed -n "s/.*host=\([^ ']*\).*/\1/p")
+    rep_user=$(get_replication_user 2>/dev/null)
+    if [ -n "$host" ] && [ -n "$rep_user" ]; then
+        ocf_log info "conn_require_auth is '${OCF_RESKEY_conn_require_auth}': updating primary_conninfo of this standby"
+        finalize_standby_config "$host" "$rep_user"
+    fi
+}
+
 discover_promoted_node() {
     # Discover which node is currently promoted (primary)
     # Try multiple methods in order of reliability
@@ -1827,7 +2261,7 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via VIP ${OCF_RESKEY_vip}"
 
         # Try to connect to VIP and check if it's promoted
-        local vip_answer=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery(), pg_postmaster_start_time()\"" 2>/dev/null)
+        local vip_answer=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=2 ${PSQL} -h ${OCF_RESKEY_vip} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery(), pg_postmaster_start_time()\"" 2>/dev/null)
         local is_primary="${vip_answer%%|*}" vip_started="${vip_answer#*|}"
 
         if [ "$is_primary" = "t" ]; then
@@ -1841,7 +2275,7 @@ discover_promoted_node() {
             local me=$(get_cluster_node_name) node node_started
             for node in ${OCF_RESKEY_node_list}; do
                 [ "$node" = "$me" ] && continue
-                node_started=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT pg_postmaster_start_time() WHERE NOT pg_is_in_recovery()\"" 2>/dev/null)
+                node_started=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT pg_postmaster_start_time() WHERE NOT pg_is_in_recovery()\"" 2>/dev/null)
                 if [ -n "$node_started" ] && [ "$node_started" = "$vip_started" ]; then
                     ocf_log info "Discovered promoted node via VIP ${OCF_RESKEY_vip}: ${node}"
                     echo "$node"
@@ -1861,7 +2295,7 @@ discover_promoted_node() {
         ocf_log debug "Attempting to discover promoted node via node_list"
 
         for node in ${OCF_RESKEY_node_list}; do
-            local is_primary=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+            local is_primary=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=2 ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} ${disc_opts} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
 
             if [ "$is_primary" = "t" ]; then
                 promoted_node="$node"
@@ -1966,6 +2400,26 @@ set_promotion_eligibility() {
     # ordinary fail-count/migration-threshold banning, not this attribute.
     local master_attr="master-${rsc_name}"
 
+    # A standby the primary recorded as not in sync may miss acknowledged
+    # commits: never a candidate, whatever the caller found (mark_peer_unsynced)
+    if [ "$mode" != "ineligible" ] && [ "$mode" != "primary" ] && [ "$mode" != "promoted" ] && \
+       [ -n "$(node_unsynced_since "$node_name")" ]; then
+        local umark="$(dirname "${PGDATA}")/.pgtwin_unsynced_logged"
+        if [ -z "$(find "$umark" -mmin -5 2>/dev/null)" ]; then
+            ocf_log warn "This node is recorded as not in sync ($(unsynced_attr) since $(node_unsynced_since "$node_name")): not a promotion candidate until it is a synchronous standby again"
+            touch "$umark" 2>/dev/null
+        fi
+        mode="ineligible"
+    fi
+
+    # Alone and not primary/async when it went down (promotion_alone_blocked),
+    # or alone without gateway (isolation_action=demote)
+    if [ "$mode" != "ineligible" ] && [ "$mode" != "primary" ] && [ "$mode" != "promoted" ]; then
+        if promotion_alone_blocked log || isolated_without_gateway; then
+            mode="ineligible"
+        fi
+    fi
+
     # Transient attribute (-l reboot): every node's own attrd owns and reports
     # its value, so after a partition or stall heals the value each node set for
     # itself counts - a permanent attribute lives in the CIB configuration, where
@@ -2039,6 +2493,11 @@ set_promotion_eligibility() {
                     esac
                 fi
                 ;;
+            newer)
+                # cold start, newer data than the peer (cold_start_eligibility):
+                # above location and ping preferences, below a promoted bonus
+                score=$((base + 5000))
+                ;;
             *)
                 score=$base
                 ;;
@@ -2083,7 +2542,7 @@ no_primary_in_cluster() {
     peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 1
     rep_user=$(get_replication_user 2>/dev/null)
     [ -n "$rep_user" ] && opts="-U ${rep_user} -d postgres"
-    state=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=3 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
+    state=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=3 ${PSQL} -h ${peer_host} -p ${OCF_RESKEY_pgport} ${opts} -Atc \"SELECT pg_is_in_recovery()\"" 2>/dev/null)
     case "$state" in
         t) return 0 ;;          # peer is a standby too
         f) return 1 ;;          # peer is a primary
@@ -2197,8 +2656,13 @@ pgsql_monitor() {
             return $OCF_FAILED_PROMOTED
         fi
 
-        # Relative promotion score of the primary (reset once a standby is in sync)
-        set_promotion_eligibility "primary"
+        # Relative promotion score of the primary (reset once a standby is in
+        # sync); -INFINITY when alone without gateway (isolation_action=demote)
+        if primary_isolation_reached; then
+            set_promotion_eligibility "ineligible"
+        else
+            set_promotion_eligibility "primary"
+        fi
 
         # Check replication slots on primary
         check_replication_slots
@@ -2227,6 +2691,16 @@ pgsql_monitor() {
                         touch "$mark"
                     fi
                     safe_sync="$current_sync"
+                fi
+
+                # Asynchronous (also since a cold start): the peer may miss
+                # acknowledged commits, record that first; without the record
+                # keep waiting. Synchronous: remove the record once the peer has
+                # caught up.
+                if [ -z "$safe_sync" ]; then
+                    mark_peer_unsynced || safe_sync="$current_sync"
+                else
+                    clear_peer_unsynced_if_synced
                 fi
 
                 if [ "$current_sync" != "$safe_sync" ]; then
@@ -2268,6 +2742,11 @@ pgsql_monitor() {
 
         return $OCF_RUNNING_PROMOTED
     else
+        # conn_require_auth set, changed or removed: before the health check, so
+        # a standby whose connections fail after the change is handled as an
+        # unhealthy one (and one that only works without it recovers)
+        standby_conninfo_sync_auth
+
         # Enhanced replication health monitoring for standby (v1.6)
         check_replication_health
         local repl_health=$?
@@ -2275,6 +2754,9 @@ pgsql_monitor() {
         if [ $repl_health -eq 0 ]; then
             # Replication is healthy, reset failure counter
             ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
+
+            # A promotion candidate if the peer is lost later (promotion_alone_blocked)
+            note_streamed_as_member
 
             # dmkif (self-healing, see pgtwin#3): this node is caught up and
             # streaming cleanly. Clear any promotion-eligibility veto we may
@@ -2298,9 +2780,9 @@ pgsql_monitor() {
             # this a cold start of both nodes can end with no primary at all.
             # (dmkif, fix/cold-start-eligible)
             if no_primary_in_cluster; then
-                ocf_log info "Replication cannot be healthy: no primary exists (peer is a standby, or down with no promoted instance in the CIB); staying eligible for promotion"
+                ocf_log info "Replication cannot be healthy: no primary exists (peer is a standby, or down with no promoted instance in the CIB); staying eligible for promotion (unless the primary recorded this node as not in sync)"
                 ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
-                set_promotion_eligibility "eligible"
+                cold_start_eligibility || set_promotion_eligibility "eligible"
                 return $OCF_SUCCESS
             fi
 
@@ -2329,70 +2811,40 @@ pgsql_monitor() {
 
             ocf_log warn "Replication failure detected (count: ${failure_count}/${OCF_RESKEY_replication_failure_threshold})"
 
-            # Check if threshold exceeded
+            # Threshold exceeded: this standby runs but does not integrate. It is
+            # sick, not dead, and next to a sick standby every later event can
+            # go either way, so it is not repaired inside the monitor (no stop
+            # notification, the primary keeps waiting for it) and the primary
+            # never relaxes on its own observation. The instance fails:
+            # Pacemaker stops it (fences the node if the stop fails), the
+            # primary relaxes on the post-stop notification, and the start
+            # repairs what it can (timeline divergence -> pg_rewind, removed WAL
+            # or a stuck WAL position -> pg_basebackup). A standby that cannot
+            # be repaired (authentication, pg_hba) ends banned after
+            # migration-threshold failures: a clear state for the admin.
+            # Only with a Promoted peer online: otherwise this node may be the
+            # next primary (no_primary_in_cluster above covers the usual case).
             if [ $failure_count -ge ${OCF_RESKEY_replication_failure_threshold} ]; then
-                ocf_log err "Replication failure threshold (${OCF_RESKEY_replication_failure_threshold}) exceeded"
-                ocf_log err "Triggering automatic recovery (pg_rewind/pg_basebackup)"
-
-                # Discover promoted node for recovery
-                local primary_host=$(discover_promoted_node)
-
-                if [ -n "$primary_host" ]; then
-                    ocf_log info "Initiating recovery from primary: ${primary_host}"
-
-                    # Reset failure counter before recovery attempt
+                if peer_promoted_member; then
                     ocf_run crm_attribute -N $(get_cluster_node_name) -n postgres-replication-failures -v 0 -l reboot 2>/dev/null
-
-                    # A consistent standby (clean shutdown) starts fine but its
-                    # walreceiver fails forever with "requested WAL segment ...
-                    # has already been removed". pg_rewind reports success there
-                    # without fixing anything, so the recovery looped every
-                    # threshold cycle. Watch one walreceiver retry
-                    # (wal_retrieve_retry_interval, default 5 s) and rebuild with
-                    # pg_basebackup if the WAL is gone.
-                    local rec_mode=""
-                    local wal_snap="${state_dir}/.pgtwin_walcheck.$$"
+                    # A consistent standby whose WAL was removed on the primary
+                    # starts fine and only its walreceiver fails, so the start
+                    # cannot see it: watch one walreceiver retry
+                    # (wal_retrieve_retry_interval, default 5 s) here and ask the
+                    # next start for a rebuild
+                    local wal_snap="$(dirname "${PGDATA}")/.pgtwin_walcheck.$$"
                     snapshot_pg_logs "$wal_snap"
                     sleep 6
                     if standby_start_failed_for_missing_wal "$wal_snap" /dev/null; then
-                        rec_mode="basebackup-only"
-                        ocf_log warn "Standby cannot stream: WAL it needs has already been removed on the primary ${primary_host}"
-                        ocf_log warn "pg_rewind cannot help, rebuilding the standby with pg_basebackup"
-                        set_promotion_eligibility "ineligible"
+                        echo "WAL this standby needs has already been removed on the primary" > "$(rebuild_request_file)"
+                        ocf_log warn "Standby cannot stream: WAL it needs has already been removed on the primary, the next start rebuilds it with pg_basebackup"
                     fi
                     rm -f "$wal_snap"
-
-                    # Trigger recovery (this will stop PostgreSQL, run pg_rewind/basebackup, and restart)
-                    recover_standby "$primary_host" $rec_mode
-                    local recovery_rc=$?
-
-                    # This standby could not stream. A pg_rewind that found
-                    # nothing to do changed nothing, and the next cycles would
-                    # repeat the same "recovery" forever (dmkif, TC15 on 1.8.0:
-                    # "record with incorrect prev-link" at the same LSN after
-                    # every start). Rebuild instead.
-                    if [ $recovery_rc -eq 0 ] && [ "$rec_mode" != "basebackup-only" ] && [ "${REWIND_NOOP:-0}" = "1" ]; then
-                        ocf_log warn "pg_rewind found nothing to rewind, but this standby cannot stream from ${primary_host}: rebuilding it with pg_basebackup"
-                        set_promotion_eligibility "ineligible"
-                        rec_mode="basebackup-only"
-                        recover_standby "$primary_host" basebackup-only
-                        recovery_rc=$?
-                    fi
-
-                    if [ $recovery_rc -eq 0 ] && [ "$rec_mode" = "basebackup-only" ]; then
-                        ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
-                        return $OCF_NOT_RUNNING
-                    elif [ $recovery_rc -eq 0 ]; then
-                        ocf_log info "Automatic replication recovery completed successfully"
-                        return $OCF_SUCCESS
-                    else
-                        ocf_log err "Automatic replication recovery failed (rc=$recovery_rc)"
-                        return $OCF_ERR_GENERIC
-                    fi
-                else
-                    ocf_log err "Cannot trigger recovery: unable to discover promoted node"
+                    ocf_exit_reason "Standby cannot stream from the primary on $(get_peer_node_name) for ${failure_count} monitor cycles"
+                    ocf_log err "Replication failure threshold (${OCF_RESKEY_replication_failure_threshold}) exceeded: failing this instance, Pacemaker stops it and the primary stops waiting for it; the next start repairs it if it can"
                     return $OCF_ERR_GENERIC
                 fi
+                ocf_log warn "Replication failure threshold (${OCF_RESKEY_replication_failure_threshold}) exceeded, but no Promoted peer is online in the cluster: not failing (this node may be the next primary)"
             fi
 
             # Haven't reached threshold yet, still return success but log warning
@@ -2634,7 +3086,7 @@ ensure_primary_replication_slot() {
 
     # immediately_reserve: the slot has to protect WAL from the moment it exists
     local slot_sql="SELECT CASE WHEN (SELECT count(*) FROM pg_replication_slots WHERE slot_name = '${OCF_RESKEY_slot_name}') = 0 THEN (SELECT pg_create_physical_replication_slot('${OCF_RESKEY_slot_name}', true))::text ELSE 'already_exists' END"
-    result=$(run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" 2>&1)
+    result=$(run_as_pguser env ${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" 2>&1)
     if [ $? -ne 0 ]; then
         ocf_log warn "Could not check replication slot '${OCF_RESKEY_slot_name}' on primary ${primary_host}: ${result}"
         return 1
@@ -2671,25 +3123,48 @@ local_cluster_state() {
 # checkpoint_timeout). The start path took that for a divergence and ran
 # pg_rewind against a standby that had just crashed, which broke it (see
 # recover_standby). For a node in recovery the minimum recovery point's
-# timeline and the history files it received from its primary count as well;
-# a standby never writes WAL of its own, so it cannot have diverged from them.
+# timeline and the history files it received from its primary count as well,
+# but a history file only if this node's position on its checkpoint timeline
+# is not past the point where that history file says the new timeline left it:
+# a former primary demoted while it could not reach the new primary (alone,
+# full partition) wrote WAL on the old timeline after the switch point (commits
+# that waited for the standby, the shutdown checkpoint) and has diverged even
+# when its walreceiver fetched the new history file later.
 # A primary (or a crashed primary) keeps its checkpoint timeline.
 local_effective_timeline() {
-    local cd tli state min_tli h hex n
+    local cd tli cp_tli state min_tli h hex n pos ckpt minrec sw
     cd=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null)
     tli=$(echo "$cd" | sed -n "s/^Latest checkpoint's TimeLineID: *//p")
     case "$tli" in ''|*[!0-9]*) return 1 ;; esac
+    cp_tli=$tli
     state=$(echo "$cd" | sed -n 's/^Database cluster state: *//p')
     case "$state" in
         "in archive recovery"|"shut down in recovery")
             min_tli=$(echo "$cd" | sed -n "s/^Min recovery ending loc's timeline: *//p")
             case "$min_tli" in ''|*[!0-9]*) ;; *) [ "$min_tli" -gt "$tli" ] && tli=$min_tli ;; esac
+            # position on the checkpoint timeline (only if the minimum recovery
+            # point has not moved to a newer timeline already)
+            pos=""
+            if [ "$tli" -eq "$cp_tli" ]; then
+                ckpt=$(lsn_to_int "$(echo "$cd" | sed -n 's/^Latest checkpoint location: *//p')")
+                minrec=$(lsn_to_int "$(echo "$cd" | sed -n 's/^Minimum recovery ending location: *//p')")
+                pos=${ckpt:-0}
+                [ -n "$minrec" ] && [ "$minrec" -gt "$pos" ] && pos=$minrec
+            fi
             for h in "${PGDATA}"/pg_wal/*.history; do
                 [ -f "$h" ] || continue
                 hex=$(basename "$h" .history)
                 case "$hex" in [0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F][0-9A-F]) ;; *) continue ;; esac
                 n=$((16#$hex))
-                [ "$n" -gt "$tli" ] && tli=$n
+                [ "$n" -gt "$tli" ] || continue
+                if [ -n "$pos" ]; then
+                    sw=$(lsn_to_int "$(awk -v t="$cp_tli" '$1 == t { print $2; exit }' "$h" 2>/dev/null)")
+                    if [ -n "$sw" ] && [ "$pos" -gt "$sw" ]; then
+                        ocf_log warn "Timeline ${n} left timeline ${cp_tli} before this node's position on it: diverged, not following timeline ${n}"
+                        continue
+                    fi
+                fi
+                tli=$n
             done
             ;;
     esac
@@ -2758,6 +3233,10 @@ standby_start_stuck_at_invalid_wal() {
 
 pgsql_start() {
     local rc
+
+    conn_require_auth_valid || return $OCF_ERR_CONFIGURED
+    isolation_params_valid || return $OCF_ERR_CONFIGURED
+    conn_require_auth_supported || return $OCF_ERR_CONFIGURED
 
     if pgsql_is_running; then
         ocf_log info "PostgreSQL is already running"
@@ -2941,6 +3420,23 @@ pgsql_start() {
         fi
     fi
 
+    # A former primary that starts alone while it was waiting for a standby
+    # (primary/sync, synchronous_standby_names set): the standby may have been
+    # promoted after it and written more. Start as standby, not eligible
+    # (promotion_alone_blocked); the data-state comparison decides when the peer
+    # joins. Before 1.8.2 this refused the start with OCF_ERR_CONFIGURED, which
+    # also kept the peer from starting until a cleanup.
+    if [ ! -f "${PGDATA}/standby.signal" ] && [ -f "${PGDATA}/PG_VERSION" ] && \
+       command -v crm_node >/dev/null 2>&1 && [ -z "$(get_peer_member_name)" ]; then
+        local alone_sync
+        alone_sync=$(get_pg_config_value "synchronous_standby_names")
+        if [ -n "$alone_sync" ]; then
+            ocf_log warn "Single-node startup of a former primary that was waiting for its standby (synchronous_standby_names='${alone_sync}'): the standby may have been promoted after it"
+            ocf_log warn "Starting as standby, not a promotion candidate until the peer joins (data-state comparison). To make this node primary anyway: crm_attribute -N $(get_cluster_node_name) -n $(alone_override_attr) -l reboot -v true"
+            run_as_pguser touch "${PGDATA}/standby.signal"
+        fi
+    fi
+
     # Check if we need to do recovery
     if [ -f "${PGDATA}/standby.signal" ]; then
         ocf_log info "Starting PostgreSQL as standby"
@@ -2982,7 +3478,7 @@ pgsql_start() {
                     # during a switchover the demoting primary saw the not yet promoted
                     # standby as "diverged" and ran pg_rewind against it on every switch.
                     local other_timeline=$(run_as_pguser sh -c \
-                        "${PSQL} -h ${node_to_check} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \
+                        "${REMOTE_PGENV} ${PSQL} -h ${node_to_check} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \
                         'SELECT timeline_id FROM pg_control_checkpoint() WHERE NOT pg_is_in_recovery()' 2>/dev/null" || echo "")
 
                     if [ -n "$other_timeline" ]; then
@@ -3071,7 +3567,7 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             # 3. Wrong passfile location
             if echo "$primary_conninfo" | grep -qE "host=\s|user=\s|host=$|user=$" || \
                ! echo "$primary_conninfo" | grep -q "application_name=" || \
-               standby_conninfo_uses_vip; then
+               standby_conninfo_uses_vip || standby_conninfo_auth_outdated; then
                 ocf_log warn "Detected potentially incorrect standby configuration - attempting to fix"
 
                 # Try to discover primary node to fix configuration
@@ -3094,51 +3590,23 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
     else
         ocf_log info "Starting PostgreSQL as primary"
 
-        # Single-node startup safety check (v1.6.14+)
-        # Detect if we're starting alone with sync replication configured
-        # This indicates a potential double-failure scenario where wrong node may be promoting
-        if command -v crm_node >/dev/null 2>&1; then
-            local node_count=$(crm_node -l 2>/dev/null | grep -c member)
+        # Single-node startup (v1.6.14+, promotion_alone_blocked): handled
+        # before this branch; a former primary that gets here alone ran
+        # without waiting for a standby (primary/async)
+        if command -v crm_node >/dev/null 2>&1 && [ -z "$(get_peer_member_name)" ]; then
+            ocf_log info "Single-node startup as primary/async (synchronous_standby_names empty): no other node can have newer data"
+        fi
+    fi
 
-            if [ "$node_count" -eq 1 ]; then
-                # We're the only node in cluster - check sync configuration
-                # Use postgres -C to query config (works with any config file structure)
-                local sync_standby=$(get_pg_config_value "synchronous_standby_names")
-
-                if [ -n "$sync_standby" ]; then
-                    # Sync replication is configured but we're alone - DANGER!
-                    ocf_log err "⚠️  SINGLE-NODE STARTUP WITH SYNC REPLICATION CONFIGURED ⚠️"
-                    ocf_log err "⚠️  synchronous_standby_names='${sync_standby}'"
-                    ocf_log err ""
-                    ocf_log err "This configuration suggests one of these scenarios:"
-                    ocf_log err "  1. Both nodes crashed (double failure)"
-                    ocf_log err "  2. This node crashed first (other node may have newer data)"
-                    ocf_log err "  3. This node is stale (other node was promoted and disabled sync)"
-                    ocf_log err ""
-                    ocf_log err "If this node was the primary when other node failed, pgtwin notify support"
-                    ocf_log err "would have automatically disabled sync replication. Since sync is still"
-                    ocf_log err "enabled, this node was likely NOT handling the failure."
-                    ocf_log err ""
-                    ocf_log err "REFUSING to start as primary - other node may have newer data!"
-                    ocf_log err ""
-                    ocf_log err "Recovery options:"
-                    ocf_log err "  1. WAIT for other node to join cluster (RECOMMENDED)"
-                    ocf_log err "  2. Check timelines on both nodes:"
-                    ocf_log err "     pg_controldata ${PGDATA} | grep timeline"
-                    ocf_log err "  3. If confirmed this node has latest timeline, manually override:"
-                    ocf_log err "     - Stop cluster: crm configure property maintenance-mode=true"
-                    ocf_log err "     - Start PostgreSQL manually, then: ALTER SYSTEM SET synchronous_standby_names = '';"
-                    ocf_log err "     - Reload config: pg_ctl reload"
-                    ocf_log err "     - Restart cluster: crm configure property maintenance-mode=false"
-                    ocf_log err ""
-                    return $OCF_ERR_CONFIGURED
-                else
-                    # Sync disabled (async mode) - SAFE to promote
-                    ocf_log info "✓ Single-node startup with async replication (sync disabled)"
-                    ocf_log info "✓ This is expected after standby failure (pgtwin notify support)"
-                    ocf_log info "✓ Safe to start as primary"
-                fi
-            fi
+    # The standby monitor failed this instance and found the WAL it needs
+    # removed on the primary: rebuild instead of starting it again
+    if [ -f "$(rebuild_request_file)" ]; then
+        local req_reason
+        req_reason=$(cat "$(rebuild_request_file)" 2>/dev/null)
+        rm -f "$(rebuild_request_file)"
+        if [ -f "${PGDATA}/standby.signal" ]; then
+            start_rebuild_standby "${req_reason:-rebuild requested by the standby monitor}"
+            return $?
         fi
     fi
 
@@ -3168,26 +3636,8 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
         fi
         if [ -n "$bb_reason" ]; then
             rm -f "$log_snapshot"
-            ocf_log warn "Standby cannot start: ${bb_reason}"
-            ocf_log warn "Falling back to a full pg_basebackup"
-            if pgsql_is_running; then
-                pgsql_stop
-            fi
-            local bb_primary
-            bb_primary=$(discover_promoted_node)
-            if [ -z "$bb_primary" ]; then
-                ocf_log err "Cannot rebuild standby: unable to discover primary node"
-                return $OCF_ERR_GENERIC
-            fi
-            set_promotion_eligibility "ineligible"
-            recover_standby "${bb_primary}" basebackup-only
-            local bb_rc=$?
-            if [ $bb_rc -ne 0 ]; then
-                ocf_log err "Standby rebuild via pg_basebackup failed to start"
-                return $OCF_ERR_GENERIC
-            fi
-            ocf_log info "Standby rebuild started (pg_basebackup running in background), deferring to monitor"
-            return $OCF_NOT_RUNNING
+            start_rebuild_standby "$bb_reason"
+            return $?
         fi
         rm -f "$log_snapshot"
         ocf_log err "Failed to start PostgreSQL"
@@ -3208,6 +3658,11 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
             # Perform configuration check after successful start
             check_postgresql_config
             rc=$?
+
+            # Cold start: rank against the peer before the scheduler picks one
+            if [ -f "${PGDATA}/standby.signal" ] && [ -z "$(discover_promoted_node 2>/dev/null)" ]; then
+                cold_start_eligibility
+            fi
 
             # Configuration check failures are warnings, not start failures
             # Return success even if config has warnings
@@ -3390,12 +3845,13 @@ peer_is_leaving() {
 # The LSN is the replay position of a standby or the current position of a
 # primary. Returns 1 if the node does not answer or the answer is not valid.
 query_data_state() {
-    local host="$1" hostopts="" rep_user out
+    local host="$1" hostopts="" rep_user out renv=""
     if [ -n "$host" ]; then
         rep_user=$(get_replication_user)
         hostopts="-h ${host} -U ${rep_user} -d postgres"
+        renv="${REMOTE_PGENV}"
     fi
-    out=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc \"SELECT (SELECT timeline_id FROM pg_control_checkpoint()) || ' ' || CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text ELSE pg_current_wal_lsn()::text END\"" 2>/dev/null) || return 1
+    out=$(run_as_pguser sh -c "${renv} PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc \"SELECT (SELECT timeline_id FROM pg_control_checkpoint()) || ' ' || CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()::text ELSE pg_current_wal_lsn()::text END\"" 2>/dev/null) || return 1
     case "$out" in
         [0-9]*" "[0-9A-Fa-f]*/[0-9A-Fa-f]*) ;;
         *) return 1 ;;
@@ -3411,7 +3867,7 @@ query_data_state() {
     # timeline is used as before.
     local hist tli
     local hist_sql="SELECT max(('x'||substr(f,1,8))::bit(32)::int) FROM pg_ls_dir('pg_wal', true, false) AS f WHERE f ~ '^[0-9A-F]{8}[.]history\$'"
-    hist=$(run_as_pguser env PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc "$hist_sql" 2>/dev/null)
+    hist=$(run_as_pguser env ${renv} PGCONNECT_TIMEOUT=3 ${PSQL} ${hostopts} -p ${OCF_RESKEY_pgport} -Atc "$hist_sql" 2>/dev/null)
     tli=${out%% *}
     case "$hist" in
         ""|*[!0-9]*) ;;
@@ -3653,7 +4109,7 @@ check_promotion_safety() {
         local chk_user chk_opts=""
         chk_user=$(get_replication_user 2>/dev/null)
         [ -n "$chk_user" ] && chk_opts="-U ${chk_user} -d postgres"
-        local sync_state=$(run_as_pguser sh -c "PGCONNECT_TIMEOUT=2 ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} ${chk_opts} -Atc \"
+        local sync_state=$(run_as_pguser sh -c "${REMOTE_PGENV} PGCONNECT_TIMEOUT=2 ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} ${chk_opts} -Atc \"
             SELECT coalesce(sync_state, 'hidden')
             FROM pg_stat_replication
             WHERE application_name='${app_name}'
@@ -3737,6 +4193,31 @@ pgsql_promote() {
         return $OCF_ERR_GENERIC
     fi
 
+    # Recorded as not in sync by the primary: promoting would lose the commits
+    # it acknowledged without this node (mark_peer_unsynced)
+    local unsynced_since
+    unsynced_since=$(node_unsynced_since "$(get_cluster_node_name)")
+    if [ -n "$unsynced_since" ]; then
+        ocf_exit_reason "Not in sync with the last primary since $(date -d "@${unsynced_since}" '+%F %T' 2>/dev/null || echo "$unsynced_since")"
+        ocf_log err "Refusing promotion: the primary recorded this node as not in sync ($(unsynced_attr)); it may miss acknowledged commits"
+        ocf_log err "To promote it anyway and accept that loss: crm_attribute -N $(get_cluster_node_name) -n $(unsynced_attr) -l forever -D"
+        return $OCF_ERR_GENERIC
+    fi
+
+    # Alone, and not primary/async when it went down: the peer may have newer data
+    if promotion_alone_blocked; then
+        ocf_exit_reason "Alone in the cluster and not primary/async when it went down"
+        ocf_log err "Refusing promotion: the peer is not a cluster member and this node was not primary/async when it went down; the peer may have been promoted after it"
+        ocf_log err "The data-state comparison decides once the peer joins. To promote this node anyway: crm_attribute -N $(get_cluster_node_name) -n $(alone_override_attr) -l reboot -v true"
+        return $OCF_ERR_GENERIC
+    fi
+
+    if isolated_without_gateway; then
+        ocf_exit_reason "Alone in the cluster without gateway"
+        ocf_log err "Refusing promotion: the peer is not a cluster member and this node has lost its gateway (${OCF_RESKEY_gateway_attribute}=0, isolation_action=demote)"
+        return $OCF_ERR_GENERIC
+    fi
+
     # NEW v1.6.8: Check promotion safety before allowing promotion
     check_promotion_safety
     local safety_rc=$?
@@ -3776,6 +4257,10 @@ pgsql_promote() {
     while [ $count -lt 30 ]; do
         if pgsql_is_promoted; then
             ocf_log info "PostgreSQL promoted successfully"
+
+            # Primary now: its state is synchronous_standby_names again
+            rm -f "$(alone_ok_file)" 2>/dev/null
+            crm_attribute -N "$(get_cluster_node_name)" -n "$(alone_override_attr)" -l reboot -D >/dev/null 2>&1
 
             # Relative promotion score: this node now wins against a stale
             # primary that shows up after a stall or partition
@@ -3827,8 +4312,8 @@ check_timeline_divergence() {
     ocf_log info "Local PGDATA state: timeline=${local_timeline}, checkpoint_lsn=${local_checkpoint_lsn}"
 
     # Try to get primary's current WAL position
-    local primary_current_lsn=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_current_wal_lsn()\"" 2>/dev/null)
-    local primary_timeline=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT timeline_id FROM pg_control_checkpoint()\"" 2>/dev/null)
+    local primary_current_lsn=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_current_wal_lsn()\"" 2>/dev/null)
+    local primary_timeline=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT timeline_id FROM pg_control_checkpoint()\"" 2>/dev/null)
 
     if [ -z "$primary_current_lsn" ] || [ -z "$primary_timeline" ]; then
         ocf_log warn "Could not query primary for timeline/LSN, will attempt demotion and let PostgreSQL detect issues"
@@ -3846,7 +4331,7 @@ check_timeline_divergence() {
 
     # Check if local checkpoint is ahead of primary's current position
     # This indicates the local node has WAL that the primary doesn't have
-    local lsn_compare=$(run_as_pguser sh -c "${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_wal_lsn_diff('${local_checkpoint_lsn}', '${primary_current_lsn}')\"" 2>/dev/null)
+    local lsn_compare=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc \"SELECT pg_wal_lsn_diff('${local_checkpoint_lsn}', '${primary_current_lsn}')\"" 2>/dev/null)
 
     if [ -n "$lsn_compare" ] && [ "$lsn_compare" -gt 0 ]; then
         ocf_log warn "WAL divergence detected: local checkpoint ${local_checkpoint_lsn} is ahead of primary ${primary_current_lsn} by $lsn_compare bytes"
@@ -3877,6 +4362,27 @@ pgsql_demote() {
     fi
 
     ocf_log info "Demoting PostgreSQL to standby"
+
+    # Did the peer stream from this node right before the stop? (see
+    # clear_peer_unsynced_after_clean_stop)
+    local peer_streaming=false peer_app peer_name
+    peer_name=$(get_peer_node_name)
+    peer_app=$(echo "${peer_name%%.*}" | tr '-' '_')
+    if [ -n "$peer_app" ] && [ "$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE application_name = '${peer_app}' AND state = 'streaming'\"" 2>/dev/null)" -gt 0 ] 2>/dev/null; then
+        peer_streaming=true
+    fi
+
+    # Primary/async at the shutdown (promotion_alone_blocked): this node runs
+    # without waiting and the peer is recorded as not in sync, so the peer cannot
+    # be promoted after this node. Written before anything below can fail.
+    if [ "${OCF_RESKEY_rep_mode}" = "sync" ] && [ "$peer_streaming" = "false" ] && \
+       [ -z "$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc 'SHOW synchronous_standby_names'" 2>/dev/null)" ] && \
+       [ -n "$peer_name" ] && [ -n "$(node_unsynced_since "$peer_name")" ]; then
+        date +%s > "$(alone_ok_file)" 2>/dev/null
+        ocf_log info "Demoted as primary/async (${peer_name} recorded as not in sync): this node may be promoted alone after a restart"
+    else
+        rm -f "$(alone_ok_file)" 2>/dev/null
+    fi
 
     # Enhanced promoted node discovery (v1.6)
     # Try dynamic discovery first, then fall back to traditional methods
@@ -3926,7 +4432,7 @@ pgsql_demote() {
             ocf_log warn "No promoted node found by discover_promoted_node() or .pgpass; re-checking node_list with verification before falling back"
             for node in ${OCF_RESKEY_node_list}; do
                 if [ "$node" != "$local_node_name" ] && [ "$node" != "$local_hostname" ]; then
-                    local candidate_is_primary=$(run_as_pguser sh -c "${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
+                    local candidate_is_primary=$(run_as_pguser sh -c "${REMOTE_PGENV} ${PSQL} -h ${node} -p ${OCF_RESKEY_pgport} -Atc \"SELECT NOT pg_is_in_recovery()\"" 2>/dev/null)
                     if [ "$candidate_is_primary" = "t" ]; then
                         primary_host="$node"
                         ocf_log info "Verified ${node} is actually promoted; using it"
@@ -3936,6 +4442,20 @@ pgsql_demote() {
                     fi
                 fi
             done
+        fi
+    fi
+
+    # Alone (isolation_action=demote, or a full partition): there is no primary
+    # to follow. Become a standby that points at the peer's address; it connects
+    # once the peer is back, and the start path rewinds it if needed.
+    local demote_alone=false
+    if [ -z "$primary_host" ] && [ -z "$(get_peer_member_name)" ]; then
+        local alone_peer
+        alone_peer=$(get_peer_node_name)
+        [ -n "$alone_peer" ] && primary_host=$(resolve_cluster_node_to_hostname "$alone_peer")
+        if [ -n "$primary_host" ]; then
+            demote_alone=true
+            ocf_log warn "Demoting while alone: no primary to follow, standby will point at ${primary_host}"
         fi
     fi
 
@@ -3953,10 +4473,11 @@ pgsql_demote() {
     if [ $rc -ne 0 ]; then
         return $rc
     fi
+    clear_peer_unsynced_after_clean_stop "$peer_streaming"
 
     # v1.7.0: Check for timeline divergence before attempting to start as standby
     ocf_log info "Checking for timeline divergence before demotion"
-    if check_timeline_divergence "${primary_host}"; then
+    if [ "$demote_alone" = "false" ] && check_timeline_divergence "${primary_host}"; then
         ocf_log info "Timeline divergence detected, triggering pg_rewind recovery"
 
         # Call recover_standby which will handle pg_rewind, create standby.signal, and start
@@ -3980,7 +4501,7 @@ pgsql_demote() {
 
     # Update postgresql.auto.conf for replication with validated application name
     run_as_pguser sh -c "cat > ${PGDATA}/postgresql.auto.conf" <<EOF
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${OCF_RESKEY_pgpassfile}${REMOTE_CONNINFO}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
@@ -4108,7 +4629,7 @@ finalize_standby_config() {
         ocf_log warn "PostgreSQL is running during finalization - using ALTER SYSTEM (prefer to avoid this)"
 
         # Use ALTER SYSTEM if PostgreSQL is already running
-        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'\"" >/dev/null 2>&1
+        run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -c \"ALTER SYSTEM SET primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}${REMOTE_CONNINFO}'\"" >/dev/null 2>&1
 
         if [ $? -ne 0 ]; then
             ocf_log err "Failed to set primary_conninfo via ALTER SYSTEM"
@@ -4134,7 +4655,7 @@ finalize_standby_config() {
         run_as_pguser sh -c "cat > ${PGDATA}/postgresql.auto.conf" <<EOF
 # Do not edit this file manually!
 # It will be overwritten by the ALTER SYSTEM command.
-primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}'
+primary_conninfo = 'host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} application_name=${app_name} sslmode=prefer passfile=${pgpass_file}${REMOTE_CONNINFO}'
 primary_slot_name = '${OCF_RESKEY_slot_name}'
 EOF
 
@@ -4211,7 +4732,7 @@ recover_standby() {
 
             # Test connectivity before attempting pg_rewind
             ocf_log debug "Testing connectivity to ${primary_host} as ${rep_user}"
-            run_as_pguser env PGPASSFILE="${pgpass_file}" psql -h "${primary_host}" -p "${OCF_RESKEY_pgport}" -U "${rep_user}" -d postgres -Atc "SELECT 1" >/dev/null 2>&1
+            run_as_pguser env ${REMOTE_PGENV} PGPASSFILE="${pgpass_file}" psql -h "${primary_host}" -p "${OCF_RESKEY_pgport}" -U "${rep_user}" -d postgres -Atc "SELECT 1" >/dev/null 2>&1
             if [ $? -ne 0 ]; then
                 ocf_log warn "Cannot connect to primary ${primary_host} as ${rep_user}, pg_rewind will likely fail"
             fi
@@ -4245,7 +4766,7 @@ recover_standby() {
             run_as_pguser env PGPASSFILE="${pgpass_file}" \
                 ${PG_REWIND} \
                 --target-pgdata="${PGDATA}" \
-                --source-server="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} dbname=postgres sslmode=prefer" \
+                --source-server="host=${primary_host} port=${OCF_RESKEY_pgport} user=${rep_user} dbname=postgres sslmode=prefer${REMOTE_CONNINFO}" \
                 --progress 2>&1 | tee /tmp/pg_rewind_$$.log
             rc=${PIPESTATUS[0]}
 
@@ -4384,7 +4905,7 @@ start_async_basebackup() {
 
         # Note: PGPASSFILE env var doesn't work with runuser, but psql automatically uses ~/.pgpass
         # ensure_pgpass() already ensures the file is at /var/lib/pgsql/.pgpass
-        run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" > "${slot_result_file}" 2>&1
+        run_as_pguser env ${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "${slot_sql}" > "${slot_result_file}" 2>&1
         local slot_rc=$?
         local slot_result
         read slot_result < "${slot_result_file}" 2>/dev/null || slot_result=""
@@ -4426,7 +4947,7 @@ start_async_basebackup() {
 
         # Get primary server version
         local primary_version_output="${state_dir}/.pgtwin_primary_version.$$"
-        run_as_pguser ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "SHOW server_version" > "${primary_version_output}" 2>&1
+        run_as_pguser env ${REMOTE_PGENV} ${PSQL} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -d postgres -Atc "SHOW server_version" > "${primary_version_output}" 2>&1
         local primary_version_rc=$?
         local primary_version_full
         read primary_version_full < "${primary_version_output}" 2>/dev/null || primary_version_full=""
@@ -4547,7 +5068,7 @@ EOF
         # briefly spikes I/O on the primary during the forced checkpoint,
         # an acceptable tradeoff here since this only runs when a standby
         # is (re)joining, not on every monitor cycle.
-        setpriv --reuid=${pguid} --regid=${pggid} --clear-groups env PGSSLMODE=prefer ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -c fast -S ${OCF_RESKEY_slot_name} --progress
+        setpriv --reuid=${pguid} --regid=${pggid} --clear-groups env PGSSLMODE=prefer ${REMOTE_PGENV} ${PG_BASEBACKUP} -h ${primary_host} -p ${OCF_RESKEY_pgport} -U ${rep_user} -D ${PGDATA} -X stream -P -R -c fast -S ${OCF_RESKEY_slot_name} --progress
         basebackup_rc=\$?
         echo \${basebackup_rc} > '${rc_file}'
 
@@ -4715,6 +5236,7 @@ check_basebackup_progress() {
 }
 
 disable_sync_replication() {
+    mark_peer_unsynced || return 1
     ocf_log info "Disabling synchronous replication due to standby failure"
 
     # Update postgresql.auto.conf to disable sync replication
@@ -4794,6 +5316,13 @@ pgsql_validate() {
     # Check binaries
     check_binary "${PGCTL}"
     check_binary "${PSQL}"
+
+    conn_require_auth_valid || return $OCF_ERR_CONFIGURED
+    isolation_params_valid || return $OCF_ERR_CONFIGURED
+    conn_require_auth_supported || return $OCF_ERR_CONFIGURED
+    if [ -z "${OCF_RESKEY_conn_require_auth}" ]; then
+        ocf_log info "conn_require_auth is not set: connections to other nodes accept a server without authentication (set it before production, QUICKSTART production checklist)"
+    fi
 
     # Check data directory - be lenient, allow missing/empty for auto-initialization
     if [ ! -d "${PGDATA}" ]; then
@@ -4901,6 +5430,12 @@ promote)	pgsql_promote;;
 demote)		pgsql_demote;;
 notify)		pgsql_notify;;
 validate-all)	pgsql_validate;;
+reload-agent)	# Only reloadable parameters change here (conn_require_auth);
+		# the next actions run with the new values
+		conn_require_auth_valid && conn_require_auth_supported || exit $OCF_ERR_CONFIGURED
+		ocf_log info "reload-agent: conn_require_auth='${OCF_RESKEY_conn_require_auth}'"
+		exit $OCF_SUCCESS
+		;;
 usage|help)	pgsql_usage
 		exit $OCF_SUCCESS
 		;;

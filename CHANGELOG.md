@@ -1,3 +1,73 @@
+## [1.8.2] - 2026-11-12
+
+Release notes: `releasenotes/RELEASE_v1.8.2.md`.
+
+### Changed
+- **A standby that runs but cannot stream is stopped, not tolerated** (doc/DESIGN_STALL_SAFE_SYNC.md, section 9;
+  answer to dmkif's request to relax after the promote timeout). After `replication_failure_threshold`
+  consecutive monitor cycles without streaming, and only while a Promoted peer is online, the standby monitor
+  fails the instance. Pacemaker stops it (fences the node if the stop fails), the primary relaxes on the
+  post-stop notification. Before, the monitor ran `pg_rewind`/`pg_basebackup` itself and returned success, so no
+  stop notification came and writes stayed blocked when the repair did not help (authentication, `pg_hba`).
+  Repair moved to the start; the removed-WAL check runs in the monitor before failing and asks the next start for
+  a `pg_basebackup`.
+- `replication_failure_threshold` description: the write stop after a standby failure is about
+  (threshold + 1) x the Unpromoted monitor interval.
+
+### Fixed
+- **Divergence of a former primary that was demoted while alone** was not detected: its walreceiver fetched the
+  new primary's history file later, and `local_effective_timeline` took that as "follows the new timeline", so
+  the start ran no `pg_rewind` and the standby could never stream. A newer history file now counts only if the
+  node's position on its checkpoint timeline is not past the switch point in that file.
+- A demote while alone (no primary to follow) no longer fails with "Cannot determine primary host": the
+  standby points at the peer's address.
+
+### Added
+- **Cold start: the node with the newer data is promoted directly** (dmkif T5). When both nodes are standbys and
+  no primary exists, each compares timeline and WAL position with the peer as soon as both answer: newer gets a
+  score above location and ping preferences, older -INFINITY, equal the normal score (the scheduler's choice).
+  Before, Pacemaker promoted by location and the data-state guard refused the older node, which left a failed
+  promote action. The guard stays as the safety net.
+- QUICKSTART "Choosing the primary by hand": every safety block with the command that overrides it.
+- **`fence_pgtwin`**, a fence agent for the last level of `fencing_topology`: when no real fence device can
+  confirm, it states "this node is alone" if the target is not a cluster member and none of its addresses
+  (corosync ring addresses plus `extra_addresses`) answers `ping_count` consecutive pings; optionally only while
+  this node reaches its gateway (`gateway_attribute`). Installed to `/usr/sbin` by the spec.
+- **`isolation_action`** (`none` default, `demote`), `gateway_attribute` (`pingd`), `isolation_threshold` (3):
+  a primary that is alone and has lost its gateway gives up the primary role; a standby in that state is not
+  promoted; the no-fencing relax rule does not relax there.
+- **A node that starts alone is promoted only if it was primary/async** (`rep_mode=sync`; dmkif finding E: with
+  `no-quorum-policy=ignore` a fenced standby that booted during a partition fenced the healthy primary and
+  promoted itself). Without the peer as a cluster member a node is a promotion candidate only if it was primary
+  without waiting for its standby when it went down (the standby recorded as not in sync), or if it has been a
+  healthy, unrecorded standby of the peer as a cluster member since it booted. Otherwise it stays an ineligible
+  standby until the peer joins and the data-state comparison decides; operator override
+  `pgtwin-promote-alone-<rsc>`. A former primary that starts alone while it was waiting for its standby now
+  starts as such a standby; before it failed with `OCF_ERR_CONFIGURED`, which also kept the peer from starting
+  until a cleanup.
+- **"Not in sync" record**: before a primary with `rep_mode=sync` stops waiting for its standby (post-stop,
+  monitor rules 1a/1c, promote) it writes the permanent node attribute `pgtwin-unsynced-<rsc>` on the peer and
+  waits until it is in the CIB; without it the primary keeps waiting. A recorded node is never promoted
+  automatically (score -INFINITY, promote refuses), also when the primary is lost: it may miss acknowledged
+  commits. The primary removes the record once the peer is its synchronous standby and has caught up, and on a
+  clean demote once the peer has received its shutdown checkpoint (switchover right after a rejoin). Closes the
+  double-failure window "standby back but not caught up, primary fails, standby promoted".
+- **`conn_require_auth`** parameter: libpq `require_auth` for every connection of the agent to another node
+  (probes, discovery, safety check, `primary_conninfo`, `pg_rewind`, `pg_basebackup`); local socket connections
+  are not affected. Default empty (test setups); without it libpq accepts a server that skips authentication.
+  Validated (syntax, libpq 16+); reloadable (`reload-agent`); standbys update `primary_conninfo` with their next
+  monitor. Passed into the container in container mode.
+
+### Documentation
+- QUICKSTART: production checklist with a security block (`conn_require_auth`, `pg_hba` only from the node
+  addresses, corosync crypto, optional TLS), monitoring of the record and of failed standby monitors, changing
+  `conn_require_auth` without restarting the primary, what to do with a recorded node after losing the primary.
+- doc/DESIGN_STALL_SAFE_SYNC.md: section 9 (decision, rules, authentication, lab results).
+- QUICKSTART "When no fence device can confirm": fencing first, `fence_pgtwin` as the last level, the
+  consequences of a full partition, `isolation_action`, and that two data centres whose services should go on
+  on each side after a partition need a redundant gateway setup. Production checklist accordingly.
+- QUICKSTART "A node that starts alone".
+
 ## [1.8.1] - 2026-11-11
 
 Release notes: `releasenotes/RELEASE_v1.8.1.md`.

@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.8.1
+Version:        1.8.2
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later
@@ -64,6 +64,8 @@ install -d -m 0755 %{buildroot}%{_prefix}/lib/ocf/resource.d/heartbeat
 
 # Install the OCF resource agent
 install -m 0755 pgtwin %{buildroot}%{_prefix}/lib/ocf/resource.d/heartbeat/pgtwin
+install -d -m 0755 %{buildroot}%{_sbindir}
+install -m 0755 fence_pgtwin %{buildroot}%{_sbindir}/fence_pgtwin
 
 # Install documentation
 install -d -m 0755 %{buildroot}%{_docdir}/%{name}
@@ -78,6 +80,7 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %files
 %defattr(-,root,root,-)
 %{_prefix}/lib/ocf/resource.d/heartbeat/pgtwin
+%{_sbindir}/fence_pgtwin
 %dir %{_docdir}/%{name}
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/CHANGELOG.md
@@ -88,6 +91,20 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
+* Thu Nov 12 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.2-1
+- Release v1.8.2: sick standby is stopped, not tolerated; "not in sync" marker; conn_require_auth
+- A standby that runs but cannot stream fails its monitor after replication_failure_threshold;
+  Pacemaker stops it, the primary relaxes on the stop notification, the start repairs it
+- Before relaxing, the primary records the peer as not in sync (pgtwin-unsynced-<rsc>); such a
+  node is never promoted automatically until it is a synchronous standby again
+- New parameter conn_require_auth (libpq require_auth on all connections to other nodes, reloadable)
+- A node that starts alone is promoted only if it was primary/async (dmkif finding E)
+- New fence agent fence_pgtwin (last fencing level: peer gone when no connection answers)
+- New parameter isolation_action (none|demote): primary alone without gateway gives up its role
+- Divergence of a former primary demoted while alone is detected (history file vs. switch point)
+- Cold start: the node with the newer data state is preferred before Pacemaker promotes (no failed promote)
+- QUICKSTART: security block in the production checklist
+
 * Wed Nov 11 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.1-1
 - Release v1.8.1: a crashed standby could be left unrecoverable (regression in 1.8.0)
 - Start path uses the timeline a standby follows, no false divergence after a crash

@@ -142,6 +142,10 @@ host    postgres        replicator      192.168.122.0/24        scram-sha-256
 host    all             all             192.168.122.0/24        scram-sha-256
 ```
 
+For production, allow `replication` and `postgres` for the replication user only from the two node addresses
+(`192.168.122.60/32`, `192.168.122.120/32`) instead of the whole network: `application_name` is no
+authentication, anyone with the replication password who may connect could act as the synchronous standby.
+
 **IMPORTANT**: Do not leave backup copies or other files owned by `root` inside PGDATA (for example
 `cp pg_hba.conf pg_hba.conf.orig` run as root). `pg_basebackup` copies every file in PGDATA and aborts with
 `could not open file "./pg_hba.conf.orig": Permission denied`, so the standby can never be initialized. Keep
@@ -1058,9 +1062,24 @@ Before deploying to production, verify:
 - ☑ **Cluster Configuration**
   - Fencing enabled (`fencing-enabled=true`, Pacemaker 2: `stonith-enabled=true`) with a working watchdog
   - Fencing device configured and tested
+  - Decide what happens when no fence device can confirm (dead host behind hypervisor fencing, full partition):
+    by default nothing fails over until someone confirms the fence by hand. `fence_pgtwin` as the last fencing
+    level lets a node that no longer reaches the other one on any connection go on alone, see "When no fence
+    device can confirm" below
+  - A ping resource (`ocf:pacemaker:ping`) on the gateway the clients use. For two data centres in which each side
+    should go on after a partition, each side needs a gateway it reaches on its own (redundant gateway)
   - VIP configured and reachable
   - Both nodes have identical pgtwin agent version
   - Location constraints configured for both nodes
+
+- ☑ **Security**
+  - pgtwin verifies the server on every connection to the other node: `conn_require_auth="scram-sha-256"` on the
+    pgtwin resource (PostgreSQL 16+ client). Without it libpq accepts a server that skips authentication, so
+    whoever answers on a node address or the VIP could pose as primary or standby without any credentials. To set
+    it on a running cluster without restarting the primary, see below.
+  - `pg_hba.conf`: `replication` and `postgres` for the replication user only from the node addresses (`/32`)
+  - Corosync: `crypto_cipher` and `crypto_hash` set (`crm cluster init` default)
+  - Optional, if the network between the nodes is not trusted: TLS with a cluster CA (`sslmode=verify-full`)
 
 - ☑ **Testing**
   - Manual failover tested successfully
@@ -1074,6 +1093,121 @@ Before deploying to production, verify:
   - PostgreSQL log monitoring
   - Disk space alerts (especially for WAL)
   - Replication lag alerts
+  - Alert on the node attribute `pgtwin-unsynced-<resource>` (`crm_mon -A`): the primary stopped waiting for
+    that standby, it is no promotion candidate until it is in sync again, and a failure of the primary needs an
+    operator (see below)
+  - Alert on failed standby monitors ("Standby cannot stream from the primary"): a standby that cannot stream is
+    stopped after `replication_failure_threshold` monitor cycles
+
+### Changing `conn_require_auth` on a running cluster
+
+The parameter is reloadable, but Pacemaker restarts a promoted instance on any parameter change (demote, stop,
+start, promote: a short write stop without failover). Without that restart:
+
+```bash
+crm configure property maintenance-mode=true
+crm resource param postgres-db set conn_require_auth scram-sha-256
+crm_resource --refresh -r postgres-db      # records the new parameters, nothing is restarted
+crm configure property maintenance-mode=false
+```
+
+The standby switches its `primary_conninfo` with its next monitor (reload, the walreceiver reconnects). If it
+cannot authenticate afterwards it is handled like any standby that cannot stream (stopped, see the monitoring
+items above). To remove the parameter use `crm resource param postgres-db delete conn_require_auth` in the same
+procedure.
+
+### A standby recorded as not in sync
+
+When the primary stops waiting for its standby (standby fenced, stopped, or gone without fencing) it first
+records the standby as not in sync (`pgtwin-unsynced-<resource>`). From then on the primary may acknowledge
+commits the standby does not have, so pgtwin never promotes that node automatically, not even when the primary
+fails. The primary removes the record itself once the standby streams as synchronous standby again and has
+caught up. If the primary is lost for good while the record exists, no failover happens: decide whether the
+commits since the time in the record may be lost, then
+
+```bash
+crm_attribute -N <node> -n pgtwin-unsynced-postgres-db -l forever -D
+```
+
+and Pacemaker promotes that node.
+
+### Choosing the primary by hand
+
+pgtwin refuses an automatic promotion whenever the node might miss commits that were acknowledged elsewhere. If
+there was a conflict, a person decides. Every block can be overridden; each override accepts losing whatever the
+other node has and this one lacks (it is rewound or rebuilt when it rejoins).
+
+| Situation (log message) | To make `<node>` primary anyway |
+|---|---|
+| The primary recorded `<node>` as not in sync ("recorded as not in sync") | `crm_attribute -N <node> -n pgtwin-unsynced-postgres-db -l forever -D` |
+| `<node>` is alone and was not primary/async ("This node is alone ...") | `crm_attribute -N <node> -n pgtwin-promote-alone-postgres-db -l reboot -v true` |
+| Both nodes up, no primary, the other node has newer data ("Cold start: <other> has the newer data state") | `crm node standby <other>`: the other node stops, `<node>` is promoted; `crm node online <other>` afterwards, it is rewound to `<node>` |
+| A fence is not confirmed (no fence device reaches the other node) | only if the other node is really down: `stonith_admin --confirm <other>` |
+| Both nodes ran as primary after a full partition | before the partition heals, stop the side to discard (`crm cluster stop` there); after the heal the node promoted last stays primary automatically |
+| Alone without gateway (`isolation_action=demote`, "Alone without gateway") | restore the gateway, or `crm resource param postgres-db set isolation_action none` |
+
+Check the data first: `sudo -u postgres pg_controldata /var/lib/pgsql/data | grep -E "TimeLineID|checkpoint location"`
+on both nodes (higher timeline, then higher location = newer data).
+
+### When no fence device can confirm
+
+Fencing first: as long as any fence device can reach the other node (hypervisor, BMC, power) it is used, and two
+primaries never happen. When none of them can confirm - the host of the other node is dead, or every connection
+between the nodes is cut - Pacemaker waits, and with `rep_mode=sync` writes wait as well, until someone runs
+`stonith_admin --confirm <node>`.
+
+pgtwin cannot tell a dead node from a fully partitioned one. `fence_pgtwin` (installed with pgtwin in
+`/usr/sbin`) states "this node is alone" when the other node is not a cluster member and none of its addresses
+(corosync ring addresses plus `extra_addresses`) answers 5 consecutive pings; any answer makes it fail, the
+other node is alive. Use it only as the **last** level:
+
+```bash
+crm configure primitive fence-alone stonith:fence_pgtwin \
+    params pcmk_host_list="pg1 pg2" delay=5 ping_count=5 ping_interval=2 gateway_attribute=pingd \
+    op monitor interval=60s timeout=20s
+crm configure fencing_topology pg1: fence-virsh fence-alone pg2: fence-virsh fence-alone
+```
+
+It adds `delay + ping_count x ping_interval` (15 s) to a fence that the real device could not do. Lab: dead
+standby with an unreachable hypervisor, write gap 25 s.
+
+**In a full partition both nodes may get here.** Both are then primary until they meet again; the node promoted
+last stays primary, the other one is rewound and **loses the commits it acknowledged in between**. To keep that
+to the side the clients can reach:
+
+- `gateway_attribute=pingd` on `fence-alone`: a node that has lost its gateway never confirms, so as primary it
+  keeps waiting for its standby and acknowledges nothing.
+- `isolation_action=demote` on the pgtwin resource (default `none`): a primary that is alone and has lost its
+  gateway gives up the primary role after `isolation_threshold` (3) monitor runs, a standby in that state is not
+  promoted. Lab: the cut-off primary acknowledged nothing after the partition, the other side was primary after
+  25 s, and after the heal the old primary was rewound (0 acknowledged commits lost).
+
+Both rely on the ping resource. **Two data centres in which the services should go on on each side after a
+partition need a redundant gateway setup**: every side must reach a gateway of its own (for example one per data
+centre, both in the ping resource's `host_list`). A single gateway that lives in one data centre makes the other
+side look cut off: with `isolation_action=demote` it gives up, without it both sides run as primary.
+
+### A node that starts alone
+
+With `rep_mode=sync` a node that starts while its peer is not a cluster member (the other node is down, or the
+cluster network is cut) cannot compare its data with the peer. It becomes primary only if nobody can have
+written after it:
+
+- it was **primary running asynchronously** when it went down (it had recorded the standby as not in sync, so
+  the standby could not be promoted after it), or
+- it has been a healthy, unrecorded standby of the peer since it booted, both cluster members (an ordinary
+  failover).
+
+In every other case (it was a standby, or a primary still waiting for its standby) it starts as standby, is no
+promotion candidate and logs "This node is alone ...". As soon as the other node joins, pgtwin compares timeline
+and WAL position and promotes the node with the newer data. If the node that was primary/async does not come
+back, decide whether its last commits may be lost, then
+
+```bash
+crm_attribute -N <node> -n pgtwin-promote-alone-postgres-db -l reboot -v true
+```
+
+and Pacemaker promotes that node (the value is removed after the promotion and on reboot).
 
 ---
 

@@ -129,7 +129,7 @@ pgtwin v1.6 introduces intelligent replication failure detection and automatic r
 
 **New Parameters**:
 - `vip`: Virtual IP address for fast promoted node discovery (optional but recommended)
-- `replication_failure_threshold`: Number of monitor cycles before recovery (default: 5, ~40 seconds with 8s intervals)
+- `replication_failure_threshold`: Monitor cycles a standby may run without streaming before it is stopped (default: 5, about 60 seconds with a 10 s monitor interval)
 
 **Status**: Production Ready - v1.6.6 fixes all critical bugs from v1.6.0-v1.6.5.
 
@@ -493,6 +493,7 @@ sudo crm configure primitive postgres-db pgtwin \
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **1.8.2** | 2026-11-12 | A standby that cannot stream is stopped instead of tolerated, a standby that is not in sync is never promoted automatically, a node that starts alone is promoted only if it was primary/async, `fence_pgtwin` and `isolation_action` for the case that no fence device can confirm, optional server authentication for all agent connections (`conn_require_auth`) ([release notes](releasenotes/RELEASE_v1.8.2.md)) |
 | **1.8.1** | 2026-11-11 | Fixes from the 1.8.0 field tests: crashed standby after a timeline switch, no relax while the peer promotes, relax after a confirmed fence, upgrade score race, standby streams from the node instead of the VIP ([release notes](releasenotes/RELEASE_v1.8.1.md)) |
 | **1.8.0** | 2026-11-10 | Fast switchover (19-30 s), pg_rewind after crashes, standby-side slot, promotion and recovery fixes ([release notes](releasenotes/RELEASE_v1.8.0.md)) |
 | **1.7.x** | 2026-01 - 2026-10 | pgtwin-migrate, promotion by data state, WAL/slot fixes (see [CHANGELOG](CHANGELOG.md)) |

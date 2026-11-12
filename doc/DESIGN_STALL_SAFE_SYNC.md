@@ -219,7 +219,8 @@ acknowledged id checked on the final primary.
 - **A standby that runs but does not stream** (authentication, slot, rewind trouble): the monitor no longer
   relaxes, writes block until the standby's own recovery stops its instance. Before, the primary relaxed within
   one monitor interval. Option: relax when the condition persists longer than the promote timeout (a reachable
-  standby could otherwise be in the middle of its promotion after a stall of this node).
+  standby could otherwise be in the middle of its promotion after a stall of this node). Decided in 1.8.2: no
+  relax next to a running standby; the standby fails itself and is stopped (section 9).
 - **Full partition**: by design two independent regions; on healing the newer timeline wins (score and rule 2),
   the other side's writes of the partition are discarded by pg_rewind. Both sides promoted from standby during
   the partition (same timeline number, different data) needs an operator.
@@ -266,3 +267,157 @@ The promote after a fenced primary took 5 s: the promotion safety check searched
 the former primary as offline and clean (promote 1.4 s), and in any case when the former primary is a member
 with no instance running (switchover: write gap 18.0 -> 15.8 s). Without fencing a lost node is always asked:
 there it counts as clean on blind faith while its primary may still run.
+
+## 9. Sick standby and the "not in sync" record (1.8.2)
+
+### 9.1 Decision
+
+dmkif asked to relax `synchronous_standby_names` when a standby runs but does not stream for longer than the
+promote timeout (k3s: writes blocked without a bound are worse than a short asynchronous window). Declined in that
+form:
+
+- A standby that runs but does not integrate is **sick, not dead**. Relaxing next to it leaves a running
+  promotion candidate whose data is behind; every later event (primary failure, restart, end of a partition) can
+  then go either way.
+- The cluster makes it dead instead: the standby fails its own monitor, Pacemaker stops it (and fences the node
+  if the stop fails), and the primary relaxes on the post-stop notification, a proof it already accepts
+  (rule 1c). The primary never relaxes on its own observation of a reachable peer, so the stale-view problem (the
+  peer might be in the middle of its promotion) does not arise.
+- A stop is also the clearer state for the admin: a failed action with a reason, and a banned instance after
+  `migration-threshold` failures if the start cannot repair it.
+
+The relax after a stop still left a gap: the standby can come back, stream but not yet be caught up, and be
+promoted when the primary fails in that window (`no_primary_in_cluster` keeps it eligible). Then the commits the
+primary acknowledged without it are lost. In a long asynchronous period (dmkif: 17 days without a working
+standby) that would be all of them.
+
+### 9.2 Rules
+
+1. **Sick standby fails itself.** After `replication_failure_threshold` consecutive monitor cycles without
+   streaming, and only while a Promoted peer is an online member, the standby monitor returns an error. Without a
+   Promoted peer it does not (it may be the next primary). Repair moves to the start: timeline divergence ->
+   `pg_rewind`, removed WAL (detected by the monitor before failing, passed to the start) or a stuck WAL position
+   -> `pg_basebackup`. A standby that cannot be repaired (authentication) is banned after `migration-threshold`.
+2. **Record before relaxing.** Before a primary with `rep_mode=sync` writes an empty
+   `synchronous_standby_names` (post-stop notification, monitor rules 1a/1c, promote), it writes the permanent
+   node attribute `pgtwin-unsynced-<rsc>` (relax time) on the peer and waits until it is in the CIB. If it cannot
+   be written, the primary keeps waiting. A primary that runs asynchronously for any other reason (cold start)
+   writes it with its next monitor.
+3. **A recorded node is never a candidate.** `set_promotion_eligibility` keeps it at -INFINITY whatever the
+   caller found (also in the no-primary case), and promote refuses. Recovery after a loss of the primary then
+   needs an operator, who decides whether the commits since the recorded time may be lost (QUICKSTART).
+4. **Only the primary clears it**, once the peer streams as synchronous standby and has flushed past the WAL
+   position seen when it was first found in sync (all commits acknowledged without it lie below), usually in the
+   same monitor run. A primary that demotes cleanly also clears it when the peer streamed from it right before
+   the stop and has received past its shutdown checkpoint: the walsender ships all WAL before the shutdown ends,
+   so every commit lies below that checkpoint. Without this, a switchover seconds after a rejoin found the target
+   still recorded and the cluster ended without primary (HA suite, first 1.8.2 run). A node never clears its own
+   record: a stale primary (A') would otherwise drop the record B' set for it.
+
+The record is permanent so it survives a reboot of either node. Setting it too often is harmless (it is cleared
+seconds after the standby is back in sync); setting it too rarely would lose commits, hence "record first".
+
+### 9.3 Server authentication (`conn_require_auth`)
+
+All proofs above come from the cluster (corosync, authenticated). The agent's own PostgreSQL connections
+(probes, discovery, safety check, streaming, `pg_rewind`, `pg_basebackup`) did not verify the server: libpq
+accepts a server that skips authentication. Whoever takes a node address or the VIP could make a primary step
+down (rule 2), pass the safety check, or serve a standby wrong WAL or a wrong base backup. `conn_require_auth`
+(libpq `require_auth`, PostgreSQL 16+) closes that for remote connections; local socket connections (peer) are
+not affected. Default empty for test setups, required by the production checklist. A server that fails it gives
+an authentication error: the probe classifies it as "server error" (never proof), and a standby that cannot
+stream because of it is stopped by rule 1.
+
+### 9.4 Lab results (1.8.2)
+
+Same lab as 8.5 (two knet rings, `fence_virsh`, token 3000 ms), `conn_require_auth=scram-sha-256`,
+`replication_failure_threshold=5`, standby monitor every 10 s:
+
+| Scenario | Result |
+|---|---|
+| Primary serves the standby without authentication (`trust` in `pg_hba` for it) | standby refuses ("server did not complete authentication"), fails its monitor after 5 cycles, stopped; primary records it and relaxes: write gap 60.9 s, 0 lost |
+| Primary fenced while the standby is recorded | standby stays Unpromoted at -INFINITY; the primary comes back and is promoted again |
+| `pg_hba` repaired, cleanup | standby streams, record removed after the catch-up |
+| Standby frozen, fencing | record set by the primary before relaxing, write gap 12.4 s, removed after the rejoin, 0 lost |
+| Primary frozen 40 s, fencing | the promote records the old primary, write gap 18.0 s, removed after its rejoin, 0 lost |
+| Standby powered off, no fencing | record, relax after the 6 s window: write gap 16.6 s, 0 lost |
+| Standby back after its WAL was recycled on the primary (slot dropped) | starts, cannot stream; monitor sees the removed WAL, fails after 5 cycles, stopped; start rebuilds with `pg_basebackup`, streaming sync, record removed |
+| `test-pgtwin-ha-suite.sh` | 12/12 (first run 8/12: switchover right after a rejoin refused, see rule 4) |
+| `conn_require_auth` changed with `crm resource param` | standby: reload-agent; primary: restart (Pacemaker restarts a promoted instance on any parameter change, 16-18 s write stop); with maintenance mode + `crm_resource --refresh`: nothing restarted, 0.4 s |
+
+
+### 9.5 A node that starts alone
+
+A node whose peer is not a cluster member cannot compare data states. It
+may be promoted only if nobody can have written after it (`promotion_alone_blocked`, `rep_mode=sync` only):
+
+1. It was **primary/async** when it went down: it ran without waiting for its standby, and since 9.2 rule 2 that
+   means the standby is recorded, so the standby was no candidate after it. Running primary: empty
+   `synchronous_standby_names` (start path). Demoted at a shutdown with the peer not streaming and recorded:
+   `.pgtwin_last_primary_async` (written before anything in the demote can fail, removed by a promote and by
+   streaming as a member).
+2. Or it has been a healthy, unrecorded standby of the peer **as a cluster member** since it booted
+   (`$HA_RSCTMP/pgtwin-<rsc>.streamed`, gone after a reboot). That is an ordinary failover, 9.2 applies.
+   Streaming without the peer as member does not count: dmkif's finding E blocked only corosync, the rebooted
+   standby streamed asynchronously from a primary whose record it could not see.
+
+Anything else (standby, or primary/sync when it went down) is not eligible: a standby at -INFINITY, promote
+refuses. A former primary/sync that starts alone starts as such a standby (before: `OCF_ERR_CONFIGURED`, which
+blocked the peer's start as well). Once the peer is a member, the data-state comparison decides. If the
+primary/async node never returns: operator override `pgtwin-promote-alone-<rsc>` (transient).
+
+Startup fencing (`no-quorum-policy=ignore`, the pgtwin default) is Pacemaker's; the rule only makes sure that a
+node fenced and rebooted during a partition does not promote itself with older data.
+
+### 9.6 No fence device can confirm
+
+Fencing first; two primaries are the last thing to happen. When no fence device can confirm (host of the node
+dead behind hypervisor fencing, full partition), Pacemaker waits for `stonith_admin --confirm`. A dead node and a
+fully partitioned one look the same from here, so the decision is "this node is alone":
+
+- `fence_pgtwin`, last level of `fencing_topology`: confirms if the target is not a member, and none of its
+  addresses (corosync rings plus `extra_addresses`) answers `ping_count` pings after `delay`. Any answer: the
+  target is alive, not confirmed (operator). With `gateway_attribute`: never confirms while this node's gateway
+  attribute is 0.
+- `isolation_action=demote` (default `none`): primary alone with gateway attribute 0 for `isolation_threshold`
+  monitor runs: score -INFINITY, Pacemaker demotes it; a standby in that state is not a candidate; the no-fencing
+  relax rule (1a) does not relax there. A missing attribute is "unknown", never "lost".
+
+With both, a primary cut off from its gateway never relaxes (no confirmation), acknowledges nothing and steps
+down; the side with the gateway confirms and promotes. If both sides keep a gateway, both become primary; when
+they meet, rule 2 (newer timeline wins) keeps the node promoted last and the other is rewound, losing what it
+acknowledged in between: the accepted last resort. Two data centres whose services should go on on each side
+need a gateway per side (redundant gateway); a single gateway in one data centre makes the other side "cut off".
+
+SBD as an extra level adds information only where its disk survives what the node dies of; in a two data centre
+setup it sits in one of them. A QDevice in a third place helps some partitions, but not one that also cuts it off.
+
+### 9.7 Divergence after a demote while alone
+
+A primary demoted while it cannot reach the new primary has WAL on the old timeline after the switch point
+(commits that waited for the standby, the shutdown checkpoint). Its walreceiver later fetches the new history
+file; `local_effective_timeline` took any newer history file as "follows that timeline" (1.8.1, against false
+divergences of crashed standbys, whose minimum recovery point is already on the new timeline). Now a history
+file counts only if the node's position on its checkpoint timeline (checkpoint or minimum recovery point) is not
+past that file's switch point for it; otherwise the start sees the divergence and runs `pg_rewind`.
+
+### 9.8 Lab results (sections 9.5-9.7)
+
+Same lab, `fence-alone` (`fence_pgtwin`, `delay=5 ping_count=5 ping_interval=2 gateway_attribute=pingd`) as
+level 2 after `fence-virsh`, ping resource on the hypervisor host (192.168.122.1):
+
+| Scenario | Result |
+|---|---|
+| Finding E: both rings blocked on the primary, PostgreSQL reachable, `no-quorum-policy=ignore` | primary fences the standby, relaxes; rebooted standby: "alone", stays standby, fences the primary; primary back, comparison promotes it; 179 acknowledged, 0 lost |
+| `fence-virsh` unreachable from the primary, standby destroyed | `fence_pgtwin` confirms after 15 s, primary records and relaxes: write gap 25 s, 0 lost |
+| Full partition (all traffic, VIP, hypervisor fence), gateway on both | both confirm, both primary; heal: old primary steps down (rule 2), rewound; its 240 commits acknowledged after relaxing are lost (expected) |
+| Same, primary loses the gateway, `isolation_action=demote` | cut-off primary never confirms or relaxes, demotes after 3 runs; other side primary after 25 s; heal: divergence detected (9.7), rewound; 0 lost |
+| Same before the 9.7 fix | old primary not rewound, could never stream, stopped for good |
+
+### 9.9 Cold start ranking
+
+Both nodes standbys, no primary: `cold_start_eligibility` (end of the start, and every monitor in the "no primary
+exists" branch) compares timeline and LSN with the peer once the peer answers as a standby. Newer: score base +
+5000 (above location and ping rules, below the promoted bonus); older: -INFINITY; equal: base (the scheduler's
+choice, either loses nothing). `promotion_data_state_guard` at promote time stays the safety net. Lab: preferred
+node unable to catch up, the other newer: promoted directly, no failed action (dmkif T5 had a failed promote).
