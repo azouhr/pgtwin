@@ -396,8 +396,12 @@ sudo corosync-quorumtool
 # Check quorum expected votes
 sudo corosync-quorumtool -s
 
-# Set expected votes (emergency only!)
-sudo corosync-quorumtool -e 1  # WARNING: Use with caution!
+# A node that restarted alone waits for its peer (variant B, no-quorum-policy unset):
+# release it (corosync 3.1+); Pacemaker then fences the peer and starts the resources
+sudo corosync-cmapctl -s quorum.cancel_wait_for_all u8 1
+
+# Quorum policy (crm cluster join deletes "ignore": check after every join)
+sudo crm_attribute -t crm_config -n no-quorum-policy -G
 ```
 
 ---

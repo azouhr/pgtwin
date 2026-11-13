@@ -455,11 +455,24 @@ Without `-y`, crmsh asks the open questions interactively. `crm cluster join` ne
 node 1 as root (crmsh asks for the password if no key is set up). crmsh configures corosync with `two_node: 1`,
 creates the `fence_sbd` resource and enables fencing.
 
+A two-node cluster needs `two_node: 1` in the `quorum` section of corosync.conf (crmsh and pcs set it; a
+hand-written corosync.conf must contain it). Check on both nodes once node 2 has joined:
+
+```bash
+sudo corosync-quorumtool -s | grep Flags
+# Flags:            2Node Quorate WaitForAll
+```
+
+See "Quorum in a two-node cluster" in the Production Checklist for what it does.
+
 ### 2.5 Configure Cluster Properties
 
 ```bash
 # On node 1
 sudo crm configure property cluster-recheck-interval=1min
+
+# Only now, after node 2 has joined: every "crm cluster join" deletes this property
+sudo crm configure property no-quorum-policy=ignore
 
 # Verify that fencing is enabled
 # (Pacemaker 3 renamed stonith-enabled to fencing-enabled; crm cluster init with -s sets it to true)
@@ -468,6 +481,14 @@ sudo crm configure show | grep -E "fencing-enabled|stonith-enabled"
 
 **Note**: Only for a test setup without any fencing device: `sudo crm configure property fencing-enabled=false`
 (`stonith-enabled=false` on Pacemaker 2). Never run a production cluster without fencing.
+
+**`no-quorum-policy=ignore`** is the pgtwin reference (variant A). It lets a node that restarts while its peer is
+away come back by itself, and it keeps production running while a second pgtwin pair is a member of the cluster
+(a `pgtwin-migrate` migration). A cluster that always stays at two nodes may leave the property unset instead
+(variant B). The reasons and costs of both are in "Quorum in a two-node cluster" in the Production Checklist.
+`crm cluster join` removes `ignore` on every join (crmsh `join_cluster`): set it again after each join, also after
+a node has been rebuilt or new nodes have been added. Check with
+`crm_attribute -t crm_config -n no-quorum-policy -G`.
 
 **Failover time after a node crash is dominated by fencing, not by pgtwin.** Measured on a two-node KVM lab with
 the values `crm cluster init` sets (power-off of the primary until the standby is promoted, 114 s in total):
@@ -1066,6 +1087,9 @@ Before deploying to production, verify:
     by default nothing fails over until someone confirms the fence by hand. `fence_pgtwin` as the last fencing
     level lets a node that no longer reaches the other one on any connection go on alone, see "When no fence
     device can confirm" below
+  - Corosync has `two_node: 1` (`corosync-quorumtool -s` shows `2Node`), and `no-quorum-policy` is what you
+    decided (variant A: `ignore`, set after the last `crm cluster join`; variant B: unset), see "Quorum in a
+    two-node cluster" below
   - A ping resource (`ocf:pacemaker:ping`) on the gateway the clients use. For two data centres in which each side
     should go on after a partition, each side needs a gateway it reaches on its own (redundant gateway)
   - VIP configured and reachable
@@ -1121,15 +1145,47 @@ procedure.
 A real quorum is a majority of votes: at least three voters, preferably an odd number (with four, a 2/2 split
 leaves no side with a majority). Two nodes cannot have one: each half of a split holds exactly half of the votes.
 
-Corosync's `two_node: 1` (set by `crm cluster init`) therefore lowers the requirement to one vote, and a single
-node is reported as "quorate". That only means it may keep running services; it says nothing about whether the
-other node is dead or just cut off, and in a partition both halves report quorum. The one thing it adds is
-`wait_for_all`: after a start, a node counts itself quorate only once it has seen its peer. pgtwin sets
-`no-quorum-policy=ignore`, so that a node can still start when the other one is dead or under repair.
+Corosync's `two_node: 1` (set by crmsh and pcs for two nodes) therefore lowers the requirement to one vote:
+
+- **A running node keeps quorum alone.** When its peer fails, is fenced or is stopped for an update, the other
+  node keeps running and failover works. That is what makes failover, switchover and rolling updates possible.
+- **In a partition both halves report quorum.** "Quorate" says nothing about whether the other node is dead or
+  just cut off; fencing decides.
+- **`wait_for_all`** (switched on with `two_node`): after corosync starts on a node, the node counts itself
+  quorate only once it has seen its peer. It affects only a node that starts while its peer is away; a running
+  node never. While such a node waits, Pacemaker runs its probes and nothing else: no start, no promote, no
+  fencing.
+
+`no-quorum-policy` only matters for a partition without quorum. With two nodes that is exactly the node waiting
+for its peer after its own start. `ignore` lets it act anyway: Pacemaker fences the peer it has not seen
+(startup fencing, which needs a confirmation from a fence device), starts the resources, and pgtwin promotes it
+only if it was primary/async ("A node that starts alone" below).
+
+**More than two corosync members.** A `pgtwin-migrate` migration (e.g. PostgreSQL 17 to 18) adds a second pgtwin
+pair, with its own primary, to the same corosync cluster. While it is a member, `two_node` is off (crmsh removes it
+on the join), there are four votes and a quorum of three. With the default policy production then depends on the
+votes of the second pair: when its nodes are stopped, 2 of 4 votes, no quorum, and Pacemaker stops production
+PostgreSQL. With two data centres a split is always 2:2, so even four votes never give one side a majority.
+
+The two variants:
+
+| | Variant A: `no-quorum-policy=ignore` (pgtwin reference) | Variant B: property unset |
+|---|---|---|
+| Node restarts while its peer is away (repair, failed update, other data centre down) | comes back by itself: startup fence of the peer, then start; promoted only if it was primary/async | waits until released: `corosync-cmapctl -s quorum.cancel_wait_for_all u8 1` (corosync 3.1 or later), see "Choosing the primary by hand" |
+| Network between the nodes fails | the loser of the fencing race reboots, fences the healthy primary at startup, and the two can keep fencing each other while the fault lasts; data stays safe through pgtwin's rules (finding E: 44 s instead of 4 s in an external lab) | the rebooted node waits, nobody is fenced wrongly |
+| Second pgtwin pair in the cluster (migration) | no extra step beyond setting `ignore` again after the joins | set `ignore` after the last join of the new nodes, remove it after the old nodes have been removed; if the first is forgotten, production stops when the new nodes are stopped; if the second is forgotten, the cluster silently runs variant A |
+
+pgtwin works with both. With variant A a migration has one quorum step (`ignore` again after the joins, because
+of crmsh, see below), and if it is forgotten that shows at once; variant B has two, and a forgotten second one
+does not show. Variant B suits a cluster that always stays at two nodes and values a quiet network fault more
+than an automatic restart. **`crm cluster join` deletes
+`no-quorum-policy=ignore` on every join** (crmsh `join_cluster`), and `crm cluster remove` restores `two_node: 1`
+but leaves the policy as it is. With either variant, check the property after every join and removal:
+`crm_attribute -t crm_config -n no-quorum-policy -G`.
 
 A third vote (a QDevice, a third node) only helps if it sits in a third place that fails independently of both
-data centres; in a two data centre setup there is none. pgtwin is built for that setup and does not rely on
-quorum. Its protection is:
+data centres; in a two data centre setup there is none, and during a migration its vote would have to move with
+the production role. pgtwin is built for that setup and does not rely on quorum. Its protection is:
 
 - **fencing first**: as long as a fence device can reach the other node, it is stopped, and two primaries never
   happen;
@@ -1164,6 +1220,7 @@ other node has and this one lacks (it is rewound or rebuilt when it rejoins).
 | Situation (log message) | To make `<node>` primary anyway |
 |---|---|
 | The primary recorded `<node>` as not in sync ("recorded as not in sync") | `crm_attribute -N <node> -n pgtwin-unsynced-postgres-db -l forever -D` |
+| Variant B: `<node>` restarted while its peer is away and waits for it (`crm_mon`: "partition WITHOUT quorum", `corosync-quorumtool -s`: no `Quorate` flag) | `corosync-cmapctl -s quorum.cancel_wait_for_all u8 1` on `<node>` (corosync 3.1 or later). Pacemaker then fences the peer (still needs a fence confirmation) and starts the resources; pgtwin promotes `<node>` only if it was primary/async, otherwise see the next row |
 | `<node>` is alone and was not primary/async ("This node is alone ...") | `crm_attribute -N <node> -n pgtwin-promote-alone-postgres-db -l reboot -v true` |
 | Both nodes up, no primary, the other node has newer data ("Cold start: <other> has the newer data state") | `crm node standby <other>`: the other node stops, `<node>` is promoted; `crm node online <other>` afterwards, it is rewound to `<node>` |
 | A fence is not confirmed (no fence device reaches the other node) | only if the other node is really down: `stonith_admin --confirm <other>` |
@@ -1214,8 +1271,9 @@ side look cut off: with `isolation_action=demote` it gives up, without it both s
 ### A node that starts alone
 
 With `rep_mode=sync` a node that starts while its peer is not a cluster member (the other node is down, or the
-cluster network is cut) cannot compare its data with the peer. It becomes primary only if nobody can have
-written after it:
+cluster network is cut) cannot compare its data with the peer. (With variant B of "Quorum in a two-node cluster"
+it does not get this far: it waits for its peer until released with `cancel_wait_for_all`.) It becomes primary
+only if nobody can have written after it:
 
 - it was **primary running asynchronously** when it went down (it had recorded the standby as not in sync, so
   the standby could not be promoted after it), or

@@ -27,6 +27,11 @@
 ###############################################################################
 
 # Configure cluster properties
+# no-quorum-policy=ignore: variant A, the pgtwin reference (QUICKSTART.md "Quorum in a two-node cluster"):
+# a node that restarts while its peer is away comes back by itself, and production keeps running while a
+# second pgtwin pair (pgtwin-migrate) is a member of the cluster. A cluster that always stays at two nodes
+# may leave it unset (variant B). "crm cluster join" deletes it on every join: load this file, or set the
+# property again, after the last node has joined.
 property cib-bootstrap-options: \
     have-watchdog=true \
     stonith-enabled=true \

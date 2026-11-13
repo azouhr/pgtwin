@@ -128,7 +128,7 @@ This guide demonstrates how to set up a highly available 2-node PostgreSQL clust
 With dual Corosync rings, network partition between nodes requires **both rings to fail simultaneously**. This is considered a **double failure** outside the design scope of this configuration.
 
 - **Single ring failure** → Corosync continues on remaining ring ✅
-- **Both rings fail (nodes alive, communication lost)** → Network isolation, quorum lost (not designed for)
+- **Both rings fail (nodes alive, communication lost)** → Network isolation; both nodes keep quorum (`two_node: 1`) and fencing decides (not designed for)
   - ⚠️ **Important**: This means both communication paths fail while **both nodes remain operational**
   - This is a network/communication failure, not a node crash or hardware failure
 - **Therefore**: If both nodes are healthy and reachable, Corosync ALWAYS has connectivity
@@ -685,7 +685,10 @@ logging {
 4. **Different mcastports**: 5405 for Ring 0, 5407 for Ring 1
 5. **nodelist**: Explicit node definitions with both ring addresses
 6. **`two_node: 1`**: Special quorum handling for 2-node clusters
-7. **`wait_for_all: 1`**: Wait for all nodes before forming quorum (safer for 2-node)
+7. **`wait_for_all: 1`**: After corosync starts, a node is quorate only once it has seen its peer (this is the
+   default with `two_node: 1` and stated here only for clarity). It affects only a node that starts while its
+   peer is away. With `no-quorum-policy=ignore` (step 8) Pacemaker acts on such a node anyway; see "Quorum in a
+   two-node cluster" in QUICKSTART.md for both variants
 
 **Why These Timeout Values?**
 
@@ -913,7 +916,12 @@ Then load it with: `sudo crm configure load update pgsql-resource-config.crm`
 # Test setups without any fencing device only:
 #   sudo crm configure property fencing-enabled=false    (Pacemaker 2: stonith-enabled=false)
 
-# Enable cluster startup
+# Variant A, the pgtwin reference: a node that restarts while its peer is away comes back by itself,
+# and production keeps running while a second pgtwin pair (pgtwin-migrate) is a member of the cluster.
+# Cost: if the network between the nodes fails, the fenced node fences the healthy primary at startup.
+# A cluster that always stays at two nodes may leave it unset (variant B, QUICKSTART.md
+# "Quorum in a two-node cluster"). If nodes join with "crm cluster join", set it again after every join:
+# crmsh deletes it on each join.
 sudo crm configure property no-quorum-policy=ignore
 
 # Resource stickiness: use rsc_defaults (the property default-resource-stickiness has no effect
@@ -1055,7 +1063,7 @@ PostgreSQL replication requires network connectivity between primary and standby
 |------------|-------------------|---------------------|-------------------|
 | Ring 0 + Ring 1 working | Yes (preferred +200) | Yes | Enabled (both nodes) |
 | Ring 0 down, Ring 1 up | Yes (score 100/50) | No (-inf) → **Stopped** | Disabled (auto) |
-| Both rings down | No (no quorum) | No | N/A (cluster down) |
+| Both rings down | Only the winner of the fencing race | No (fenced) | Disabled after the fence is confirmed |
 
 **Key Parameters**:
 - **`notify="true"`**: Enables dynamic sync replication management (v1.6.6 feature)
@@ -1545,7 +1553,9 @@ sudo ip link set eth0 down
    # On psql1 (via console only)
    sudo crm status
 
-   # Expected: psql1 loses quorum, stops resources
+   # Expected: psql1 still reports quorum (with two_node: 1 both halves of a partition do).
+   # It reaches neither psql2 nor, usually, its fence device, so it cannot fence psql2.
+   # If it is primary, its writes wait for the standby and are not acknowledged.
    ```
 
 3. **Check cluster status on psql2**:
@@ -1553,7 +1563,8 @@ sudo ip link set eth0 down
    # On psql2
    sudo crm status
 
-   # Expected: psql2 detects psql1 offline, may fence or wait
+   # Expected: psql2 detects psql1 offline and fences it (if its fence device is reachable),
+   # then it is (or stays) primary. Without a confirmed fence it waits.
    ```
 
 4. **Check quorum**:
@@ -1585,7 +1596,7 @@ sudo ip link set eth0 down
 
 **Expected Result**: ✅ No split-brain, proper quorum handling
 
-**Note**: VIP failures ("`vip-postgres start on psql1 returned 'Not installed' ([findif] failed)`") are rare in this test since Pacemaker stops resources when quorum is lost, before interfaces disappear. VIP cleanup is usually only needed in Test 1 where the interface disappears while the node still has quorum.
+**Note**: With `two_node: 1` psql1 keeps quorum when both interfaces go down; it is stopped by the fence from psql2, not by a loss of quorum. If the interface disappears while the VIP still runs there, a VIP failure ("`vip-postgres start on psql1 returned 'Not installed' ([findif] failed)`") can remain after the restoration; clean it up as in Test 1.
 
 ---
 
@@ -2120,7 +2131,7 @@ t+18s   Sync replication enabled
 | **Ring 0 fails on standby** | Stays on psql1 | Stops on psql2 | Disabled ('') | post-stop | Async mode, writes OK |
 | **Ring 0 restored on stopped** | Stays on psql2 | Starts on psql1 | Enabled ('*') | post-start | Back to sync mode |
 | **Ring 1 fails (Ring 0 OK)** | No change | No change | Enabled ('*') | - | Corosync on Ring 0 |
-| **Both rings fail (nodes alive)** | Cluster down | Cluster down | N/A | - | Network isolation, quorum lost |
+| **Both rings fail (nodes alive)** | Winner of the fencing race | Loser fenced | Disabled ('') after the fence | post-stop | Network isolation, both nodes keep quorum, fencing decides |
 | **Manual standby stop** | No change | Stopped | Disabled ('') | post-stop | Async mode |
 | **Manual standby start** | No change | Started | Enabled ('*') | post-start | Sync mode restored |
 
@@ -2231,7 +2242,7 @@ iperf3 -c 10.10.10.2
 | **Infrastructure Cost** | Higher (storage network) | Lower (just cables) |
 | **Complexity** | Medium (storage setup) | Low (network config) |
 | **Failure Detection** | Fast (SBD watchdog) | Fast (Corosync heartbeat) |
-| **Fencing Mechanism** | Strong (hardware reset) | Software-based (quorum) |
+| **Fencing Mechanism** | Strong (hardware reset) | None by itself (needs a fence device) |
 
 **Recommendation**:
 - **Development/Testing**: Dual ring (no SBD) is sufficient

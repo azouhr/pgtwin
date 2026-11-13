@@ -15,9 +15,17 @@ Release notes: `releasenotes/RELEASE_v1.8.3.md`.
 ### Documentation
 - QUICKSTART "Choosing the primary by hand": after a full partition, start the stopped side again only after
   the heal. Both full-partition overrides tested in the lab.
-- QUICKSTART "Quorum in a two-node cluster": what `two_node: 1` means (a single node is reported quorate, both
-  halves of a partition are), why `no-quorum-policy=ignore` is the default, and that pgtwin relies on fencing and
-  the data rules, not on quorum, because a two data centre setup has no independent third vote.
+- QUICKSTART "Quorum in a two-node cluster": what `two_node: 1` and `wait_for_all` do, that pgtwin relies on
+  fencing and the data rules, not on quorum, and the two choices for `no-quorum-policy`: variant A `ignore` (the
+  reference: lone restart without a person, no quorum step during a `pgtwin-migrate` migration with four votes;
+  cost: startup fencing of the healthy primary when the network between the nodes fails) and variant B unset
+  (for clusters that stay at two nodes; lone restart released with `cancel_wait_for_all`, new row in "Choosing
+  the primary by hand").
+- `crm cluster join` deletes `no-quorum-policy=ignore` on every join: QUICKSTART 2.5 sets it after the join, new
+  section "Nodes Joining or Leaving the Cluster" in doc/MAINTENANCE_GUIDE.md, checks in the production checklist.
+  QUICKSTART 2.4 states the `two_node: 1` requirement.
+- Corrected quorum statements in QUICKSTART_DUAL_RING_HA.md (both rings down: both nodes keep quorum, fencing
+  decides), PGTWIN_CONCEPTS.md, README.md, CHEATSHEET.md and pgsql-resource-config.crm.
 
 ## [1.8.2] - 2026-11-12
 

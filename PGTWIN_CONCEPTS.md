@@ -566,7 +566,9 @@ pgtwin handles various failure scenarios automatically:
 
 #### 2.4.4 Split-Brain Prevention
 
-pgtwin relies on Pacemaker's quorum and STONITH to prevent split-brain:
+pgtwin relies on fencing (STONITH) and its own data rules to prevent split-brain, not on quorum: two nodes
+cannot have a real quorum (with `two_node: 1` each half of a partition reports quorum), see "Quorum in a
+two-node cluster" in QUICKSTART.md.
 
 ```
 Two-node cluster with SBD (STONITH Block Device):
@@ -586,7 +588,7 @@ Node2 loses network:
 
 **Requirements**:
 - STONITH must be enabled (`stonith-enabled=true`)
-- Quorum must be enforced
+- Corosync with `two_node: 1`; `no-quorum-policy` set as decided (variant A `ignore`, variant B unset)
 - SBD or other fencing mechanism configured
 
 ### 2.5 Key Features Summary
@@ -1277,7 +1279,7 @@ PG18 cluster failover (pgtwin handles):
 - Cluster Information Base (CIB) for discovery
 - Notify support for dynamic configuration
 - Colocation/ordering constraints for resource placement
-- Quorum and STONITH for split-brain prevention
+- STONITH (fencing) for split-brain prevention; quorum carries no information with two nodes
 
 **Benefits**:
 - Well-understood operational model

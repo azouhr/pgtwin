@@ -804,7 +804,35 @@ psql -h 192.168.122.20 -U postgres -c "SELECT inet_server_addr();"
 # 8. Check data integrity
 # Run application-specific health checks
 # Verify row counts in critical tables
+
+# 9. Verify quorum settings (after any node joined or was removed)
+sudo corosync-quorumtool -s | grep Flags        # two nodes: 2Node Quorate WaitForAll
+sudo crm_attribute -t crm_config -n no-quorum-policy -G
 ```
+
+### Nodes Joining or Leaving the Cluster
+
+`crm cluster join` deletes `no-quorum-policy=ignore` on every join, and `crm cluster remove` restores
+`two_node: 1` when two nodes remain but leaves the policy as it is (crmsh `join_cluster` / `remove_node_from_cluster`). This
+matters whenever a node joins:
+
+- **Initial setup**: node 2 joins the single-node cluster of node 1. Set `ignore` after the join, not before.
+- **A rebuilt node** (reinstall, new VM, new hardware) joins again: set `ignore` again afterwards.
+- **A second pgtwin pair** joins for a `pgtwin-migrate` migration: `two_node` is switched off (four votes, quorum
+  three). Set `ignore` after the last new node has joined; otherwise production loses quorum as soon as the new
+  nodes are stopped. After the cutover and the removal of the old nodes, `two_node` is back; the policy stays as
+  set.
+
+With variant B (property unset, see "Quorum in a two-node cluster" in QUICKSTART.md) set `ignore` for the time
+the second pair is a member and remove it again after the old nodes have been removed:
+
+```bash
+sudo crm configure property no-quorum-policy=ignore      # after the last join
+sudo crm_attribute -t crm_config -n no-quorum-policy -D  # variant B only, after the removal
+```
+
+A cluster joined with a hand-written corosync.conf and `systemctl start pacemaker` (no crmsh) keeps the
+property.
 
 ### Emergency Rollback Procedures
 

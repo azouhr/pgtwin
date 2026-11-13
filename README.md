@@ -303,7 +303,8 @@ See [doc/BUGFIX_PG_BASEBACKUP_FINALIZATION.md](doc/BUGFIX_PG_BASEBACKUP_FINALIZA
 **Rationale**:
 - Many organizations need basic HA but can't afford 3+ Datacenters
 - Patroni requires 3+ nodes (1 DCS cluster + N PostgreSQL nodes minimum)
-- Pacemaker's 2-node quorum is well-established and reliable
+- Pacemaker/Corosync handle 2-node clusters well (`two_node: 1`); with two nodes pgtwin relies on fencing and
+  its data rules, not on quorum
 - Simpler architecture = easier to understand and operate
 
 **Trade-off**: Cannot survive simultaneous failure of both nodes. For geographic distribution or multi-site HA, use Patroni instead.
