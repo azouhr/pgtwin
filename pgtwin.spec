@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           pgtwin
-Version:        1.8.3
+Version:        1.8.4
 Release:        1
 Summary:        PostgreSQL 2-Node High Availability OCF Resource Agent
 License:        GPL-2.0-or-later
@@ -91,6 +91,13 @@ install -m 0644 VERSION %{buildroot}%{_docdir}/%{name}/
 %license %{_docdir}/%{name}/LICENSE
 
 %changelog
+* Mon Nov 16 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.4-1
+- Release v1.8.4: the peer is the other node of node_list; with more than two
+  cluster nodes (a second pgtwin pair for pgtwin-migrate) it was the first other
+  node of the whole cluster, and acknowledged commits could be lost
+- node_list is required when the cluster has more than two nodes
+- Documentation: update the agent by copy + rename on a running cluster
+
 * Thu Nov 12 2026 Berthold Gunreben <azouhr@opensuse.org> - 1.8.3-1
 - Release v1.8.3: a primary removes the "not in sync" record on itself once the
   peer follows it as synchronous standby (record left from a full partition made

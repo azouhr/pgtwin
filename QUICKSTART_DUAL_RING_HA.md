@@ -590,8 +590,9 @@ sudo zypper install -y \
 
 ```bash
 # Copy pgtwin OCF agent
-sudo cp /path/to/pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin
-sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 /path/to/pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin.new /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify installation
 sudo ocf-tester -n pgtwin -o pgdata=/tmp/test || echo "Test expected to fail without valid PGDATA"

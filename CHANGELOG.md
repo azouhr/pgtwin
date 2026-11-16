@@ -1,3 +1,93 @@
+## [1.8.4] - 2026-11-16
+
+Release notes: `releasenotes/RELEASE_v1.8.4.md`.
+
+### Fixed
+- **With more than two nodes in the Pacemaker cluster, the peer was a node of another pair** (doc/STATE_MATRIX.md
+  M5). The peer was the first other node of the whole cluster (five separate detections: `get_peer_node_name`,
+  `get_peer_member_name`, the "first node_list entry" fallback of `resolve_cluster_node_to_hostname`, the
+  `.pgpass` host fallback and a member count). With a second pgtwin pair for `pgtwin-migrate` (lab: PG17 pair
+  pg1/pg2, PG18 pair pg3/pg4), pg3 and pg4 both took pg1 as peer: the record went to pg1 instead of the real
+  standby, the promotion safety check and the data comparison looked at the wrong node, the lone start rule never
+  applied (pg1 was a member), and peer probes of pg3 asked its own PostgreSQL. Result in the lab: a standby that
+  was not recorded was promoted alone, 481 acknowledged commits missing. Now one set of functions
+  (`pgtwin_pair_nodes`, `pgtwin_peer`, `pgtwin_peer_member`, `pgtwin_peer_host`) decides, and every caller uses
+  it. Lab retest: the record goes to the real standby, the standby stays unpromoted when it is alone, all
+  acknowledged commits present.
+- The "alone with sync" promotion guard (v1.6.14) counted all cluster members and never applied with more than two
+  nodes; it now asks whether the peer of the own pair is a member.
+- A record that cannot be written because the peer is undetermined keeps synchronous replication (before: counted
+  as written).
+
+### Changed
+- **`node_list` is required when the Pacemaker cluster has more than two nodes.** It must name exactly the two
+  nodes of this PostgreSQL cluster, this node included; start and validate-all refuse otherwise
+  (`OCF_ERR_CONFIGURED`), the monitor logs the problem every 5 minutes. Two-node clusters may still leave it
+  empty. **Upgrade:** set `node_list` on every pgtwin clone before a third node joins.
+
+### pgtwin-migrate 2.1.0 (experimental, review requested)
+- Sanity checks in the pattern of pgtwin's `*_valid` functions, on start, `validate-all` (before: always
+  success) and before every cutover (the cutover makes the other cluster production): both clusters are pgtwin
+  clones, `node_list` with the two nodes of each pair, no overlap, each clone runs only on its own list; pgtwin
+  1.8.4 or newer on the node; `-INFINITY` locations with `resource-discovery=never` for every node outside a
+  clone's `node_list` (dmkif: a probe of one clone stopped the other cluster's PostgreSQL); a warning for more
+  than two votes without `no-quorum-policy=ignore`. Not in the monitor. Test: `test/test-migrate-sanity.sh`.
+- pgtwin: the `node_list` check is now `pair_config_valid`, like the other checks.
+- **Cutover lost acknowledged commits** (dmkif 1.8.2 runs A-C). Lab rerun under load (one insert every 0.25 s
+  through the production VIP, PG17 -> PG18): **2887 of 2887** acknowledged ids on the new production; the
+  writer got "read-only transaction" errors during the 37 s window instead of acknowledgements.
+  - Step 1 never set read-only: `ALTER SYSTEM ...; SELECT pg_reload_conf()` in one `psql -c` is one
+    transaction, which ALTER SYSTEM refuses; the error went to /dev/null. Now `set_cluster_read_only`
+    (separate statements, verified), open client sessions over TCP are ended (their transactions roll back),
+    and the migration user is exempted by a role setting (it must drop and create the directions there).
+  - Step 2 compared a column that does not exist and read the error as lag 0. Now `direction_slot_state`
+    reads the slots on the publisher: every slot must have confirmed the WAL position taken after step 1; a
+    failing query or a missing slot aborts and sets the old production read-write again. Same helper in the
+    pre-cutover stability check (it passed on an unknown lag before).
+  - A direction created by a cutover uses `copy_data=false` (run C: the forward direction after a cutover
+    back failed on the first primary key). A database new on production uses `copy_data=true` in both
+    directions (reverse used false, its rows never arrived).
+  - Before the VIP swap, every slot of the new direction must exist on the new production, otherwise the
+    cutover rolls back: a slot keeps only the WAL from its creation on, writes before it can only be copied.
+  - A missing slot is no longer recreated at the current position (runs B and 18 -> 18: 53 and 553 commits
+    silently missing): start and monitor fail with "Mirror incomplete" and the resync steps. Same for a
+    publication whose subscription is missing. The monitor checks the active direction (before: forward only).
+  - `CREATE SUBSCRIPTION` errors were reported as success (`local x=$(...)` returns the status of `local`),
+    and a failed subscription check was "non-fatal": both fatal now; same fix for `CREATE DATABASE`,
+    `pg_restore` and the database discovery.
+  - The database list of a cutover came from the requested production (the `production_cluster` parameter),
+    not from the current one.
+  - The stability wait (up to `stability_timeout`) ran in the monitor and outlasted its timeout; it is now
+    step 0 of the background cutover.
+  - The DDL trigger of the old direction was never dropped (wrong name, `..._trigger_<db>`): after a cutover it
+    sent DDL that arrived through the new direction back again.
+  - The monitor stopped the resource (`target-role=Stopped`) after every cutover, despite a comment saying
+    this was removed: nobody watched the reverse mirror and no cutover back could start. Removed, also from
+    the v1 completion path.
+  - Lab cut back PG18 -> PG17 under load: 669 of 669 acknowledged ids on both clusters, tables identical,
+    forward direction created without copying (no duplicate keys).
+- **Shorter write window: 10.8 s instead of 35-62 s** (lab, three databases, writer through the VIP, 0 of 518
+  acknowledged commits lost, tables identical afterwards).
+  - The slots of the new direction are created before the read-only step (step 0b). The subscriptions are
+    created disabled on them; once the old direction is gone and before the VIP moves, the slots are advanced
+    to the new production's current WAL position (nothing is written there in between, so nothing is lost),
+    then the subscriptions are enabled (step 4b). The advance also skips the old direction's apply (it would
+    otherwise come back as duplicates) and the creation of the publications. Every abort before step 4
+    drops the slots again.
+  - The CIB lookups behind every `psql` call (PGHOME, `.pgpass`, VIP addresses) used `crm configure show`
+    (crmsh, about 0.4 s, four calls per `psql`); now `cibadmin` and `xmllint` (about 0.03 s).
+  - No schema copy when no data is copied (`copy_data=false`: the subscriber has the tables); it took about
+    7 s per database and only failed on "already exists".
+- README Option B lacked `op monitor`: without a monitor no cutover ever starts.
+
+### Documentation
+- Installing or updating the agent on a running cluster: copy to a new file and rename (README, QUICKSTART,
+  QUICKSTART_DUAL_RING_HA, BUILD, README-pgtwin-migrate). Lab: overwriting the agent in place while a monitor ran
+  made bash read a half-written file, the monitor of the primary failed hard and Pacemaker moved the primary.
+- README-pgtwin-migrate: preparing the clusters, `node_list` on both clones, what the cutover does and does not
+  guarantee; MIGRATION_DOCUMENTATION_INDEX lists only shipped documents.
+- doc/STATE_MATRIX.md: draft state table (rules, dimensions, reachable states, gaps, lab results).
+
 ## [1.8.3] - 2026-11-12
 
 Release notes: `releasenotes/RELEASE_v1.8.3.md`.

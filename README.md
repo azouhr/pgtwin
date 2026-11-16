@@ -33,7 +33,7 @@
 pgtwin-migrate enables **zero-downtime PostgreSQL migrations** using logical replication between two parallel clusters. While tested in development, it should be:
 - ✅ Tested thoroughly in non-production environments first
 - ✅ Used with caution in production
-- ⚠️ Considered experimental until v2.0.0
+- ⚠️ Experimental (pgtwin-migrate 2.1.0); the package moves to 2.x once pgtwin-migrate is considered stable
 
 ### Use Cases
 
@@ -61,8 +61,9 @@ pgtwin-migrate enables **zero-downtime PostgreSQL migrations** using logical rep
 
 ```bash
 # 1. Install pgtwin OCF agent
-sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
-sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin.new /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # 2. Configure PostgreSQL for replication (see QUICKSTART.md)
 # 3. Setup Pacemaker cluster (see QUICKSTART.md)
@@ -433,8 +434,9 @@ git clone https://github.com/azouhr/pgtwin.git
 cd pgtwin
 
 # Install OCF agent
-sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
-sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin.new /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify installation
 sudo bash -n /usr/lib/ocf/resource.d/heartbeat/pgtwin
@@ -494,6 +496,7 @@ sudo crm configure primitive postgres-db pgtwin \
 
 | Version | Date | Changes |
 |---------|------|---------|
+| **1.8.4** | 2026-11-16 | With more than two cluster nodes (a second pgtwin pair for pgtwin-migrate), the peer is always the other node of `node_list` (before: the first other node of the whole cluster; acknowledged commits could be lost); `node_list` required with more than two nodes; pgtwin-migrate 2.1.0 (experimental): sanity checks, a cutover that loses no acknowledged commit, about 11 s write window ([release notes](releasenotes/RELEASE_v1.8.4.md)) |
 | **1.8.3** | 2026-11-12 | The surviving primary of a full partition no longer keeps the other side's "not in sync" record (a later cold start could end without any promotion candidate) ([release notes](releasenotes/RELEASE_v1.8.3.md)) |
 | **1.8.2** | 2026-11-12 | A standby that cannot stream is stopped instead of tolerated, a standby that is not in sync is never promoted automatically, a node that starts alone is promoted only if it was primary/async, `fence_pgtwin` and `isolation_action` for the case that no fence device can confirm, optional server authentication for all agent connections (`conn_require_auth`) ([release notes](releasenotes/RELEASE_v1.8.2.md)) |
 | **1.8.1** | 2026-11-11 | Fixes from the 1.8.0 field tests: crashed standby after a timeline switch, no relax while the peer promotes, relax after a confirmed fence, upgrade score race, standby streams from the node instead of the VIP ([release notes](releasenotes/RELEASE_v1.8.1.md)) |

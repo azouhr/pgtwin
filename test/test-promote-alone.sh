@@ -20,7 +20,7 @@ alone_ok_file() { echo "$(dirname "${PGDATA}")/.pgtwin_last_primary_async"; }
 streamed_flag() { echo "${HA_RSCTMP}/pgtwin-${OCF_RESOURCE_INSTANCE%%:*}.streamed"; }
 alone_override_attr() { echo "pgtwin-promote-alone-${OCF_RESOURCE_INSTANCE%%:*}"; }
 get_cluster_node_name() { echo pg-a; }
-get_peer_member_name() { echo "$FAKE_PEER"; }
+pgtwin_peer_member() { [ -n "$FAKE_PEER" ] && echo "$FAKE_PEER"; }
 node_unsynced_since() { echo "$FAKE_UNSYNCED"; }
 crm_attribute() { echo "$FAKE_OVERRIDE"; }
 ocf_log() { :; }

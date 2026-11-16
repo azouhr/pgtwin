@@ -409,8 +409,9 @@ sudo zypper ar https://download.opensuse.org/repositories/home:azouhr:d3v/openSU
 sudo zypper in pgtwin
 
 # For others, there is no package available yet:
-sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
-sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin.new /usr/lib/ocf/resource.d/heartbeat/pgtwin
 
 # Verify installation
 ls -l /usr/lib/ocf/resource.d/heartbeat/pgtwin
@@ -638,7 +639,7 @@ clone in section 2.8, not on the primitive.
 | `pgdata` | Required | Required | Same for both |
 | `pgport` | Required | Required | Same for both |
 | `rep_mode` | Required | Required | Same for both |
-| `node_list` | Required | Required | Same for both, cluster node names |
+| `node_list` | Required | Required | The two nodes of this PostgreSQL cluster, same on both; enforced when the Pacemaker cluster has more than two nodes (1.8.4) |
 | `vip` | Recommended | Recommended | Same address as the VIP resource (section 2.9), used to discover the primary |
 | `promotion_peer_wait` | Optional | Optional | Default 60 s: wait for the peer's data state before promoting without a running primary (0 = off) |
 | `pg_bindir` | Optional | - | Directory of the PostgreSQL binaries (default `/usr/bin`) |

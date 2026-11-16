@@ -2,11 +2,12 @@
 
 **A Pacemaker OCF agent that orchestrates PostgreSQL cluster migrations via logical replication (major version upgrades, vendor migrations, hosting provider changes, etc.)**
 
-> **WARNING**: pgtwin-migrate v2.0.0 is EXPERIMENTAL. Test thoroughly before production use.
+> **WARNING**: pgtwin-migrate v2.1.0 is EXPERIMENTAL. Test thoroughly before production use. The package moves to
+> 2.x once pgtwin-migrate is considered stable.
 
 ## Overview
 
-pgtwin-migrate enables **zero-downtime PostgreSQL migrations** by orchestrating logical replication between two parallel PostgreSQL clusters managed by Pacemaker. It handles the complete migration lifecycle: forward replication, cutover automation, and reverse replication for fallback scenarios.
+pgtwin-migrate enables **PostgreSQL migrations with a short cutover window** by orchestrating logical replication between two parallel PostgreSQL clusters managed by Pacemaker. It handles the complete migration lifecycle: forward replication, cutover automation, and reverse replication for fallback scenarios.
 
 ### Use Cases
 
@@ -17,7 +18,8 @@ pgtwin-migrate enables **zero-downtime PostgreSQL migrations** by orchestrating 
 
 ### Key Features
 
-- ✅ **Zero downtime** - Applications keep running during migration
+- ✅ **Short downtime** - Applications keep running during the copy; only the cutover needs a short quiesce
+  (see [Cutover Phase](#3-cutover-phase-automated))
 - ✅ **Bidirectional failover** - Switch production between clusters using `production_cluster` parameter (v2.0)
 - ✅ **Dynamic database discovery** - Databases discovered at runtime, no explicit list needed (v2.0)
 - ✅ **New database auto-setup** - New databases detected and replicated automatically (v2.0)
@@ -96,13 +98,28 @@ crm_resource --resource migration-forward \
   --parameter-value postgres-clone-18
 ```
 
-**What happens (all automated):**
-1. Old direction replication is DELETED (publications, subscriptions, slots)
-2. New direction replication is CREATED fresh
-3. VIP follows production cluster automatically
-4. CIB state updated to reflect new direction
+**What the agent does (v2.1.0):**
 
-**Downtime:** Zero - Applications reconnect to new VIP seamlessly
+0. Waits until the new production cluster is stable and the mirror has caught up (up to `stability_timeout`),
+   and creates the replication slots of the new direction on it in advance
+1. Sets the old production read-only (verified) and ends open client sessions over TCP; their open
+   transactions roll back, so no commit is acknowledged after this point. The migration user is exempted
+   (`ALTER ROLE ... SET default_transaction_read_only = off`)
+2. Waits until every slot of the old direction has confirmed the WAL position taken after step 1; aborts if a
+   slot is missing or the publisher does not answer
+3. Deletes the old direction (publications, subscriptions, slots, DDL trigger)
+4. Creates the new direction on the slots from step 0 (no data copy, no schema copy), advances the slots to
+   the current position and enables the subscriptions; checks that every slot exists
+5. Swaps the `ip=` values of the two VIP resources
+6. Sets the old production read-write again (it is now the subscriber) and updates the CIB state
+
+Any failure before step 5 sets the old production read-write again and leaves the VIP where it was. Clients
+see "cannot execute ... in a read-only transaction" errors and one refused connection during the window, never
+an acknowledgement that is later lost. Lab (three databases, writer through the VIP): about 11 s without an
+acknowledged write, 0 acknowledged commits lost in four cutovers.
+
+The window grows with the number of databases (about 2 s each in step 4). The monitor starts a requested cutover
+only every 5th monitor cycle (about 2.5 minutes at a 30 s interval).
 
 ### 4. Failback Option (v2.0)
 
@@ -130,8 +147,9 @@ crm resource stop migration-forward
 
 ```bash
 # Copy agent to OCF directory (all cluster nodes)
-sudo cp pgtwin-migrate /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate
-sudo chmod 755 /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 pgtwin-migrate /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate.new /usr/lib/ocf/resource.d/heartbeat/pgtwin-migrate
 
 # Copy setup wizard (admin workstation or one cluster node)
 sudo cp pgtwin-migrate-setup /usr/local/bin/
@@ -179,16 +197,22 @@ crm configure primitive migration-forward ocf:heartbeat:pgtwin-migrate \
         source_pgpassfile="/var/lib/pgsql/.pgpass" \
         target_pgpassfile="/var/lib/pgsql/.pgpass" \
         migration_dbuser="pgmigrate" \
+    op start timeout=120s \
+    op stop timeout=60s \
+    op monitor interval=30s timeout=60s \
     meta \
         target-role=Stopped \
         migration-threshold=3 \
         failure-timeout=300s
 ```
 
+The `op monitor` line is required: the monitor checks the mirror and starts a requested cutover. Without it a
+change of `production_cluster` only restarts the resource and nothing else happens (lab 2026-11-16).
+
 `production_vip_resource` and `target_vip_resource` must both already exist
 as Pacemaker `IPaddr2` primitives before starting the migration resource,
-each colocated with its own cluster's Promoted role (same pattern as the
-replication VIPs above). Cutover works by swapping the two resources' `ip=`
+each colocated with its own cluster's Promoted role (see
+[Preparing the clusters](#preparing-the-clusters)). Cutover works by swapping the two resources' `ip=`
 values, not by moving either resource - without that colocation the IP swap
 still happens but the resource carrying the production address can end up
 running on an arbitrary node instead of the actual new primary.
@@ -303,6 +327,15 @@ ssh root@<source-primary> "sudo -u postgres psql -c \
 
 ## Version History
 
+- **v2.1.0** (2026-11-16, pgtwin 1.8.4) - **EXPERIMENTAL**, review requested
+  - Cutover: no acknowledged commit lost (read-only that works, sync check on the publisher's slots, no copy
+    for a direction created by a cutover, slots checked before the VIP swap); write window about 11 s
+  - A missing slot or subscription is reported ("Mirror incomplete"), not recreated at the current position
+  - No automatic stop after a cutover; the monitor checks the active direction
+  - Sanity checks on start, `validate-all` and before every cutover: both clusters are pgtwin clones with
+    `node_list` naming their own two nodes, no overlap, each clone runs only on its list; pgtwin 1.8.4 or newer;
+    `resource-discovery=never` protection for every node outside a clone's `node_list`; a warning when corosync
+    has more than two votes and `no-quorum-policy` is not `ignore`
 - **v2.0.0** (2026-01-19) - **EXPERIMENTAL** Major redesign
   - Bidirectional failover with `production_cluster` parameter
   - Dynamic database discovery (no explicit `databases` parameter needed)
@@ -321,48 +354,144 @@ ssh root@<source-primary> "sudo -u postgres psql -c \
 
 ## Documentation
 
-### Complete Documentation
-
-- **MIGRATION_DOCUMENTATION_INDEX.md** - Complete migration workflow guide
-- **PGTWIN_CONCEPTS.md** - Conceptual overview of pgtwin agents
-- **FEATURE_REVERSE_DDL_REPLICATION_v1.0.4.md** - Bidirectional DDL details
-- **OPTIMIZATION_CUTOVER_WINDOW_v1.0.5.md** - Cutover performance
-- **BUGFIX_CLUSTER_ATTRIBUTE_SCOPE_v1.0.6.md** - Self-healing implementation
-
-### Quick Guides
-
-- **QUICKSTART_MIGRATION_SETUP.md** - Migration cluster setup
-- **MIGRATION_CUTOVER_PROCEDURE.md** - Step-by-step cutover guide
-- **POST_MIGRATION_CLEANUP.md** - Cleanup after migration
+- [PGTWIN_CONCEPTS.md](PGTWIN_CONCEPTS.md) - conceptual overview of pgtwin and pgtwin-migrate
+- [doc/FEATURE_MULTI_DATABASE_MIGRATION_v1.0.8.md](doc/FEATURE_MULTI_DATABASE_MIGRATION_v1.0.8.md) - multi-database migration
+- [doc/BUGFIX_AUTO_STOP_TIMING_v1.0.7.md](doc/BUGFIX_AUTO_STOP_TIMING_v1.0.7.md) - auto-stop timing
+- [doc/STATE_MATRIX.md](doc/STATE_MATRIX.md) - cluster states, including four nodes with a logical subscriber (section 7)
 
 ## Requirements
 
-### PostgreSQL Configuration
+- Two pgtwin-managed PostgreSQL clusters (source and target) in one Pacemaker cluster, both healthy.
+- Source and target can run the same or different PostgreSQL major versions (logical replication).
+- `pgtwin-migrate` installed on every node of both clusters.
 
-**Both clusters must have:**
+The steps below are what the 2026-11 lab setup (PG17 pair pg1/pg2, PG18 pair pg3/pg4) needed.
+
+## Preparing the clusters
+
+### 1. Add the target nodes to the existing cluster
+
+Before the new nodes join, keep each pair's resources off the other pair, and stop Pacemaker from even probing
+them there. Without `resource-discovery=never`, a probe of the PG17 resource on a PG18 node finds a running
+PostgreSQL and can trigger recovery actions against the wrong cluster:
+
+```bash
+crm configure location postgres-avoid-pg3 postgres-clone resource-discovery=never -inf: pg3
+crm configure location postgres-avoid-pg4 postgres-clone resource-discovery=never -inf: pg4
+crm configure location vip-avoid-pg3 vip resource-discovery=never -inf: pg3
+crm configure location vip-avoid-pg4 vip resource-discovery=never -inf: pg4
+```
+
+Extend the fence devices (host map or host list) to the new nodes. A clone meant for every node, such as a ping
+clone, must not keep `clone-max=2`.
+
+Then join each new node with `crm cluster join -c <existing node>`. crmsh changes cluster properties on join:
+
+| Property | Before | After join | Action |
+|----------|--------|------------|--------|
+| `no-quorum-policy` | `ignore` | deleted | set again after the last join |
+| `priority-fencing-delay` | e.g. `5` | `0` | set again |
+| `rsc_defaults priority` | e.g. `1` | `0` | set again |
+| `fencing-timeout` | e.g. `30` | recalculated (69 in the lab) | check the value |
+| corosync `two_node` | `1` | off (4 votes, quorum 3) | expected |
+
+```bash
+crm configure property no-quorum-policy=ignore priority-fencing-delay=5
+crm configure rsc_defaults priority=1
+```
+
+**Both** pgtwin clones need `node_list` with the two nodes of their own pair (`node_list="pg1 pg2"` on the
+source, `node_list="pg3 pg4"` on the target) **before the third node joins**. From pgtwin 1.8.4 on, a clone
+without `node_list` refuses to start in a cluster of more than two nodes, and its monitor logs an error. Before
+1.8.4, pgtwin took the first other node of the whole cluster as its peer, which in the lab made a PG18 node
+record a PG17 node and promote without checking its own standby (481 acknowledged commits lost). Check:
+
+```bash
+crm configure show | grep -E '^primitive|node_list'
+```
+
+pgtwin-migrate 2.1.0 checks this, the probe protection below and the pgtwin version on start, on
+`validate-all` and before every cutover, and refuses with the reason. To check before creating the resource:
+`crm_resource -r migration-forward --validate`.
+
+Create the target pgtwin clone with `node_list` set to the target nodes, and keep it and its VIP off the source
+nodes the same way. The first standby start can run while the new primary is still promoting. It then fails with
+"unable to discover primary" and is retried only after `failure-timeout`; a
+`crm resource cleanup <target-clone>` after the promote shortens this.
+
+### 2. `wal_level = logical`
+
+The source needs `wal_level = logical`, and so does the target for the reverse direction after cutover. Put it
+into `postgresql.custom.conf` on **both** nodes of each pair. `ALTER SYSTEM` on the primary only does not reach
+the standby, which then runs with a different setting after the next switchover.
+
 ```ini
-# postgresql.conf
+# postgresql.custom.conf, every node of both clusters
 wal_level = logical
 max_replication_slots = 10
 max_wal_senders = 10
 max_logical_replication_workers = 10
 ```
 
-**Authentication (.pgpass):**
-```
-# On all nodes in both clusters
-<source-replication-vip>:5432:postgres:pgmigrate:<password>
-<target-replication-vip>:5432:postgres:pgmigrate:<password>
-<source-replication-vip>:5432:replication:replicator:<password>
-<target-replication-vip>:5432:replication:replicator:<password>
+`wal_level` needs a restart. Restart node by node: the standby first, then the old primary, so the standby
+takes over in between. Do not use `crm resource restart` of the clone, which stops production:
+
+```bash
+crm node standby <standby-node>; crm node online <standby-node>   # wait until it streams again
+crm node standby <primary-node>; crm node online <primary-node>   # the standby takes over
 ```
 
-### Cluster Setup
+### 3. Migration user, `pg_hba.conf`, `.pgpass`
 
-- Two pgtwin-managed PostgreSQL clusters (source and target)
-- Replication VIPs configured on both clusters
-- Production VIP managed separately
-- Both clusters must be healthy before starting migration
+Create a superuser for the migration on both primaries. It creates publications, subscriptions and event
+triggers:
+
+```sql
+CREATE ROLE pgmigrate WITH LOGIN SUPERUSER PASSWORD '...';
+```
+
+The cutover sets the old production read-only and exempts this user with
+`ALTER ROLE pgmigrate SET default_transaction_read_only = off` (2.1.0 does this itself), so that it can drop the
+old direction and create the new one there. Applications must not use this role: its sessions are neither
+read-only nor ended during the cutover. Logical replication does not copy roles: create the application roles
+on both clusters.
+
+The agent connects to **every** migrated database, not only to `postgres`. Allow the user for all databases on
+both nodes of each pair, then reload. `pg_hba.conf` is not replicated, and a node that becomes primary later
+needs the line too:
+
+```
+host  all  pgmigrate  <node and VIP network>  scram-sha-256
+```
+
+`.pgpass` on every node, owned by postgres, mode 0600, with `*` as the database:
+
+```
+<source-replication-vip>:5432:*:pgmigrate:<password>
+<target-replication-vip>:5432:*:pgmigrate:<password>
+<each node address>:5432:*:pgmigrate:<password>
+```
+
+The target nodes also need their own `replicator` lines for pgtwin's physical replication (see QUICKSTART.md).
+
+### 4. Replication VIPs
+
+`source_replication_vip` and `target_replication_vip` are IP addresses that always point to the primary of their
+own cluster. They must be separate from the production VIPs, because those are swapped at cutover:
+
+```bash
+crm configure primitive vip17-repl IPaddr2 params ip=192.168.122.22 cidr_netmask=24 op monitor interval=10s
+crm configure colocation vip17-repl-with-primary inf: vip17-repl postgres-clone:Promoted
+crm configure order vip17-repl-after-promote Mandatory: postgres-clone:promote vip17-repl:start
+# the same for the target (vip18-repl with pg18-clone); keep each VIP off the other pair
+```
+
+Check both before starting the migration resource:
+
+```bash
+sudo -u postgres psql -h <source-replication-vip> -U pgmigrate -d postgres -c 'select version()'
+sudo -u postgres psql -h <target-replication-vip> -U pgmigrate -d postgres -c 'select version()'
+```
 
 ## Troubleshooting
 
@@ -438,7 +567,19 @@ ssh root@<target-primary> "sudo -u postgres psql -c \
 crm resource restart migration-forward
 ```
 
-## Known Limitations (v2.0)
+## Known Limitations (v2.1)
+
+- **Failover of the publishing pair loses the mirror.** Logical slots exist only on the primary; after a failover
+  the new primary has none. pgtwin-migrate reports "Mirror incomplete" instead of recreating the slot (which
+  would hide a gap). Resync: stop the resource, empty the replicated tables (or drop the database) on the
+  non-production side, start again. Failover slots (PostgreSQL 17+) are planned. The `postgres` database
+  should be emptied, not dropped.
+- **Sequences and roles are not replicated** (logical replication). Set sequences above the source value before
+  a cutover; create application roles on both clusters.
+- **`pg_bindir` is not in pgtwin's metadata**: `crm configure` rejects it; set it with
+  `crm_resource --set-parameter` when the second cluster runs another PostgreSQL version.
+- **The cutover window grows with the number of databases** (about 2 s each), and a requested cutover starts
+  with the next 5th monitor cycle.
 
 1. **max_logical_replication_workers limit** - PostgreSQL default is 4 workers. For migrations with many databases, increase this setting in `postgresql.custom.conf`.
 
@@ -450,7 +591,7 @@ crm resource restart migration-forward
 
 1. Complete any in-progress migrations
 2. Stop and delete old migration resource
-3. Deploy pgtwin-migrate v2.0
+3. Deploy pgtwin-migrate v2.1
 4. Use pgtwin-migrate-setup to generate new configuration
 5. Test with non-production data first
 
@@ -465,9 +606,8 @@ GPL-2.0-or-later
 ## Support
 
 For issues and questions:
-- GitHub: https://github.com/anthropics/pgtwin (if published)
-- Documentation: See MIGRATION_DOCUMENTATION_INDEX.md
+- GitHub: https://github.com/azouhr/pgtwin/issues
 
 ---
 
-**pgtwin-migrate v2.0.0 (EXPERIMENTAL) - Pacemaker OCF agent for PostgreSQL cluster migrations via logical replication**
+**pgtwin-migrate v2.1.0 (EXPERIMENTAL) - Pacemaker OCF agent for PostgreSQL cluster migrations via logical replication**

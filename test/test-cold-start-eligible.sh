@@ -15,7 +15,7 @@ OCF_RESKEY_pgport=5432
 PSQL="$STORE/fake-psql"; printf '#!/bin/sh\necho "$FAKE_IN_RECOVERY"\n' > "$PSQL"; chmod +x "$PSQL"
 run_as_pguser() { "$@"; }
 resolve_cluster_node_to_hostname() { echo "$1"; }
-get_peer_member_name() { echo "$FAKE_PEER"; }
+pgtwin_peer_member() { [ -n "$FAKE_PEER" ] && echo "$FAKE_PEER"; }
 OCF_RESOURCE_INSTANCE="postgres-db:0"
 # crm_resource -W stub: FAKE_CIB=promoted|nopromoted|fail (default: fail)
 crm_resource() {

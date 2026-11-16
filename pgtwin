@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # PostgreSQL OCF RA with advanced replication slot management
-# Version: 1.8.3
+# Version: 1.8.4
 # Release Date: 2026-11-11
 #
 # Description:  Manages PostgreSQL as an OCF HA resource with
@@ -165,7 +165,7 @@ meta_data() {
 	cat <<END
 <?xml version="1.0"?>
 <!DOCTYPE resource-agent SYSTEM "ra-api-1.dtd">
-<resource-agent name="pgtwin" version="1.8.3">
+<resource-agent name="pgtwin" version="1.8.4">
 <version>1.6.9</version>
 
 <longdesc lang="en">
@@ -284,9 +284,13 @@ Replication mode: sync or async
 
 <parameter name="node_list" unique="0">
 <longdesc lang="en">
-Space-separated list of cluster node names
+The two nodes of this PostgreSQL cluster (this node and its peer), space-separated, as
+names to connect to. Required when the Pacemaker cluster has more than two nodes, e.g. a
+second pgtwin pair for pgtwin-migrate: the peer is always the other node of this list,
+never another node of the Pacemaker cluster. With exactly two cluster nodes it may be
+empty; the two cluster nodes are then the pair.
 </longdesc>
-<shortdesc lang="en">Cluster node list</shortdesc>
+<shortdesc lang="en">The two nodes of this PostgreSQL cluster</shortdesc>
 <content type="string" default="${OCF_RESKEY_node_list_default}" />
 </parameter>
 
@@ -646,8 +650,12 @@ node_unsynced_since() {
 mark_peer_unsynced() {
     local peer i
     [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 0
-    peer=$(get_peer_node_name)
-    [ -n "$peer" ] || return 0
+    # No peer known (pair_config_problem): nobody to record, keep waiting
+    peer=$(pgtwin_peer)
+    if [ -z "$peer" ]; then
+        ocf_log err "Cannot record the standby as not in sync: the peer of this node is undetermined ($(pair_config_problem)); keeping synchronous replication"
+        return 1
+    fi
     [ -n "$(node_unsynced_since "$peer")" ] && return 0
     crm_attribute -N "$peer" -n "$(unsynced_attr)" -l forever -v "$(date +%s)" >/dev/null 2>&1
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -680,7 +688,7 @@ clear_own_unsynced_if_peer_follows() {
 
 clear_peer_unsynced_if_synced() {
     local peer app target_file target done_sql res i
-    peer=$(get_peer_node_name)
+    peer=$(pgtwin_peer)
     [ -n "$peer" ] || return 0
     app=$(echo "${peer%%.*}" | tr '-' '_')
 
@@ -729,7 +737,7 @@ clear_peer_unsynced_if_synced() {
 clear_peer_unsynced_after_clean_stop() {
     local was_streaming="$1" peer peer_host rep_user cd ckpt ok
     [ "$was_streaming" = "true" ] || return 0
-    peer=$(get_peer_node_name)
+    peer=$(pgtwin_peer)
     [ -n "$peer" ] || return 0
     [ -n "$(node_unsynced_since "$peer")" ] || return 0
     cd=$(run_as_pguser pg_controldata "${PGDATA}" 2>/dev/null)
@@ -797,7 +805,7 @@ alone_override_attr() { echo "pgtwin-promote-alone-${OCF_RESOURCE_INSTANCE%%:*}"
 # state (this node now follows a primary, its own last writes are superseded).
 note_streamed_as_member() {
     [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 0
-    [ -n "$(get_peer_member_name)" ] || return 0
+    [ -n "$(pgtwin_peer_member)" ] || return 0
     [ -z "$(node_unsynced_since "$(get_cluster_node_name)")" ] || return 0
     if [ ! -f "$(streamed_flag)" ]; then
         mkdir -p "$(dirname "$(streamed_flag)")" 2>/dev/null
@@ -811,7 +819,7 @@ note_streamed_as_member() {
 promotion_alone_blocked() {
     local me ov mark
     [ "${OCF_RESKEY_rep_mode}" = "sync" ] || return 1
-    [ -n "$(get_peer_member_name)" ] && return 1
+    [ -n "$(pgtwin_peer_member)" ] && return 1
     [ -f "$(streamed_flag)" ] && return 1
     [ -f "$(alone_ok_file)" ] && return 1
     me=$(get_cluster_node_name)
@@ -840,7 +848,7 @@ gateway_lost() {
 # member and this node has lost its gateway.
 isolated_without_gateway() {
     [ "${OCF_RESKEY_isolation_action}" = "demote" ] || return 1
-    [ -z "$(get_peer_member_name)" ] || return 1
+    [ -z "$(pgtwin_peer_member)" ] || return 1
     gateway_lost
 }
 
@@ -879,7 +887,7 @@ primary_isolation_reached() {
 cold_start_eligibility() {
     local peer peer_host l p cmp
     [ -f "${PGDATA}/standby.signal" ] || return 1
-    peer=$(get_peer_member_name); [ -n "$peer" ] || return 1
+    peer=$(pgtwin_peer_member); [ -n "$peer" ] || return 1
     [ "$(peer_recovery_state "$peer")" = "t" ] || return 1
     peer_host=$(resolve_cluster_node_to_hostname "$peer")
     l=$(query_data_state "") || return 1
@@ -904,7 +912,7 @@ cold_start_eligibility() {
 # True if the peer is an online cluster member running the Promoted instance
 peer_promoted_member() {
     local peer prim xml
-    peer=$(get_peer_node_name)
+    peer=$(pgtwin_peer)
     [ -n "$peer" ] || return 1
     prim="${OCF_RESOURCE_INSTANCE%%:*}"
     xml=$(crm_mon --as-xml 2>/dev/null) || return 1
@@ -912,11 +920,100 @@ peer_promoted_member() {
     [ -n "$(echo "$xml" | xmllint --xpath "//resources//resource[@id='${prim}' and @role='Promoted']/node[@name='${peer}']/@name" - 2>/dev/null)" ]
 }
 
-get_peer_node_name() {
-    local me
-    me=$(get_cluster_node_name)
-    crm_mon --as-xml 2>/dev/null | xmllint --xpath "//nodes/node[@name!='${me}']/@name" - 2>/dev/null | \
-        sed 's/ *name="\([^"]*\)"/\1\n/g' | grep -v '^$' | head -1
+# --- The nodes of this PostgreSQL cluster (pair) ------------------------------
+# The single source for "which nodes form this PostgreSQL cluster" and "which
+# node is the peer". Every decision about the peer (record, relax, promotion
+# checks, data comparison, lone start, stale-primary check) goes through
+# pgtwin_peer / pgtwin_peer_member / pgtwin_peer_host. Before 1.8.4 the peer was
+# the first other node of the whole Pacemaker cluster: with a second pgtwin pair
+# in the same cluster (pgtwin-migrate) a node got a node of the other pair as its
+# peer, recorded the wrong node and promoted without comparing with its own
+# standby (doc/STATE_MATRIX.md M5).
+#   node_list set:    its entries (exactly two, one of them this node)
+#   node_list empty:  the nodes of the Pacemaker cluster, only if there are
+#                     exactly two (two-node clusters keep working unchanged)
+#   otherwise:        undetermined - start and validate-all refuse
+#                     (pair_config_problem), nothing ever guesses a peer.
+# Names are compared without domain (FQDN in node_list, short names in the
+# cluster or the other way round).
+
+short_node_name() { echo "${1%%.*}"; }
+
+# All node names of the Pacemaker cluster, as Pacemaker spells them, any state
+pacemaker_node_names() {
+    crm_mon --as-xml 2>/dev/null | xmllint --xpath "//nodes/node/@name" - 2>/dev/null | \
+        sed 's/ *name="\([^"]*\)"/\1\n/g' | grep -v '^$'
+}
+
+# Print the nodes of this pair, one per line. Returns 1 if undetermined.
+pgtwin_pair_nodes() {
+    local names
+    if [ -n "${OCF_RESKEY_node_list}" ]; then
+        printf '%s\n' ${OCF_RESKEY_node_list}
+        return 0
+    fi
+    names=$(pacemaker_node_names)
+    [ "$(echo "$names" | grep -c .)" -eq 2 ] || return 1
+    echo "$names"
+}
+
+# Print why the pair cannot be determined (empty: it can). Used by start and
+# validate-all (refuse) and by the monitor (log).
+pair_config_problem() {
+    local me e n found=false
+    me=$(short_node_name "$(get_cluster_node_name)")
+    if [ -n "${OCF_RESKEY_node_list}" ]; then
+        n=0
+        for e in ${OCF_RESKEY_node_list}; do
+            n=$((n + 1))
+            [ "$(short_node_name "$e")" = "$me" ] && found=true
+        done
+        if [ "$n" -ne 2 ] || [ "$found" != "true" ]; then
+            echo "node_list must name the two nodes of this PostgreSQL cluster, this node (${me}) included: node_list='${OCF_RESKEY_node_list}'"
+        fi
+        return 0
+    fi
+    n=$(pacemaker_node_names | grep -c .)
+    if [ "$n" -gt 2 ]; then
+        echo "the Pacemaker cluster has ${n} nodes: set node_list to the two nodes of this PostgreSQL cluster"
+    fi
+    return 0
+}
+
+# Print the peer, the other node of this pair, as Pacemaker names it (for
+# crm_attribute -N and crm_mon). Returns 1 and prints nothing if undetermined.
+pgtwin_peer() {
+    local me e peer="" n=0 k
+    me=$(short_node_name "$(get_cluster_node_name)")
+    for e in $(pgtwin_pair_nodes); do
+        [ "$(short_node_name "$e")" = "$me" ] && continue
+        peer="$e"
+        n=$((n + 1))
+    done
+    [ "$n" -eq 1 ] || return 1
+    for k in $(pacemaker_node_names); do
+        if [ "$(short_node_name "$k")" = "$(short_node_name "$peer")" ]; then
+            echo "$k"
+            return 0
+        fi
+    done
+    echo "$peer"
+}
+
+# Print the peer if it is a cluster member right now, else nothing (return 1)
+pgtwin_peer_member() {
+    local peer
+    command -v crm_node >/dev/null 2>&1 || return 1
+    peer=$(pgtwin_peer) || return 1
+    crm_node -l 2>/dev/null | awk -v p="$peer" '$2 == p && $3 == "member" { f = 1 } END { exit !f }' || return 1
+    echo "$peer"
+}
+
+# Print the address to connect to the peer's PostgreSQL
+pgtwin_peer_host() {
+    local peer
+    peer=$(pgtwin_peer) || return 1
+    resolve_cluster_node_to_hostname "$peer"
 }
 
 # Ask the peer's PostgreSQL whether it is in recovery: prints t (standby),
@@ -1044,7 +1141,7 @@ peer_member_instance_stopped() {
 
 monitor_may_relax_sync() {
     local peer xml online probe
-    peer=$(get_peer_node_name)
+    peer=$(pgtwin_peer)
     [ -n "$peer" ] || return 1
     xml=$(crm_mon --as-xml 2>/dev/null)
     online=$(echo "$xml" | xmllint --xpath "string(//nodes/node[@name='${peer}']/@online)" - 2>/dev/null)
@@ -1098,7 +1195,7 @@ stale_primary_check() {
     local peer peer_host peer_state local_state p_tli l_tli
     # Not conditional on "no standby streaming": right after a stall the old
     # walsender entry can still show as streaming
-    peer=$(get_peer_node_name)
+    peer=$(pgtwin_peer)
     [ -n "$peer" ] || return 1
     [ "$(peer_recovery_state "$peer")" = "f" ] || return 1
     peer_host=$(resolve_cluster_node_to_hostname "$peer")
@@ -1584,13 +1681,8 @@ get_replication_host() {
     local rep_host=$(echo "$creds" | cut -d: -f2)
 
     if [ -z "$rep_host" ] || [ "$rep_host" = "*" ]; then
-        # Fallback to finding another node from node_list
-        for node in ${OCF_RESKEY_node_list}; do
-            if [ "$node" != "$(get_cluster_node_name)" ]; then
-                echo "$node"
-                return 0
-            fi
-        done
+        # Fallback: the peer of this pair
+        rep_host=$(pgtwin_peer_host)
     fi
 
     echo "$rep_host"
@@ -2118,40 +2210,20 @@ resolve_cluster_node_to_hostname() {
     # This is needed when cluster node names differ from system hostnames
     local cluster_node="$1"
 
-    # Try to get the node's hostname from Pacemaker
-    if command -v crm_node >/dev/null 2>&1; then
-        # Query Pacemaker for node attributes
-        local node_hostname=$(crm_node -l 2>/dev/null | grep "^[0-9]* ${cluster_node} " | awk '{print $2}')
-
-        if [ -n "$node_hostname" ] && [ "$node_hostname" != "$cluster_node" ]; then
-            ocf_log debug "Resolved cluster node '${cluster_node}' to hostname '${node_hostname}'"
-            echo "$node_hostname"
+    # The node_list entry of that node (compared without domain): node_list
+    # holds the names to connect to. A node that is not in node_list is used
+    # as-is. Before 1.8.4 such a node was replaced by the FIRST node_list entry,
+    # which with a second pgtwin pair in the cluster could be this node itself.
+    local node
+    [ -n "$cluster_node" ] || return 1
+    for node in ${OCF_RESKEY_node_list}; do
+        if [ "$(short_node_name "$node")" = "$(short_node_name "$cluster_node")" ]; then
+            echo "$node"
             return 0
         fi
-    fi
-
-    # Check if node_list has a mapping for this cluster node
-    # node_list should contain resolvable hostnames or IPs
-    if [ -n "${OCF_RESKEY_node_list}" ]; then
-        # If cluster node is in node_list, return it (should be resolvable)
-        for node in ${OCF_RESKEY_node_list}; do
-            if [ "$node" = "$cluster_node" ]; then
-                echo "$node"
-                return 0
-            fi
-        done
-
-        # If not found in node_list, assume first node in list matches
-        # This is a weak fallback but better than nothing
-        ocf_log warn "Cluster node '${cluster_node}' not in node_list, using first entry"
-        echo "${OCF_RESKEY_node_list}" | awk '{print $1}'
-        return 0
-    fi
-
-    # Last resort: return the cluster node name as-is (may not be resolvable)
-    ocf_log warn "Cannot resolve cluster node '${cluster_node}' to hostname, using as-is"
+    done
     echo "$cluster_node"
-    return 1
+    return 0
 }
 
 get_pg_config_value() {
@@ -2199,6 +2271,16 @@ standby_conninfo_off_vip() {
 
 # conn_require_auth: syntax of libpq's require_auth (comma-separated methods,
 # each optionally negated with "!")
+# The peer can be determined (pair_config_problem); same pattern as the other
+# *_valid checks: the reason goes to ocf_exit_reason
+pair_config_valid() {
+    local problem
+    problem=$(pair_config_problem)
+    [ -z "$problem" ] && return 0
+    ocf_exit_reason "Cannot determine the peer of this node: ${problem}"
+    return 1
+}
+
 isolation_params_valid() {
     case "${OCF_RESKEY_isolation_action}" in
         none|demote) ;;
@@ -2487,7 +2569,7 @@ set_promotion_eligibility() {
         local base=10 bonus=10000 limit=900000 score current peer peer_score
         case "$mode" in
             promoted)
-                peer=$(get_peer_node_name)
+                peer=$(pgtwin_peer)
                 peer_score=$(crm_attribute -N "$peer" -n "$master_attr" -l reboot -G -q 2>/dev/null)
                 case "$peer_score" in ""|*[!0-9]*) peer_score=$base ;; esac
                 score=$(( peer_score + bonus ))
@@ -2503,7 +2585,7 @@ set_promotion_eligibility() {
                 synced=$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming' ${sync_filter}\"" 2>/dev/null)
                 # Reset only when the peer is at the base as well: a standby must
                 # never score above its primary, Pacemaker would switch over to it
-                peer=$(get_peer_node_name)
+                peer=$(pgtwin_peer)
                 peer_score=$(crm_attribute -N "$peer" -n "$master_attr" -l reboot -G -q 2>/dev/null)
                 case "$peer_score" in ""|*[!0-9-]*) peer_score=$base ;; esac
                 if [ -n "$synced" ] && [ "$synced" -gt 0 ] 2>/dev/null && [ "$peer_score" -le "$base" ] 2>/dev/null; then
@@ -2560,7 +2642,7 @@ drop_permanent_promotion_score() {
 # password it can never answer in a setup following QUICKSTART.md)
 no_primary_in_cluster() {
     local peer peer_host state rep_user opts=""
-    peer=$(get_peer_member_name) || return 1
+    peer=$(pgtwin_peer_member) || return 1
     [ -n "$peer" ] || return 1
     peer_host=$(resolve_cluster_node_to_hostname "$peer") || return 1
     rep_user=$(get_replication_user 2>/dev/null)
@@ -2601,6 +2683,19 @@ pgsql_monitor() {
     # Check if basebackup is in progress (for status reporting)
     # BUG FIX v1.6.6: Check state directory, not PGDATA
     local state_dir=$(dirname "${PGDATA}")
+
+    # The pair became undetermined while running (e.g. a third node joined and
+    # node_list is empty): the peer decisions fail safe (no record means no
+    # relax), report it at most every 5 minutes. Not on probes: a probe on a
+    # node of another pair is expected to fail this check.
+    if ! ocf_is_probe; then
+        local pair_problem pair_mark="${state_dir}/.pgtwin_pair_problem_logged"
+        pair_problem=$(pair_config_problem)
+        if [ -n "$pair_problem" ] && [ -z "$(find "$pair_mark" -mmin -5 2>/dev/null)" ]; then
+            ocf_log err "Cannot determine the peer of this node: ${pair_problem}"
+            touch "$pair_mark" 2>/dev/null
+        fi
+    fi
     if [ -f "${state_dir}/.pgtwin_basebackup_in_progress" ]; then
         check_basebackup_progress
         # Still in progress, return not running so resource won't be started yet
@@ -2863,7 +2958,7 @@ pgsql_monitor() {
                         ocf_log warn "Standby cannot stream: WAL it needs has already been removed on the primary, the next start rebuilds it with pg_basebackup"
                     fi
                     rm -f "$wal_snap"
-                    ocf_exit_reason "Standby cannot stream from the primary on $(get_peer_node_name) for ${failure_count} monitor cycles"
+                    ocf_exit_reason "Standby cannot stream from the primary on $(pgtwin_peer) for ${failure_count} monitor cycles"
                     ocf_log err "Replication failure threshold (${OCF_RESKEY_replication_failure_threshold}) exceeded: failing this instance, Pacemaker stops it and the primary stops waiting for it; the next start repairs it if it can"
                     return $OCF_ERR_GENERIC
                 fi
@@ -3257,6 +3352,7 @@ standby_start_stuck_at_invalid_wal() {
 pgsql_start() {
     local rc
 
+    pair_config_valid || return $OCF_ERR_CONFIGURED
     conn_require_auth_valid || return $OCF_ERR_CONFIGURED
     isolation_params_valid || return $OCF_ERR_CONFIGURED
     conn_require_auth_supported || return $OCF_ERR_CONFIGURED
@@ -3450,7 +3546,7 @@ pgsql_start() {
     # joins. Before 1.8.2 this refused the start with OCF_ERR_CONFIGURED, which
     # also kept the peer from starting until a cleanup.
     if [ ! -f "${PGDATA}/standby.signal" ] && [ -f "${PGDATA}/PG_VERSION" ] && \
-       command -v crm_node >/dev/null 2>&1 && [ -z "$(get_peer_member_name)" ]; then
+       command -v crm_node >/dev/null 2>&1 && [ -z "$(pgtwin_peer_member)" ]; then
         local alone_sync
         alone_sync=$(get_pg_config_value "synchronous_standby_names")
         if [ -n "$alone_sync" ]; then
@@ -3616,7 +3712,7 @@ Attempting automatic recovery (pg_rewind → pg_basebackup if safe)..."
         # Single-node startup (v1.6.14+, promotion_alone_blocked): handled
         # before this branch; a former primary that gets here alone ran
         # without waiting for a standby (primary/async)
-        if command -v crm_node >/dev/null 2>&1 && [ -z "$(get_peer_member_name)" ]; then
+        if command -v crm_node >/dev/null 2>&1 && [ -z "$(pgtwin_peer_member)" ]; then
             ocf_log info "Single-node startup as primary/async (synchronous_standby_names empty): no other node can have newer data"
         fi
     fi
@@ -3842,14 +3938,6 @@ promotion_decision() {
     esac
 }
 
-# Name of the other cluster member (empty if the peer is not a member).
-get_peer_member_name() {
-    local me
-    command -v crm_node >/dev/null 2>&1 || return 1
-    me=$(get_cluster_node_name)
-    crm_node -l 2>/dev/null | awk -v me="$me" '$3 == "member" && $2 != me { print $2; exit }'
-}
-
 # True if the peer is leaving the cluster in an orderly way (Pacemaker shutdown
 # in progress or standby): it will not provide a data state any more, so the
 # comparison must not wait for it. A clean shutdown flushes all WAL to the
@@ -3918,7 +4006,7 @@ start_as_standby_for_data_comparison() {
     local wait_max="${OCF_RESKEY_promotion_peer_wait:-30}"
     case "$wait_max" in ""|*[!0-9]*) wait_max=30 ;; esac
     [ "$wait_max" -gt 0 ] || return 1
-    [ -n "$(get_peer_member_name)" ] || return 1
+    [ -n "$(pgtwin_peer_member)" ] || return 1
     [ -z "$(discover_promoted_node 2>/dev/null)" ] || return 1
     return 0
 }
@@ -3938,7 +4026,7 @@ promotion_data_state_guard() {
     case "$wait_max" in ""|*[!0-9]*) wait_max=30 ;; esac
     [ "$wait_max" -gt 0 ] || return 0
 
-    peer=$(get_peer_member_name)
+    peer=$(pgtwin_peer_member)
     [ -n "$peer" ] || return 0
 
     # Planned switchover: a peer that is shutting down or in standby flushed its
@@ -4044,12 +4132,12 @@ check_promotion_safety() {
     fi
 
     # SAFETY CHECK v1.6.14: Single-node promotion guard
-    # If we're alone in the cluster with sync replication configured,
-    # this indicates a double-failure scenario where we should NOT promote
+    # If we're alone (the peer of this pair is not a cluster member) with sync
+    # replication configured, this indicates a double-failure scenario where we
+    # should NOT promote. Before 1.8.4 this counted all cluster members, so it
+    # never applied in a cluster with a second pgtwin pair.
     if command -v crm_node >/dev/null 2>&1; then
-        local node_count=$(crm_node -l 2>/dev/null | grep -c member)
-
-        if [ "$node_count" -eq 1 ]; then
+        if [ -z "$(pgtwin_peer_member)" ]; then
             # We're alone - check if sync replication is configured
             # Use postgres -C to query config (works with any config file structure)
             local sync_standby=$(get_pg_config_value "synchronous_standby_names")
@@ -4102,7 +4190,7 @@ check_promotion_safety() {
         # running there (its stop was confirmed, e.g. switchover by node
         # standby) - valid with or without fencing.
         local safety_peer
-        safety_peer=$(get_peer_node_name)
+        safety_peer=$(pgtwin_peer)
         if fencing_enabled && peer_offline_clean "$safety_peer"; then
             ocf_log info "Promotion safety check: the former primary ${safety_peer} is offline and clean in the cluster (fenced or stopped), nothing to check"
             return 0
@@ -4389,7 +4477,7 @@ pgsql_demote() {
     # Did the peer stream from this node right before the stop? (see
     # clear_peer_unsynced_after_clean_stop)
     local peer_streaming=false peer_app peer_name
-    peer_name=$(get_peer_node_name)
+    peer_name=$(pgtwin_peer)
     peer_app=$(echo "${peer_name%%.*}" | tr '-' '_')
     if [ -n "$peer_app" ] && [ "$(run_as_pguser sh -c "${PSQL} -p ${OCF_RESKEY_pgport} -Atc \"SELECT count(*) FROM pg_stat_replication WHERE application_name = '${peer_app}' AND state = 'streaming'\"" 2>/dev/null)" -gt 0 ] 2>/dev/null; then
         peer_streaming=true
@@ -4472,9 +4560,9 @@ pgsql_demote() {
     # to follow. Become a standby that points at the peer's address; it connects
     # once the peer is back, and the start path rewinds it if needed.
     local demote_alone=false
-    if [ -z "$primary_host" ] && [ -z "$(get_peer_member_name)" ]; then
+    if [ -z "$primary_host" ] && [ -z "$(pgtwin_peer_member)" ]; then
         local alone_peer
-        alone_peer=$(get_peer_node_name)
+        alone_peer=$(pgtwin_peer)
         [ -n "$alone_peer" ] && primary_host=$(resolve_cluster_node_to_hostname "$alone_peer")
         if [ -n "$primary_host" ]; then
             demote_alone=true
@@ -5340,6 +5428,7 @@ pgsql_validate() {
     check_binary "${PGCTL}"
     check_binary "${PSQL}"
 
+    pair_config_valid || return $OCF_ERR_CONFIGURED
     conn_require_auth_valid || return $OCF_ERR_CONFIGURED
     isolation_params_valid || return $OCF_ERR_CONFIGURED
     conn_require_auth_supported || return $OCF_ERR_CONFIGURED

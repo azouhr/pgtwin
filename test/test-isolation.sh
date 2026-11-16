@@ -14,7 +14,7 @@ HA_RSCTMP="$STORE/run"
 OCF_RESOURCE_INSTANCE="postgres-db:0"
 OCF_RESKEY_gateway_attribute=pingd
 get_cluster_node_name() { echo pg-a; }
-get_peer_member_name() { echo "$FAKE_PEER"; }
+pgtwin_peer_member() { [ -n "$FAKE_PEER" ] && echo "$FAKE_PEER"; }
 crm_attribute() { [ -n "$FAKE_GW" ] && echo "$FAKE_GW"; [ -n "$FAKE_GW" ]; }
 ocf_log() { :; }
 ocf_exit_reason() { :; }

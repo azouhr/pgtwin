@@ -11,7 +11,7 @@ for f in cold_start_eligibility data_state_compare lsn_to_int; do
 done
 STORE=$(mktemp -d); trap 'rm -rf "$STORE"' EXIT
 PGDATA="$STORE/data"; mkdir -p "$PGDATA"; touch "$PGDATA/standby.signal"
-get_peer_member_name() { echo "$FAKE_PEER"; }
+pgtwin_peer_member() { [ -n "$FAKE_PEER" ] && echo "$FAKE_PEER"; }
 peer_recovery_state() { echo "$FAKE_PEER_REC"; }
 resolve_cluster_node_to_hostname() { echo "$1"; }
 query_data_state() { if [ -z "$1" ]; then [ -n "$FAKE_LOCAL" ] && echo "$FAKE_LOCAL"; else [ -n "$FAKE_REMOTE" ] && echo "$FAKE_REMOTE"; fi; }

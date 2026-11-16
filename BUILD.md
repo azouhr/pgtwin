@@ -15,8 +15,9 @@ cd pgtwin
 sudo make install
 
 # Or install manually
-sudo cp pgtwin /usr/lib/ocf/resource.d/heartbeat/
-sudo chmod +x /usr/lib/ocf/resource.d/heartbeat/pgtwin
+# Copy to a new file and rename it: a monitor running while the file is overwritten in place
+# reads a half-written agent and fails hard (Pacemaker then moves the primary)
+sudo install -m 755 pgtwin /usr/lib/ocf/resource.d/heartbeat/pgtwin.new && sudo mv /usr/lib/ocf/resource.d/heartbeat/pgtwin.new /usr/lib/ocf/resource.d/heartbeat/pgtwin
 ```
 
 ## Building RPM Package
